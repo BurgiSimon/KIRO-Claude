@@ -4,7 +4,8 @@ import * as path from 'node:path';
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { defaultRunner, defaultSys, formatCommand, lastLines } from '../../src/crew/runner.js';
+import { defaultRunner, defaultSys, formatCommand, lastLines, parseProcStat } from '../../src/crew/runner.js';
+import { gatewayTree } from '../../src/crew/gateway.js';
 
 const node = process.execPath;
 
@@ -83,9 +84,38 @@ describe('crew runner', () => {
     if (process.platform === 'linux') {
       const me = defaultSys.listProcesses().find((p) => p.pid === process.pid);
       assert.ok(me && me.argv[0]!.includes('node') && me.env?.PATH !== undefined);
+      assert.equal(me.ppid, process.ppid);
+      assert.ok(Number.isInteger(me.pgid) && me.pgid! > 0);
     }
     assert.ok((defaultSys.freeBytes(os.tmpdir()) ?? 1) > 0);
     assert.equal(formatCommand('/bin/npm', ['ci', 'a b', "it's"]), `/bin/npm ci 'a b' 'it'\\''s'`);
     assert.deepEqual(lastLines('a\nb\nc\n\n', 2), ['b', 'c']);
+  });
+});
+
+describe('gateway process tree (crew stop)', () => {
+  it('parseProcStat reads ppid and pgid, also when the command name holds spaces and parens', () => {
+    assert.deepEqual(parseProcStat('4242 (python3) S 1 4242 4242 0 -1 4194560 0'), { ppid: 1, pgid: 4242 });
+    assert.deepEqual(parseProcStat('77 (a b) (c)) R 12 70 70 0'), { ppid: 12, pgid: 70 });
+    assert.equal(parseProcStat('garbage'), undefined);
+  });
+
+  it('gatewayTree: descendants, the gateway group when it leads one, never this process or its ancestors', () => {
+    const P = (pid: number, ppid: number, pgid: number) => ({ pid, ppid, pgid, argv: [`p${pid}`] });
+    const procs = [
+      P(1, 0, 1),
+      P(100, 1, 100), // gateway, group leader
+      P(101, 100, 100), // indexer
+      P(102, 1, 100), // re-parented group member
+      P(103, 101, 100), // grandchild
+      P(200, 100, 200), // agent in its own session (descendant)
+      P(201, 200, 200), // crew stop run from inside that agent …
+      P(202, 201, 200), // … this process
+      P(300, 1, 300), // unrelated
+    ];
+    const pids = (l: { pid: number }[]) => l.map((p) => p.pid).sort((a, b) => a - b);
+    assert.deepEqual(pids(gatewayTree(procs, 100, 9999, true)), [101, 102, 103, 200, 201, 202]);
+    assert.deepEqual(pids(gatewayTree(procs, 100, 9999, false)), [101, 103, 200, 201, 202]);
+    assert.deepEqual(pids(gatewayTree(procs, 100, 202, true)), [101, 102, 103], 'self and ancestors are spared');
   });
 });

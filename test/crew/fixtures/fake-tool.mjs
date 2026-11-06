@@ -18,7 +18,10 @@
 //   FAKE_KC_DOCTOR_OUTPUT    replaces `kirocrew doctor` output
 //   FAKE_KC_EXIT             exit code of other kirocrew verbs (exec tests)
 //   FAKE_OPEN_EXIT           exit code of xdg-open/open
-import { spawnSync } from 'node:child_process';
+//   FAKE_GATEWAY_CHILD       linger | stubborn → the gateway starts a child in its process group that
+//                            outlives it (like KiroCrew's history-index worker after os._exit);
+//                            linger exits on SIGTERM, stubborn ignores it. Pid in fake-gateway-child.json
+import { spawn, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as http from 'node:http';
 import * as path from 'node:path';
@@ -316,6 +319,12 @@ function gateway() {
     process.exit(0);
   });
   fs.appendFileSync(path.join(KC_HOME, 'gateway.log'), `fake gateway boot pid ${process.pid}\n`);
+  if (env.FAKE_GATEWAY_CHILD === 'linger' || env.FAKE_GATEWAY_CHILD === 'stubborn') {
+    const onTerm = env.FAKE_GATEWAY_CHILD === 'stubborn' ? '() => undefined' : '() => process.exit(0)';
+    const code = `process.on('SIGTERM', ${onTerm}); setInterval(() => undefined, 1000); setTimeout(() => process.exit(0), 60000);`;
+    const ch = spawn(process.execPath, ['-e', code], { stdio: 'ignore' });
+    fs.writeFileSync(path.join(KC_HOME, 'fake-gateway-child.json'), JSON.stringify({ pid: ch.pid }));
+  }
   err('booting fake gateway');
   if (mode === 'hang') {
     fs.writeFileSync(GW_FILE, JSON.stringify({ pid: process.pid, port: 0 }));

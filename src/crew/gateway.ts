@@ -11,7 +11,8 @@
  *   in place (systemd, containers).
  * - stop: `kirocrew stop`, wait for the holder to go, SIGTERM then (after 10 s) SIGKILL the
  *   recorded pid if still alive, then reap orphaned `kiro-claude acp` processes whose environ has
- *   `KIROCREW_SPAWNED=1` and the same `HOME`; remove `run/token` (and `ready.json`, which holds the
+ *   `KIROCREW_SPAWNED=1` and the same `HOME`, and retire what is left of the gateway's own process
+ *   tree (its history-index worker; {@link retireGatewayTree}); remove `run/token` (and `ready.json`, which holds the
  *   token too, and the token in `gateway.out`'s READY line). Prints `Stopped (pid <n>); <k> orphan
  *   agent process(es) reaped`.
  * - `--approval auto` is passed as KiroCrew's `yolo` (its choices are reads|yolo|interactive).
@@ -208,6 +209,69 @@ export function findOrphanAgents(procs: ProcessInfo[], opts: { home: string; ent
   });
 }
 
+/** This process and its ancestors (by ppid): never signalled by `crew stop`. */
+function selfAndAncestors(procs: ProcessInfo[], selfPid: number): Set<number> {
+  const byPid = new Map(procs.map((p) => [p.pid, p]));
+  const out = new Set<number>();
+  for (let p: number | undefined = selfPid; p !== undefined && p > 1 && !out.has(p); p = byPid.get(p)?.ppid) out.add(p);
+  return out;
+}
+
+/**
+ * The processes of the gateway's tree: `root`'s descendants (by ppid) plus, when `leader` (the
+ * gateway led its own process group, as `crew start` runs it detached), every other member of
+ * group `root` — so children already re-parented after the gateway exited are found too. Never
+ * this process or its ancestors (a `crew stop` run from inside a crew agent).
+ */
+export function gatewayTree(procs: ProcessInfo[], root: number, selfPid: number, leader: boolean): ProcessInfo[] {
+  const spare = selfAndAncestors(procs, selfPid);
+  const children = new Map<number, ProcessInfo[]>();
+  for (const p of procs) if (p.ppid !== undefined) (children.get(p.ppid) ?? children.set(p.ppid, []).get(p.ppid)!).push(p);
+  const out = new Map<number, ProcessInfo>();
+  const walk = (pid: number): void => {
+    for (const ch of children.get(pid) ?? []) {
+      if (out.has(ch.pid)) continue;
+      out.set(ch.pid, ch);
+      walk(ch.pid);
+    }
+  };
+  walk(root);
+  if (leader) for (const p of procs) if (p.pgid === root && p.pid !== root) out.set(p.pid, p);
+  return [...out.values()].filter((p) => !spare.has(p.pid));
+}
+
+/**
+ * After the gateway has exited: its children that are still running (KiroCrew's history-index
+ * worker and multiprocessing's resource tracker retire themselves up to 5 s after an
+ * `os._exit` shutdown) get SIGTERM — what KiroCrew's own supervisor sends them — then SIGKILL
+ * after the grace. `before` is the tree seen before the stop; a pid now running another program
+ * (reused) is left alone. Returns how many processes had to be signalled.
+ */
+async function retireGatewayTree(c: CrewCtx, gatewayPid: number, leader: boolean, before: ProcessInfo[]): Promise<number> {
+  const same = (a: ProcessInfo, b: ProcessInfo): boolean => a.argv.join('\0') === b.argv.join('\0');
+  const known = new Map(before.map((p) => [p.pid, p]));
+  const leftovers = (): ProcessInfo[] => {
+    const now = c.deps.sys.listProcesses();
+    const out = new Map<number, ProcessInfo>();
+    for (const p of now) {
+      const k = known.get(p.pid);
+      if (k && same(k, p)) out.set(p.pid, p);
+    }
+    // a process not seen before the stop must carry the gateway env too (guards a reused pgid)
+    for (const p of gatewayTree(now, gatewayPid, c.deps.sys.pid, leader)) if (known.has(p.pid) || p.env?.KIROCREW_KIRO_BIN !== undefined) out.set(p.pid, p);
+    const spare = selfAndAncestors(now, c.deps.sys.pid);
+    return [...out.values()].filter((p) => !spare.has(p.pid));
+  };
+  let left = leftovers();
+  if (left.length === 0) return 0;
+  const n = left.length;
+  for (const p of left) c.deps.sys.kill(p.pid, 'SIGTERM');
+  const deadline = c.deps.sys.now() + c.deps.killGraceMs;
+  while ((left = leftovers()).length > 0 && c.deps.sys.now() < deadline) await c.deps.sys.sleep(c.deps.pollMs);
+  for (const p of left) c.deps.sys.kill(p.pid, 'SIGKILL');
+  return n;
+}
+
 async function waitGone(c: CrewCtx, pid: number, ms: number): Promise<boolean> {
   const deadline = c.deps.sys.now() + ms;
   while (c.deps.sys.isAlive(pid)) {
@@ -278,6 +342,10 @@ export async function crewStop(c: CrewCtx, o: StopOptions = {}): Promise<number>
     return 0;
   }
   const pid = holder.holder === 'process' ? holder.pid : readReady(c.paths)?.pid;
+  // the gateway's own children, seen while it still runs (they are re-parented once it exits)
+  const procs = pid !== undefined ? c.deps.sys.listProcesses() : [];
+  const leader = pid !== undefined && procs.find((p) => p.pid === pid)?.pgid === pid;
+  const tree = pid !== undefined ? gatewayTree(procs, pid, c.deps.sys.pid, leader) : [];
   const stopRun = await kc.stop();
   if (stopRun.code !== 0 && c.cli.verbosity > 0) c.err(`kirocrew stop: ${(stopRun.stderr || stopRun.stdout).trim()}`);
   const timeoutMs = (o.timeoutSec ?? 30) * 1000;
@@ -304,6 +372,7 @@ export async function crewStop(c: CrewCtx, o: StopOptions = {}): Promise<number>
     }
   }
   const reaped = reapOrphans(c, state);
+  if (pid !== undefined && !c.deps.sys.isAlive(pid)) await retireGatewayTree(c, pid, leader, tree);
   removeRunSecrets(c);
   if (pid !== undefined && c.deps.sys.isAlive(pid)) {
     c.err(`kiro-claude: the Kiro Crew gateway (pid ${pid}) did not exit.`);

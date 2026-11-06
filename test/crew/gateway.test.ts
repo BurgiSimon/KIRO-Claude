@@ -205,6 +205,34 @@ describe('crew start / status / open / stop (08 §3.8)', { skip: PY ? false : 'n
     }
   });
 
+  for (const kind of ['linger', 'stubborn'] as const) {
+    it(`stop: retires a ${kind} child the gateway left in its process group (KiroCrew's history-index worker)`, { skip: process.platform !== 'linux' ? 'needs /proc' : false }, async () => {
+      const fe = await setUp({ FAKE_GATEWAY_CHILD: kind });
+      // running = not gone and not a zombie (a zombie has an empty cmdline)
+      const running = (pid: number): boolean => {
+        try {
+          return fs.readFileSync(`/proc/${pid}/cmdline`).length > 0;
+        } catch {
+          return false;
+        }
+      };
+      let child: number | undefined;
+      try {
+        let r = await crew(fe, ['start', '--port', String(await freePort())]);
+        assert.equal(r.code, 0, r.stderr);
+        child = (JSON.parse(fs.readFileSync(path.join(kcHome(fe), 'fake-gateway-child.json'), 'utf8')) as { pid: number }).pid;
+        assert.equal(running(child), true, 'the gateway child runs');
+        r = await crew(fe, ['stop']);
+        assert.equal(r.code, 0, r.stderr);
+        assert.match(r.stdout, /^Stopped \(pid \d+\); 0 orphan agent process\(es\) reaped\n$/);
+        assert.equal(running(child), false, `the ${kind} gateway child outlived crew stop`);
+      } finally {
+        if (child !== undefined && running(child)) process.kill(child, 'SIGKILL');
+        fe.cleanup();
+      }
+    });
+  }
+
   it('stop: reaps orphaned kiro-claude acp processes (KIROCREW_SPAWNED=1, same HOME)', { skip: process.platform !== 'linux' ? 'needs /proc' : false }, async () => {
     const fe = await setUp();
     const spawnAgent = (home: string) =>

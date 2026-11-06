@@ -72,6 +72,9 @@ export interface ProcessInfo {
   argv: string[];
   /** Environment, when readable (`/proc/<pid>/environ`). */
   env?: Record<string, string>;
+  /** Parent pid and process group, when known (`/proc/<pid>/stat`). */
+  ppid?: number;
+  pgid?: number;
 }
 
 export interface CrewSys {
@@ -262,6 +265,16 @@ function readProcFile(pid: number, name: string): Buffer | undefined {
   }
 }
 
+/** `ppid` and `pgid` from a `/proc/<pid>/stat` line (the comm field may hold spaces and parens). */
+export function parseProcStat(text: string): { ppid: number; pgid: number } | undefined {
+  const close = text.lastIndexOf(')');
+  if (close < 0) return undefined;
+  const f = text.slice(close + 1).trim().split(/\s+/); // state ppid pgrp …
+  const ppid = Number(f[1]);
+  const pgid = Number(f[2]);
+  return Number.isInteger(ppid) && Number.isInteger(pgid) ? { ppid, pgid } : undefined;
+}
+
 /** Parse a NUL-separated `/proc/<pid>/environ` buffer. */
 export function parseEnviron(buf: Buffer): Record<string, string> {
   const env: Record<string, string> = {};
@@ -321,7 +334,9 @@ export const defaultSys: CrewSys = {
       const argv = cmd.toString('utf8').split('\0');
       if (argv[argv.length - 1] === '') argv.pop();
       const envBuf = readProcFile(pid, 'environ');
-      out.push({ pid, argv, env: envBuf ? parseEnviron(envBuf) : undefined });
+      const stat = readProcFile(pid, 'stat');
+      const ids = stat ? parseProcStat(stat.toString('utf8')) : undefined;
+      out.push({ pid, argv, env: envBuf ? parseEnviron(envBuf) : undefined, ...(ids ?? {}) });
     }
     return out;
   },
