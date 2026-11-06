@@ -153,10 +153,30 @@ def main() -> int:
     report("P-steering", "FAIL" if not have or not set(seq_o) <= kiro_kinds else "PASS",
            f"kiro-cli {json.dumps(st_t)[:300]}; ours {json.dumps(st_o)[:300]}")
 
-    # 7. Metadata parses to a context percentage
+    # 7. Metadata parses to a context percentage, except kiro-cli's refusal frame
+    #    ({sessionId, stopReason:"CONTENT_FILTERED", refusal, modelId}: no contextUsagePercentage on the
+    #    wire in kiro-cli 2.32.0 either, KiroCrew corpus refusal-fallback-live.jsonl).
+    def raw_metadata(d: Path):
+        out = []
+        for p in sorted(d.glob("*.jsonl")):
+            _, frames = harness.read_fixture(p)
+            out += [f.get("params") or {} for f in frames if f.get("method") == "_kiro.dev/metadata"]
+        return out
+    raw_o = raw_metadata(Path(a.ours).resolve() if a.ours else root / "ours")
+    raw_t = raw_metadata(root / "kiro")
     md = [e["metadata"] for es in ours.values() for e in es if e.get("action") == "metadata"]
-    report("P-metadata", "FAIL" if not md or not all(isinstance(m.get("context_pct"), (int, float)) for m in md) else "PASS",
-           f"{len(md)} _kiro.dev/metadata frames; context_pct parsed {sorted({type(m.get('context_pct')).__name__ for m in md})}; credits {sorted({str(m.get('credits')) for m in md})[:3]}")
+    refusal_o = [m for m in raw_o if m.get("stopReason") == "CONTENT_FILTERED"]
+    plain = [m for m in md if not isinstance(m.get("context_pct"), (int, float))]
+    report("P-metadata", "FAIL" if not md or len(plain) != len(refusal_o) else "PASS",
+           f"{len(md)} _kiro.dev/metadata frames; context_pct parsed {sorted({type(m.get('context_pct')).__name__ for m in md})}; "
+           f"{len(plain)} without context_pct = {len(refusal_o)} CONTENT_FILTERED refusal frames; credits {sorted({str(m.get('credits')) for m in md})[:3]}")
+    refusal_t = [m for m in raw_t if m.get("stopReason") == "CONTENT_FILTERED"]
+    if not refusal_o:
+        report("P-refusal", "SKIP", "no refusal recorded (S14 not run)")
+    else:
+        kt = (sorted(refusal_t[0]), sorted(refusal_t[0].get("refusal") or {})) if refusal_t else None
+        ko = (sorted(refusal_o[0]), sorted(refusal_o[0].get("refusal") or {}))
+        report("P-refusal", "FAIL" if kt != ko else "PASS", f"kiro-cli CONTENT_FILTERED metadata keys {kt}; ours {ko}")
 
     # 8. initialize / session/new responses
     init_o = [e for es in ours.values() for e in es if e.get("frame") == "response" and e.get("agent_version")]
