@@ -178,3 +178,70 @@ test('mcp without/with unknown subcommand', async () => {
   assert.match(h.stdout, /Usage: kiro-claude mcp <COMMAND>/);
   assert.match(h.stdout, / {2}status +Get the status of a configured server/);
 });
+
+test('mcp status / list: secret env, header, URL and argument values are masked; ${env:VAR} / $VAR references stay visible', async () => {
+  t.write(globalFile(), {
+    mcpServers: {
+      gh: {
+        command: 'gh-mcp',
+        args: ['--token', 'ghp_argsecret', '--api-key=sk-argsecret', '--verbose', '--password', '${env:PW}', 'plain-arg'],
+        env: {
+          GITHUB_TOKEN: 'ghp_literalsecret',
+          API_KEY: '${env:MY_API_KEY}',
+          DB_PASSWORD: '$DB_PASS',
+          SESSION_ID: 'sess-literal',
+          aws_secret_access_key: 'AKIAliteral',
+          Cookie_Jar: 'jar-literal',
+          LOG_LEVEL: 'debug',
+          REF_ONLY: '${env:SECRET_FROM_ENV}',
+          MIXED_AUTH: 'Bearer ${env:TOK}',
+        },
+      },
+      remote: {
+        url: 'https://user:hunter2@mcp.example.com/v1?api_key=urlsecret&mode=fast&token=${env:URL_TOKEN}',
+        headers: {
+          Authorization: 'Bearer literal-bearer',
+          'X-Api-Key': 'xkey-literal',
+          Cookie: 'sid=cookie-literal',
+          'Proxy-Authorization': 'Basic cHJveHk=',
+          'X-Trace': 'visible-trace',
+          'X-Auth-Ref': 'Bearer ${env:REMOTE_TOKEN}',
+        },
+      },
+    },
+  });
+  const env = { SECRET_FROM_ENV: 'value-from-environment', MY_API_KEY: 'sk-from-environment', URL_TOKEN: 'url-from-environment', REMOTE_TOKEN: 'remote-from-environment' };
+  const secrets = [
+    'ghp_argsecret', 'sk-argsecret', 'ghp_literalsecret', 'sess-literal', 'AKIAliteral', 'jar-literal', 'hunter2', 'urlsecret',
+    'literal-bearer', 'xkey-literal', 'cookie-literal', 'cHJveHk=', 'value-from-environment', 'sk-from-environment', 'url-from-environment', 'remote-from-environment',
+  ];
+  const st = await run(t, ['mcp', 'status', '--name', 'gh', '--no-check'], { env });
+  assert.equal(st.code, 0, st.stderr);
+  for (const s of secrets) assert.ok(!st.stdout.includes(s) && !st.stderr.includes(s), `${s} leaked:\n${st.stdout}`);
+  assert.ok(st.stdout.includes('Command : gh-mcp --token **** --api-key=**** --verbose --password ${env:PW} plain-arg\n'), st.stdout);
+  for (const kv of ['GITHUB_TOKEN=****', 'API_KEY=${env:MY_API_KEY}', 'DB_PASSWORD=$DB_PASS', 'SESSION_ID=****', 'aws_secret_access_key=****', 'Cookie_Jar=****', 'LOG_LEVEL=debug', 'REF_ONLY=${env:SECRET_FROM_ENV}', 'MIXED_AUTH=Bearer ${env:TOK}']) {
+    assert.ok(st.stdout.includes(kv), `${kv} missing:\n${st.stdout}`);
+  }
+  const rs = await run(t, ['mcp', 'status', '--name', 'remote', '--no-check'], { env });
+  assert.equal(rs.code, 0, rs.stderr);
+  for (const s of secrets) assert.ok(!rs.stdout.includes(s), `${s} leaked:\n${rs.stdout}`);
+  assert.ok(rs.stdout.includes('URL     : https://****@mcp.example.com/v1?api_key=****&mode=fast&token=${env:URL_TOKEN}\n'), rs.stdout);
+  assert.ok(rs.stdout.includes('Headers : Authorization=****, X-Api-Key=****, Cookie=****, Proxy-Authorization=****, X-Trace=visible-trace, X-Auth-Ref=Bearer ${env:REMOTE_TOKEN}'), rs.stdout);
+  const ls = await run(t, ['mcp', 'list'], { env });
+  assert.equal(ls.code, 0, ls.stderr);
+  for (const s of secrets) assert.ok(!ls.stdout.includes(s) && !ls.stderr.includes(s), `${s} leaked:\n${ls.stdout}`);
+  assert.ok(ls.stdout.includes('    • gh           gh-mcp --token **** --api-key=**** --verbose --password ${env:PW} plain-arg'), ls.stdout);
+  assert.ok(ls.stdout.includes('    • remote       https://****@mcp.example.com/v1?api_key=****&mode=fast&token=${env:URL_TOKEN}'), ls.stdout);
+  // the configuration on disk is untouched
+  assert.equal(read(globalFile()).mcpServers.gh!.env && (read(globalFile()).mcpServers.gh!.env as Record<string, string>).GITHUB_TOKEN, 'ghp_literalsecret');
+});
+
+test('mcp status: agent-defined servers (JSON and Markdown agents) are masked the same way', async () => {
+  t.write(path.join(t.kiroHome, 'agents', 'dev.json'), { name: 'dev', tools: ['*'], mcpServers: { s: { command: 'x', env: { SLACK_BOT_TOKEN: 'xoxb-json-literal', REF: '${env:HIDDEN}', MODE: 'on' } } } });
+  t.write(path.join(t.kiroHome, 'agents', 'md.md'), '---\nname: md\ntools: ["*"]\nmcpServers:\n  s:\n    command: y\n    env:\n      OPENAI_API_KEY: sk-md-literal\n      REF: ${env:HIDDEN}\n---\nBe helpful.\n');
+  const r = await run(t, ['mcp', 'status', '--name', 's', '--no-check'], { env: { HIDDEN: 'hidden-from-environment' } });
+  assert.equal(r.code, 0, r.stderr);
+  for (const s of ['xoxb-json-literal', 'sk-md-literal', 'hidden-from-environment']) assert.ok(!r.stdout.includes(s), `${s} leaked:\n${r.stdout}`);
+  assert.ok(r.stdout.includes('Env Vars: SLACK_BOT_TOKEN=****, REF=${env:HIDDEN}, MODE=on'), r.stdout);
+  assert.ok(r.stdout.includes('Env Vars: OPENAI_API_KEY=****, REF=${env:HIDDEN}'), r.stdout);
+});

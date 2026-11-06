@@ -387,6 +387,8 @@ export interface KiroSessionInternalOptions extends KiroSessionOptions {
   settings?: SettingsStore;
   binary?: ClaudeBinary;
   caps?: ClaudeCapabilities;
+  /** Time the `claude` child gets to answer `initialize` (ClaudeProcess default 60 s). */
+  initializeTimeoutMs?: number;
 }
 
 interface Preset {
@@ -943,6 +945,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         cwd: this.ws.cwd,
         env: this.childEnv(),
         initialize: launch.initialize,
+        ...(this.opts.initializeTimeoutMs !== undefined ? { initializeTimeoutMs: this.opts.initializeTimeoutMs } : {}),
         handlers: this.handlers(),
         logger: { debug: (m) => log.debug(m), warn: (m) => log.warn(m) },
       });

@@ -10,7 +10,7 @@ import { promptArguments } from '../../src/repl/commands/prompts.js';
 import { formatToolListing, toolNameMatches } from '../../src/repl/commands/tools.js';
 import { formatHooks, formatUsage } from '../../src/repl/commands/info.js';
 import { formatContextReport } from '../../src/repl/commands/context.js';
-import { setColorEnabled } from '../../src/util/ansi.js';
+import { setColorEnabled, stripAnsi } from '../../src/util/ansi.js';
 import { runToEnd, startRepl, tempEnv } from './harness.js';
 import { MockSession, agentOf } from './mockSession.js';
 
@@ -52,6 +52,33 @@ test('/clear asks [y/n]; y clears, n and Ctrl+C keep', async () => {
   r = await cmd(['/clear', '\u0003', 'hello']);
   assert.equal(r.s.called('clear').length, 0);
   assert.equal(r.s.prompts.length, 1, 'a Ctrl+C in the dialog does not exit');
+});
+
+test('/clear also forgets the REPL copy of the conversation: /copy, /reply, /transcript', async () => {
+  const t = tempEnvT();
+  t.env.EDITOR = 'true'; // an unchanged reply is not submitted (never blocks the test)
+  const s = new MockSession().script({ result: { text: 'erased answer' } });
+  const r = await cmd(['question one', '/clear', 'y', '/copy', '/reply', '/transcript', '/transcript save after.json --json'], { session: s, t });
+  assert.ok(r.out.includes('Conversation history cleared.'), r.out);
+  assert.ok(r.out.includes('No assistant message found to copy.'), r.out);
+  assert.ok(r.out.includes('No assistant message found to reply to.'), r.out);
+  assert.ok(r.out.includes('The transcript is empty.'), r.out);
+  assert.ok(!r.run.raw().includes(Buffer.from('erased answer').toString('base64')), 'nothing erased reaches the clipboard');
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(t.wsDir, 'after.json'), 'utf8')), []);
+  assert.equal(s.prompts.length, 1);
+  // a later turn is recorded again
+  const s2 = new MockSession().script({ result: { text: 'old' } }, { result: { text: 'new answer' } });
+  const t2 = tempEnvT();
+  const r2 = await cmd(['q1', '/clear', 'y', 'q2', '/transcript save t.json --json', '/copy'], { session: s2, t: t2 });
+  const j = JSON.parse(fs.readFileSync(path.join(t2.wsDir, 't.json'), 'utf8')) as Array<{ role: string; text: string }>;
+  assert.deepEqual(j.map((e) => [e.role, e.text]), [['user', 'q2'], ['assistant', 'new answer']]);
+  assert.ok(r2.run.raw().includes(Buffer.from('new answer').toString('base64')));
+  // answering n keeps everything
+  const s3 = new MockSession().script({ result: { text: 'kept answer' } });
+  const r3 = await cmd(['q', '/clear', 'n', '/copy', '/transcript'], { session: s3 });
+  assert.ok(r3.out.includes('✔ Copied the last response to the clipboard.'), r3.out);
+  assert.ok(r3.out.includes('kept answer\n'), r3.out);
+  assert.equal(s3.called('clear').length, 0);
 });
 
 // ───────────────────────────── /context ─────────────────────────────
@@ -382,10 +409,34 @@ test('/usage', async () => {
   assert.ok(r.out.includes('💡 Pro Tips:\nRun /compact to replace the conversation history with its summary'));
   assert.ok(formatUsage({ model: 'auto' }, 80).includes('Context window usage is not available yet'));
   const withFree = formatUsage({ model: 'auto', contextTokens: 100, contextWindowTokens: 1000, contextPercent: 10, categories: [{ name: 'Messages', tokens: 100 }, { name: 'Free space', tokens: 900 }] }, 80);
-  assert.ok(withFree.includes('█'.repeat(7) + '█'.repeat(63) + '  10.00%'), withFree);
+  // colours are off in this file: the free-space filler is '░' (see the colour-mode test below)
+  assert.ok(withFree.includes('█'.repeat(7) + '░'.repeat(63) + '  10.00%'), withFree);
   assert.ok(withFree.includes('█ Messages: ~100 tokens (10.00%)\n█ Free space: ~900 tokens (90.00%)\n'));
   assert.ok(formatUsage({ model: 'auto', contextPercent: 5.5 }, 80).includes('Current context window (5.5% used)'));
   assert.ok(formatUsage({ model: 'auto', contextTokens: 300, contextWindowTokens: 100, contextPercent: 300 }, 80).includes('300.00%'));
+});
+
+test('/usage bar: free space is a grey █ with colours, ░ without (never confusable with used cells)', () => {
+  const report = { model: 'auto', contextTokens: 100, contextWindowTokens: 1000, contextPercent: 10, categories: [{ name: 'Messages', tokens: 100 }, { name: 'Free space', tokens: 900 }] };
+  const bar = (s: string): string => s.split('\n').find((l) => l.endsWith('  10.00%'))!;
+  setColorEnabled(true);
+  let colored: string;
+  try {
+    colored = formatUsage(report, 80);
+  } finally {
+    setColorEnabled(false);
+  }
+  const line = bar(colored);
+  // used cells in the category colour (cyan), the filler in grey; both drawn with █
+  assert.ok(line.startsWith(`\u001b[36m${'█'.repeat(7)}\u001b[39m\u001b[90m${'█'.repeat(63)}\u001b[39m`), JSON.stringify(line));
+  assert.ok(!line.includes('░'));
+  assert.equal(stripAnsi(line), `${'█'.repeat(70)}  10.00%`);
+  const plain = bar(formatUsage(report, 80));
+  assert.equal(plain, `${'█'.repeat(7)}${'░'.repeat(63)}  10.00%`);
+  assert.ok(!plain.includes('\u001b'));
+  // nothing used yet: the whole bar is filler
+  const empty = bar(formatUsage({ model: 'auto', contextTokens: 0, contextWindowTokens: 1000, contextPercent: 0, categories: [] }, 80).replace('0.00%', '10.00%'));
+  assert.equal(empty, `${'░'.repeat(70)}  10.00%`);
 });
 
 test('/todos view and resume; /transcript', async () => {
@@ -408,6 +459,15 @@ test('/todos view and resume; /transcript', async () => {
   const e = await cmd(['/todos', '/transcript']);
   assert.ok(e.out.includes('No to-do lists to view!'));
   assert.ok(e.out.includes('The transcript is empty.'));
+});
+
+test('/transcript shows the model text without terminal escape sequences (the saved file keeps them)', async () => {
+  const s = new MockSession().script({ steps: [{ type: 'text_delta', text: 'a\u001b]0;pwned\u0007b\u001b[2Jc' }] });
+  const t = tempEnvT();
+  const r = await cmd(['ask', '/transcript', '/transcript save raw.md'], { session: s, t });
+  assert.ok(r.out.includes('> ask\n\nabc\n'), r.out);
+  assert.ok(!r.run.raw().includes('\u001b]0;pwned') && !r.run.raw().includes('\u001b[2J') && !r.run.raw().includes('\u0007'), JSON.stringify(r.run.raw()));
+  assert.equal(fs.readFileSync(path.join(t.wsDir, 'raw.md'), 'utf8'), '> ask\n\na\u001b]0;pwned\u0007b\u001b[2Jc\n');
 });
 
 // ───────────────────────────── /compact, /tangent, /rewind ─────────────────────────────

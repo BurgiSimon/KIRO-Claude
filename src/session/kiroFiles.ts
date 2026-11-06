@@ -41,6 +41,34 @@ import { toDiskJson } from './store.js';
 /** KiroCrew keeps a session mapping only when `<sid>.jsonl` has at least this many bytes. */
 export const JOURNAL_MIN_BYTES = 10;
 
+/**
+ * Journal size caps. KiroCrew never needs these bytes verbatim (08a §4.2 readers): its
+ * tool-result side reader keeps ≤ 4000 characters per block and ≤ 8000 per result
+ * (`client_tool_events._jsonl_tool_results`), the digest only counts image blocks, our
+ * `session/load` replay caps tool text again, and the Claude transcript stays the source of
+ * truth for the model. Without caps one `cat` of a big file or a pasted screenshot adds
+ * megabytes per line (image bytes are stored as JSON integer arrays, ~3.6× their size).
+ *
+ * Text of ONE tool result kept in a `ToolResults` record (UTF-8 bytes; the marker is extra).
+ */
+export const JOURNAL_TOOL_RESULT_MAX_BYTES = 256 * 1024;
+/** Raw image bytes kept per record; images that do not fit become a text placeholder. */
+export const JOURNAL_IMAGE_MAX_BYTES_PER_RECORD = 5 * 1024 * 1024;
+
+/**
+ * Tool-result text as journaled: unchanged up to {@link JOURNAL_TOOL_RESULT_MAX_BYTES}, else its
+ * head (cut on a UTF-8 character boundary) plus
+ * `\n… [kiro-claude: tool output truncated in the session journal: <n> of <total> bytes omitted]`.
+ */
+export function capToolResultText(text: string, maxBytes = JOURNAL_TOOL_RESULT_MAX_BYTES): string {
+  if (text.length * 3 <= maxBytes) return text;
+  const total = Buffer.byteLength(text, 'utf8');
+  if (total <= maxBytes) return text;
+  const head = truncateBytes(text, maxBytes);
+  const omitted = total - Buffer.byteLength(head, 'utf8');
+  return `${head}\n… [kiro-claude: tool output truncated in the session journal: ${omitted} of ${total} bytes omitted]`;
+}
+
 export type JournalBlock =
   | { kind: 'text'; data: string }
   | { kind: 'image'; data: { format: string; source: { kind: 'bytes'; data: number[] } } }

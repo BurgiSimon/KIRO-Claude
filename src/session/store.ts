@@ -147,6 +147,20 @@ function timeOf(iso: string): number {
   return Number.isNaN(t) ? 0 : t;
 }
 
+/**
+ * Origins `chat --resume` (the newest session for the directory) never picks. Kiro's `--resume`
+ * continues the user's own latest chat; a session an ACP client started (KiroCrew: persistent
+ * channel / dashboard sessions) belongs to that client, which resumes it itself with
+ * `session/load` (08a §4.2), so an interactive resume must not take it over. Such sessions are
+ * still listed (`--list-sessions`) and open by id (`--resume-id`, `session/load`).
+ */
+export const LATEST_RESUME_SKIPPED_ORIGINS: readonly SessionRecord['origin'][] = Object.freeze(['acp'] as const);
+
+/** True when `chat --resume` may pick `rec` as the latest session: no tangent, no skipped origin. */
+export function isLatestResumeCandidate(rec: SessionRecord): boolean {
+  return rec.forkKind !== 'tangent' && !LATEST_RESUME_SKIPPED_ORIGINS.includes(rec.origin);
+}
+
 /** Newest `updatedAt` first; ties by `createdAt` (newest first), then id. */
 export function compareSessionsNewestFirst(a: SessionRecord, b: SessionRecord): number {
   return timeOf(b.updatedAt) - timeOf(a.updatedAt) || timeOf(b.createdAt) - timeOf(a.createdAt) || (a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0);
@@ -382,9 +396,20 @@ export class SessionStore {
     return out.sort(compareSessionsNewestFirst);
   }
 
-  /** Newest resumable session for `cwd` (tangent sessions are skipped: they are temporary). */
+  /**
+   * Newest session of any origin for `cwd` (tangent sessions are skipped: they are temporary).
+   * `chat --resume` must use {@link latestResumable} instead.
+   */
   latest(cwd: string): SessionRecord | undefined {
     return this.list({ cwd }).find((r) => r.forkKind !== 'tangent');
+  }
+
+  /**
+   * What `chat --resume` continues: the newest {@link isLatestResumeCandidate} session for
+   * `cwd` (never a tangent, never an ACP / KiroCrew session).
+   */
+  latestResumable(cwd: string): SessionRecord | undefined {
+    return this.list({ cwd }).find(isLatestResumeCandidate);
   }
 
   /**

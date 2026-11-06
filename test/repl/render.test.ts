@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { TurnRenderer, describeTool, displayPath, formatTodos, formatToolDuration, formatToolUse, toolHeaderLine, type RenderSettings } from '../../src/repl/render.js';
+import { TerminalSanitizer, TurnRenderer, describeTool, displayPath, formatTodos, formatToolDuration, formatToolUse, stripTerminalControls, toolHeaderLine, type RenderSettings } from '../../src/repl/render.js';
 import type { SessionEvent, TurnResult } from '../../src/types.js';
 import { setColorEnabled, stripAnsi } from '../../src/util/ansi.js';
 import { call } from './mockSession.js';
@@ -208,4 +208,86 @@ test('render: colours are applied and strip to the plain text', () => {
   } finally {
     setColorEnabled(false);
   }
+});
+
+// ───────────────────────────── escape sequences split across deltas ─────────────────────────────
+
+const SPLIT_SEQUENCES: Array<[string, string]> = [
+  ['CSI SGR', '\u001b[31m'],
+  ['CSI with parameters and intermediates', '\u001b[38;5;196m\u001b[2 q'],
+  ['CSI erase display', '\u001b[2J'],
+  ['OSC 52 + BEL', '\u001b]52;c;cGF5bG9hZA==\u0007'],
+  ['OSC 52 + ST', '\u001b]52;c;cGF5bG9hZA==\u001b\\'],
+  ['OSC 8 hyperlink', '\u001b]8;;https://evil.example\u001b\\'],
+  ['DCS + ST', '\u001bPq#0;2;0;0;0\u001b\\'],
+  ['charset designation (nF)', '\u001b(B'],
+  ['two-byte ESC', '\u001b7'],
+];
+
+function leftovers(out: string): string[] {
+  const bad = ['\u001b', '\u0007', '\u009b', '[31m', '[38;5', '2 q', '[2J', '52;c', 'cGF5', 'bG9hZA', 'evil.example', '8;;', '#0;2', '\\', '(B'];
+  return bad.filter((b) => out.includes(b));
+}
+
+test('render: an escape sequence split across two text deltas leaves no visible leftovers (every offset)', () => {
+  for (const [label, seq] of SPLIT_SEQUENCES) {
+    const text = `before${seq}after`;
+    for (let i = 0; i <= text.length; i++) {
+      for (const markdown of [true, false]) {
+        const out = render([{ type: 'text_delta', text: text.slice(0, i) }, { type: 'text_delta', text: text.slice(i) }], OK, { markdown });
+        const where = `${label} split at ${i} (markdown ${markdown}): ${JSON.stringify(out)}`;
+        assert.deepEqual(leftovers(out), [], where);
+        assert.ok(out.includes('beforeafter'), where);
+      }
+      const th = render([{ type: 'thinking_delta', text: text.slice(0, i) }, { type: 'thinking_delta', text: text.slice(i) }], OK);
+      assert.deepEqual(leftovers(th), [], `${label} thinking split at ${i}: ${JSON.stringify(th)}`);
+      assert.ok(th.includes('beforeafter'), `${label} thinking split at ${i}: ${JSON.stringify(th)}`);
+    }
+  }
+});
+
+test('render: a sequence spread over many one-character deltas is still removed', () => {
+  const text = 'x\u001b]52;c;cGF5bG9hZA==\u0007y\u001b[1;31mz\u001b]0;title\u001b\\w';
+  const out = render([...text].map((ch) => ({ type: 'text_delta', text: ch }) as SessionEvent), OK, { markdown: false });
+  assert.deepEqual(leftovers(out), [], JSON.stringify(out));
+  assert.ok(out.includes('xyzw'), JSON.stringify(out));
+});
+
+test('render: an unfinished sequence is dropped at a block or turn boundary and never eats the next text', () => {
+  let out = '';
+  const r = new TurnRenderer((s) => (out += s), { ...S, markdown: false });
+  r.beginTurn();
+  r.handle({ type: 'text_delta', text: 'one\u001b[3' });
+  r.handle({ type: 'tool_start', toolUseId: 't1', call: call('Bash', { command: 'ls' }, 't1'), trusted: true });
+  r.handle({ type: 'tool_end', toolUseId: 't1', isError: false, output: '', durationMs: 1 });
+  r.handle({ type: 'text_delta', text: 'mtwo' });
+  r.endTurn(OK, { progName: 'kiro-claude' });
+  assert.ok(out.includes('> one\n') && out.includes('> mtwo'), JSON.stringify(out));
+  out = '';
+  r.beginTurn();
+  r.handle({ type: 'thinking_delta', text: 'hmm\u001b]0;ti' });
+  r.handle({ type: 'text_delta', text: 'tle\u0007answer\u001b' });
+  r.endTurn(OK, { progName: 'kiro-claude' });
+  r.beginTurn();
+  r.handle({ type: 'text_delta', text: '[31mnext turn' });
+  r.endTurn(OK, { progName: 'kiro-claude' });
+  assert.ok(out.includes('hmm') && out.includes('tle') && out.includes('answer') && out.includes('[31mnext turn'), JSON.stringify(out));
+  assert.ok(!out.includes('\u001b') && !out.includes('\u0007'), JSON.stringify(out));
+});
+
+test('TerminalSanitizer: holds an incomplete trailing sequence until the next chunk; reset drops it', () => {
+  const z = new TerminalSanitizer();
+  assert.equal(z.push('a\u001b'), 'a');
+  assert.equal(z.push('[3'), '');
+  assert.equal(z.push('1mb'), 'b');
+  assert.equal(z.push('c\u001b]52;c;QUJD'), 'c');
+  assert.equal(z.push('REVG\u001b'), '');
+  assert.equal(z.push('\\d'), 'd');
+  assert.equal(z.push('\u001b]0;x\u001b[1md'), 'd', 'an ESC that is not ST ends the OSC and starts a new sequence');
+  assert.equal(z.push('tab\tcr\rnl\n\u0000\u007f\u0085\u009b31m'), 'tab\tcr\rnl\n31m');
+  assert.equal(z.push('e\u001b[1'), 'e');
+  z.reset();
+  assert.equal(z.push('2;3Hf'), '2;3Hf', 'after reset the rest of a dropped sequence is plain text');
+  assert.equal(stripTerminalControls('p\u001b[31mq\u001b]0;t\u0007r\u001b]0;cut'), 'pqr');
+  assert.equal(stripTerminalControls('é ✓ 👍 ‮'), 'é ✓ 👍 ‮');
 });

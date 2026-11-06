@@ -309,6 +309,58 @@ test('stream-json: one JSON object per line on stdout', async () => {
   assert.equal(JSON.parse(cancelled.stdout.trim().split('\n').pop()!).type, 'interrupted');
 });
 
+test('stream-json: local commands always end with a result line (/quit, failures, interactive-only commands)', async () => {
+  const lines = (out: string): Array<Record<string, unknown>> => out.trim().split('\n').map((l) => JSON.parse(l) as Record<string, unknown>);
+  for (const cmd of ['/quit', '/exit', '/q']) {
+    const q = await headless(cmd, {}, { outputFormat: 'stream-json' });
+    assert.equal(q.code, 0);
+    assert.equal(q.stderr, '');
+    assert.equal(q.calls.created.length, 0);
+    assert.deepEqual(lines(q.stdout), [{ type: 'result', stopReason: 'local_command', isError: false, text: '', localCommand: cmd, permissionDenials: [] }]);
+  }
+  // text mode stays silent for /quit
+  const qt = await headless('/quit');
+  assert.equal(qt.stdout + qt.stderr, '');
+
+  const c = await headless('/clear', {}, { outputFormat: 'stream-json' });
+  assert.equal(c.code, 1);
+  const cl = lines(c.stdout);
+  assert.deepEqual(cl.map((l) => l.type), ['error', 'result']);
+  assert.deepEqual(cl[1], {
+    type: 'result', stopReason: 'error', isError: true, text: '', error: 'error: /clear is only available in interactive chat', localCommand: '/clear', permissionDenials: [],
+  });
+
+  // a session-local command whose session call fails
+  const f = mockFactory({});
+  const { ctx, stdout } = makeCtx(t);
+  const failing = async (o: Parameters<typeof f.create>[0]) => {
+    const s = await f.create(o);
+    (s as unknown as { mcpStatus: () => Promise<never> }).mcpStatus = async () => {
+      throw new Error('control request timed out');
+    };
+    return s;
+  };
+  const code = await runHeadless({ ctx, sessionOptions: { agentName: 'kiro_default', env: t.env }, input: '/mcp', createSession: failing, outputFormat: 'stream-json' });
+  assert.equal(code, 1);
+  const ml = lines(stdout.text);
+  assert.deepEqual(ml.map((l) => l.type), ['session', 'error', 'result']);
+  assert.equal(ml[2]!.isError, true);
+  assert.equal(ml[2]!.localCommand, '/mcp');
+  assert.equal(ml[2]!.error, 'error: /mcp: control request timed out');
+
+  // /compact whose stream fails
+  const cf = await headless('/compact', { promptError: new Error('compaction failed') }, { outputFormat: 'stream-json' });
+  assert.equal(cf.code, 1);
+  const cfl = lines(cf.stdout);
+  assert.equal(cfl[cfl.length - 1]!.type, 'result');
+  assert.equal(cfl[cfl.length - 1]!.localCommand, '/compact');
+  assert.equal(cfl[cfl.length - 1]!.isError, true);
+
+  // successful local commands keep their text + result pair
+  const ok = await headless('/tools', {}, { outputFormat: 'stream-json' });
+  assert.deepEqual(lines(ok.stdout).map((l) => l.type), ['session', 'text', 'result']);
+});
+
 test('classifyHeadlessInput table', () => {
   const { ctx } = makeCtx(t);
   const cases: Array<[string, string]> = [

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import { validateAgentFileText } from '../../src/cli/commands/agent.js';
+import { renameMarkdownAgent, validateAgentFileText } from '../../src/cli/commands/agent.js';
 import { makeCtx, makeEnv, run, type TestEnv } from './helpers.js';
 
 let t: TestEnv;
@@ -75,6 +75,41 @@ test('agent create: template, editor, validation, message; duplicates abort', as
   assert.equal(bad.code, 1);
   const noFrom = await run(t, ['agent', 'create', 'z', '--from', 'ghost']);
   assert.equal(noFrom.code, 1);
+});
+
+test('agent create --from <markdown agent>: only the front matter name changes; the body is never touched', async () => {
+  const body = 'You review code.\nname: keep this body line\n\n---\nname: also body\n';
+  t.write(path.join(globalAgents(), 'src1.md'), `---\ndescription: no name here\ntools: ["read"]\n---\n${body}`);
+  const a = await run(t, ['agent', 'create', 'copy1', '--from', 'src1']);
+  assert.equal(a.code, 0, a.stderr);
+  assert.equal(fs.readFileSync(path.join(globalAgents(), 'copy1.md'), 'utf8'), `---\nname: copy1\ndescription: no name here\ntools: ["read"]\n---\n${body}`);
+
+  t.write(path.join(globalAgents(), 'src2.md'), `---\n# a comment\nname: src2\ntools: ["read"]\n---\n${body}`);
+  const b = await run(t, ['agent', 'create', 'copy2', '--from', 'src2']);
+  assert.equal(b.code, 0, b.stderr);
+  assert.equal(fs.readFileSync(path.join(globalAgents(), 'copy2.md'), 'utf8'), `---\n# a comment\nname: copy2\ntools: ["read"]\n---\n${body}`);
+  const ls = await run(t, ['agent', 'list']);
+  assert.match(ls.stderr, /^copy2 /m);
+  assert.match(ls.stderr, /^copy1 /m);
+});
+
+test('renameMarkdownAgent: front matter only (quoted keys, multi-line values, CRLF, BOM, no front matter, YAML-unsafe names)', () => {
+  assert.equal(renameMarkdownAgent('---\nname: old\ntools: ["*"]\n---\nname: body\n', 'new'), '---\nname: new\ntools: ["*"]\n---\nname: body\n');
+  assert.equal(renameMarkdownAgent('---\r\nname: old\r\n---\r\nname: body\r\n', 'new'), '---\r\nname: new\r\n---\r\nname: body\r\n');
+  assert.equal(renameMarkdownAgent('\ufeff---\ntools: []\n---\nbody\n', 'new'), '\ufeff---\nname: new\ntools: []\n---\nbody\n');
+  assert.equal(renameMarkdownAgent('---\n"name": "old"\n---\nx', 'new'), '---\nname: new\n---\nx');
+  assert.equal(renameMarkdownAgent("---\nname: >\n  folded\n  old name\ndescription: d\n---\nx", 'new'), '---\nname: new\ndescription: d\n---\nx');
+  assert.equal(renameMarkdownAgent('---\ndescription: d\n  name: nested-looking continuation\n---\nx', 'new'), '---\nname: new\ndescription: d\n  name: nested-looking continuation\n---\nx');
+  assert.equal(renameMarkdownAgent('---\n---\nbody', 'new'), '---\nname: new\n---\nbody');
+  // no front matter: one is added, the body stays byte-for-byte
+  assert.equal(renameMarkdownAgent('Just a prompt.\nname: body\n', 'new'), '---\nname: new\n---\nJust a prompt.\nname: body\n');
+  assert.equal(renameMarkdownAgent('---\nnot closed\nname: x\n', 'new'), '---\nname: new\n---\n---\nnot closed\nname: x\n');
+  // names YAML would read as something else are quoted
+  for (const n of ['true', 'null', '123', '1e3', 'a: b', '#x', 'yes', '~']) {
+    const out = renameMarkdownAgent('---\nname: old\n---\n', n);
+    assert.equal(out, `---\nname: ${JSON.stringify(n)}\n---\n`, n);
+  }
+  assert.equal(renameMarkdownAgent('---\nname: old\n---\n', 'my-agent_2.v1'), '---\nname: my-agent_2.v1\n---\n');
 });
 
 test('agent create: an editor that breaks the file ⇒ post-write validation failure', async () => {
