@@ -695,3 +695,24 @@ export interface SlashCommand {
   /** args = shlex-split words after the command; raw = text after the command. Return 'quit' to exit the REPL. */
   run(args: string[], raw: string, host: ReplHost): Promise<void | 'quit'>;
 }
+
+// ───────────────────────────── CLI command contract ─────────────────────────────
+
+/**
+ * Passed by cli/main.ts to every subcommand implementation (chat, agent, mcp, settings, acp,
+ * spec, crew, ...). Subcommands parse their own flags from `args` and return a process exit code.
+ */
+export interface CliContext {
+  ws: WorkspaceContext;
+  settings: SettingsStore;
+  stdin: NodeJS.ReadStream;
+  stdout: NodeJS.WriteStream;
+  stderr: NodeJS.WriteStream;
+  /** argv[0]-style name used in messages: 'kiro-claude' or 'kiro-cli' when invoked through the shim. */
+  progName: string;
+  /** -v count from the root command. */
+  verbosity: number;
+}
+
+/** Signature every subcommand module exports (e.g. runAcpCommand, runSpecCommand, runCrewCommand). */
+export type SubcommandRunner = (args: string[], ctx: CliContext) => Promise<number>;
