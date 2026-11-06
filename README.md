@@ -205,6 +205,8 @@ are kept.
 * Some REPL conveniences are not implemented: Ctrl+R history search, the Ctrl+S picker, vi
   mode, image paste, and the granular shell-trust menu.
 * Knowledge bases, inline completions, translate and the desktop integrations are not ported.
+* There is one agent engine. `--agent-engine v1|v2` is accepted; `v3` (Kiro's KAS engine) is
+  rejected the way kiro-cli rejects an unknown engine, so KiroCrew uses its v2 backend.
 
 ## Development
 
@@ -218,6 +220,17 @@ KIRO_CLAUDE_E2E=1 npm run test:e2e       # end-to-end against your real claude (
 `test/fixtures/fake-claude.mjs` simulates Claude Code's stream-json and control protocol, so
 the whole suite runs without network access or a login. Run the tests from the repository
 root.
+
+The KiroCrew integration has its own end-to-end harness, which needs a built KiroCrew checkout
+(`kiro-claude crew setup`, or `npm run crew:fetch` and KiroCrew's build):
+
+```sh
+KCDIR=<built KiroCrew> KC_DIST=<kiro-claude build dir> test/e2e/kirocrew/stage.sh B   # fake claude
+KCDIR=<built KiroCrew> KC_DIST=<kiro-claude build dir> test/e2e/kirocrew/stage.sh C   # real claude (haiku)
+```
+
+Each run uses a fresh temporary HOME, never your own `~/.kiro` or kiro-cli store, and prints a
+PASS/FAIL line per contract check. `docs/VERIFICATION.md` records the last full run.
 
 ## License
 
