@@ -10,6 +10,22 @@ const STATE = {
 };
 
 describe('gateway env (08 §3.7)', () => {
+  it("puts setup's Node first on PATH for the members adapter (its #!/usr/bin/env node shebang), once", () => {
+    const state = { ...STATE, node: '/opt/node22/bin/node' };
+    const base = { HOME: '/h', PATH: '/usr/local/bin:/opt/node22/bin:/usr/bin' };
+    const { env } = computeGatewayEnv(base, { shim: '/s', state, membersAdapter: '/cs/node/x/dist/index.js', platform: 'linux' });
+    assert.equal(env.PATH, '/opt/node22/bin:/usr/local/bin:/usr/bin');
+    // members off: PATH untouched
+    const off = computeGatewayEnv(base, { shim: '/s', state: { ...state, members: { backend: 'none' as const } }, platform: 'linux' });
+    assert.equal(off.env.PATH, base.PATH);
+    // no recorded node: PATH untouched
+    assert.equal(computeGatewayEnv(base, { shim: '/s', state: STATE, membersAdapter: '/a', platform: 'linux' }).env.PATH, base.PATH);
+    // Windows keeps the existing Path spelling and separator
+    const win = computeGatewayEnv({ Path: 'C:\\Windows;C:\\node' }, { shim: 's', state: { ...state, node: 'C:\\node22\\node.exe' }, membersAdapter: 'a', platform: 'win32' });
+    assert.equal(win.env.Path, 'C:\\node22;C:\\Windows;C:\\node');
+    assert.equal(win.env.PATH, undefined);
+  });
+
   it('starts from the process env, scrubs 00 §3.2 session vars, sets the crew vars', () => {
     const base = {
       HOME: '/h',

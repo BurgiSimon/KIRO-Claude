@@ -33,8 +33,8 @@ export interface GatewayEnvOptions {
   /** Shim path (`$CS/bin/kiro-claude`); `kiroBin` overrides it (test-only `--kiro-bin`). */
   shim: string;
   kiroBin?: string;
-  /** crew.json fields used: `claude`, `members`, `env`. */
-  state?: Pick<CrewState, 'claude' | 'members' | 'env'>;
+  /** crew.json fields used: `claude`, `members`, `env`, `node` (optional). */
+  state?: Pick<CrewState, 'claude' | 'members' | 'env'> & Partial<Pick<CrewState, 'node'>>;
   /** Members adapter entry (when state.members.backend === 'claude'). */
   membersAdapter?: string;
   /** `--env K=V` pairs, applied last. */
@@ -76,10 +76,25 @@ export function computeGatewayEnv(base: NodeJS.ProcessEnv, opts: GatewayEnvOptio
   // crew.json's recorded env (the download skips) goes on top of the inherited values.
   for (const [k, v] of Object.entries(opts.state?.env ?? defaultStateEnv())) env[k] = v;
   env.PYTHONUNBUFFERED = '1';
-  if (opts.state?.members.backend !== 'none' && opts.membersAdapter) env.CLAUDE_AGENT_ACP_BIN = opts.membersAdapter;
+  if (opts.state?.members.backend !== 'none' && opts.membersAdapter) {
+    env.CLAUDE_AGENT_ACP_BIN = opts.membersAdapter;
+    // KiroCrew starts the adapter through its `#!/usr/bin/env node` shebang, so Bots run on the
+    // first `node` on PATH. Put the Node that setup checked (>= 22, the adapter's engines floor)
+    // first, so an older node earlier on the user's PATH cannot break Bot sessions.
+    if (opts.state?.node) prependPath(env, (platform === 'win32' ? path.win32 : path.posix).dirname(opts.state.node), platform);
+  }
   if (opts.state?.claude) env.CLAUDE_CODE_EXECUTABLE = opts.state.claude;
   if (opts.extra) for (const [k, v] of Object.entries(opts.extra)) env[k] = v;
   return { env, warnings };
+}
+
+/** Puts `dir` first on the env's PATH (the existing `Path` spelling on Windows), without duplicates. */
+function prependPath(env: NodeJS.ProcessEnv, dir: string, platform: NodeJS.Platform): void {
+  const key = Object.keys(env).find((k) => (platform === 'win32' ? k.toUpperCase() === 'PATH' : k === 'PATH')) ?? 'PATH';
+  const sep = platform === 'win32' ? ';' : ':';
+  const same = (a: string): boolean => (platform === 'win32' ? a.toLowerCase() === dir.toLowerCase() : a === dir);
+  const rest = (env[key] ?? '').split(sep).filter((p) => p !== '' && !same(p));
+  env[key] = [dir, ...rest].join(sep);
 }
 
 /** Parses `K=V` (`--env`); throws on a malformed pair. */
