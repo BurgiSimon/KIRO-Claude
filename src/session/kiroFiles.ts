@@ -22,7 +22,9 @@
  *    (DECISION: the real kiro-cli shape is UNVERIFIED, 08a §9 #1; KiroCrew only reads `Prompt`
  *    text and counts records, so `AssistantMessage` mirrors `Prompt`'s `content[]` form).
  *    The Claude transcript stays the source of truth; this file is a mirror for KiroCrew
- *    (digest, analytics, transfer, `session/load` replay).
+ *    (digest, analytics, transfer, `session/load` replay). Growth is capped (DECISION, see
+ *    {@link JOURNAL_TOOL_RESULT_MAX_BYTES}): one tool result keeps ≤ 256 KiB of text plus a
+ *    truncation marker, one record keeps ≤ 5 MiB of images and a text placeholder for the rest.
  *  - `<sid>.lock` — owned by session/store.ts.
  *
  * Readers ({@link readJournal}, {@link replayItems}, {@link journalHistoryText}) are used by
@@ -143,9 +145,8 @@ const MEDIA_FORMATS: Record<string, string> = {
 
 /** kiro-cli image block from base64 data (08a §4.2 shape). */
 export function imageBlock(mediaType: string, dataBase64: string): JournalBlock {
-  const format = MEDIA_FORMATS[mediaType.toLowerCase()] ?? mediaType.replace(/^image\//i, '').toLowerCase();
   const bytes = Buffer.from(dataBase64, 'base64');
-  return { kind: 'image', data: { format, source: { kind: 'bytes', data: Array.from(bytes) } } };
+  return { kind: 'image', data: { format: imageFormat(mediaType), source: { kind: 'bytes', data: Array.from(bytes) } } };
 }
 
 export function textBlock(text: string): JournalBlock {
@@ -161,10 +162,37 @@ function base(kind: JournalKind, data: JournalRecord['data'], opts: RecordOpts):
   return { version: 1, kind, timestamp: opts.timestamp ?? new Date().toISOString(), data };
 }
 
-/** `Prompt` record: the user's text (as typed) plus attached images. */
-export function promptRecord(text: string, opts: RecordOpts & { images?: { mediaType: string; dataBase64: string }[] } = {}): JournalRecord {
+function imageFormat(mediaType: string): string {
+  return MEDIA_FORMATS[mediaType.toLowerCase()] ?? mediaType.replace(/^image\//i, '').toLowerCase();
+}
+
+/** Text block standing in for an image the journal does not keep (see {@link promptRecord}). */
+export function omittedImageBlock(mediaType: string, bytes: number, maxBytes = JOURNAL_IMAGE_MAX_BYTES_PER_RECORD): JournalBlock {
+  return textBlock(`[image not stored in the session journal: ${imageFormat(mediaType)}, ${bytes} bytes; images over ${maxBytes} bytes per message are not kept]`);
+}
+
+/**
+ * `Prompt` record: the user's text (as typed) plus attached images, in order, while their raw
+ * size stays within `maxImageBytes` (default {@link JOURNAL_IMAGE_MAX_BYTES_PER_RECORD}) for the
+ * record; an image that does not fit is replaced by {@link omittedImageBlock} (the shape
+ * KiroCrew's own image repair uses for a dropped image) and later ones that still fit are kept.
+ */
+export function promptRecord(
+  text: string,
+  opts: RecordOpts & { images?: { mediaType: string; dataBase64: string }[]; maxImageBytes?: number } = {},
+): JournalRecord {
   const content: JournalBlock[] = [textBlock(text)];
-  for (const img of opts.images ?? []) content.push(imageBlock(img.mediaType, img.dataBase64));
+  const max = opts.maxImageBytes ?? JOURNAL_IMAGE_MAX_BYTES_PER_RECORD;
+  let used = 0;
+  for (const img of opts.images ?? []) {
+    const size = Buffer.byteLength(img.dataBase64, 'base64');
+    if (used + size <= max) {
+      content.push(imageBlock(img.mediaType, img.dataBase64));
+      used += size;
+    } else {
+      content.push(omittedImageBlock(img.mediaType, size, max));
+    }
+  }
   return base('Prompt', { message_id: opts.messageId ?? randomUUID(), content }, opts);
 }
 
@@ -173,7 +201,7 @@ export function assistantRecord(content: JournalBlock[], opts: RecordOpts = {}):
   return base('AssistantMessage', { message_id: opts.messageId ?? randomUUID(), content }, opts);
 }
 
-/** `ToolResults` record for one batch of tool results. */
+/** `ToolResults` record for one batch of tool results (each text capped, {@link capToolResultText}). */
 export function toolResultsRecord(
   results: { toolUseId: string; text: string; isError: boolean }[],
   opts: RecordOpts = {},
@@ -184,7 +212,7 @@ export function toolResultsRecord(
       message_id: opts.messageId ?? randomUUID(),
       content: results.map((r) => ({
         kind: 'toolResult',
-        data: { toolUseId: r.toolUseId, content: [textBlock(r.text)], status: r.isError ? 'error' : 'success' },
+        data: { toolUseId: r.toolUseId, content: [textBlock(capToolResultText(r.text))], status: r.isError ? 'error' : 'success' },
       })),
     },
     opts,

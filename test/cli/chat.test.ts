@@ -241,6 +241,41 @@ test('/usage in headless is answered before agent resolution (KiroCrew probe)', 
   assert.ok(!fs.existsSync(t.fakeLog));
 });
 
+test('headless local commands read from piped stdin are answered before agent resolution, like INPUT', async () => {
+  // a missing agent would stop a model run with exit 4; local answers never need one
+  for (const argv of [['--no-interactive', '--agent', 'ghost'], ['--no-interactive', '--agent-engine', 'v2', '--agent', 'kirocrew-lite']]) {
+    const { ctx, stdout, stderr } = makeCtx(t, { stdin: '/usage\n' });
+    const code = await runChatCommand(argv, ctx);
+    assert.equal(code, 0, stderr.text);
+    assert.equal(stdout.text, `${HEADLESS_USAGE_TEXT}\n`);
+    assert.equal(stderr.text, '');
+  }
+  const { ctx: c2 } = makeCtx(t);
+  c2.settings.set('chat.defaultAgent', 'nobody');
+  for (const [input, want] of [['/usage', HEADLESS_USAGE_TEXT], ['/help', 'Commands available with --no-interactive:']] as const) {
+    for (const how of ['stdin', 'INPUT'] as const) {
+      const { ctx, stdout, stderr } = makeCtx(t, { stdin: how === 'stdin' ? `  ${input}  \n` : '' });
+      const code = await runChatCommand(how === 'stdin' ? ['--no-interactive'] : ['--no-interactive', input], ctx);
+      assert.equal(code, 0, `${input} via ${how}: ${stderr.text}`);
+      assert.ok(stdout.text.startsWith(want), `${input} via ${how}: ${stdout.text}`);
+      assert.equal(stderr.text, '', `${input} via ${how}`);
+    }
+  }
+  const { ctx: cq, stdout: oq, stderr: eq } = makeCtx(t, { stdin: '/quit\n' });
+  assert.equal(await runChatCommand(['--no-interactive', '--output-format', 'stream-json'], cq), 0, eq.text);
+  assert.equal((JSON.parse(oq.text.trim()) as { localCommand: string }).localCommand, '/quit');
+  assert.ok(!fs.existsSync(t.fakeLog), 'no claude spawn');
+  // a real task from stdin still goes through agent resolution (exit 4) ...
+  const h = await chat(['--no-interactive'], { stdin: 'do the thing\n' });
+  assert.equal(h.code, 4);
+  assert.equal(h.rec.headless.length, 0);
+  // ... and reaches the runner as its input once an agent resolves
+  c2.settings.set('chat.defaultAgent', 'kiro_default');
+  const ok = await chat(['--no-interactive'], { stdin: 'do the thing\n' });
+  assert.equal(ok.code, 0, ok.stderr);
+  assert.equal(ok.rec.headless[0]!.input, 'do the thing\n');
+});
+
 test('--model: non-Claude ids fail with Q text, exit 1', async () => {
   const r = await chat(['--model', 'gpt-5.6-sol', '--no-interactive', 'x']);
   assert.equal(r.code, 1);
@@ -290,6 +325,22 @@ test('resume: --resume newest for this cwd, none ⇒ message; --resume-id exact/
 
   const conflict = await chat(['--resume', '--resume-id', older.sessionId]);
   assert.equal(conflict.code, 2);
+});
+
+test('--resume skips newer KiroCrew/ACP sessions in the same directory; --resume-id still opens them', async () => {
+  const store = new SessionStore(sessionsDir(makeCtx(t).ctx.ws));
+  const acpOnly = store.create({ origin: 'acp', cwd: t.cwd, agent: 'kirocrew', model: 'auto', updatedAt: '2026-03-01T00:00:00.000Z' });
+  const onlyAcp = await chat(['--resume', '--no-interactive', 'x']);
+  assert.equal(onlyAcp.stderr, 'No saved chat sessions for this directory. Starting a new session.\n');
+  assert.equal(onlyAcp.rec.headless[0]!.sessionOptions.resume, undefined);
+
+  const mine = store.create({ origin: 'repl', cwd: t.cwd, agent: 'dev', model: 'auto', updatedAt: '2026-04-01T00:00:00.000Z' });
+  store.create({ origin: 'acp', cwd: t.cwd, agent: 'kirocrew', model: 'auto', updatedAt: '2026-09-01T00:00:00.000Z' });
+  const r = await chat(['--resume', '--no-interactive', 'continue']);
+  assert.deepEqual(r.rec.headless[0]!.sessionOptions.resume, { sessionId: mine.sessionId });
+
+  const byId = await chat(['--resume-id', acpOnly.sessionId, '--no-interactive', 'x']);
+  assert.deepEqual(byId.rec.headless[0]!.sessionOptions.resume, { sessionId: acpOnly.sessionId });
 });
 
 test('--resume-picker: numbered prompt on stderr, choice from stdin', async () => {

@@ -60,9 +60,11 @@ export function notLoggedInMessage(progName: string): string {
   return `You are not logged in, please log in with ${progName} login`;
 }
 
-/** Read the task from stdin per 01 §3: only when stdin is not a TTY. */
-export async function readHeadlessStdin(stdin: NodeJS.ReadableStream & { isTTY?: boolean }): Promise<string> {
+/** Read the task from stdin per 01 §3: only when stdin is not a TTY (and not already consumed). */
+export async function readHeadlessStdin(stdin: NodeJS.ReadableStream & { isTTY?: boolean; readableEnded?: boolean; destroyed?: boolean }): Promise<string> {
   if (stdin.isTTY) return '';
+  // `chat` reads piped stdin itself (cli/commands/chat.ts); an ended stream never emits 'end' again
+  if (stdin.readableEnded || stdin.destroyed) return '';
   try {
     return await readAll(stdin);
   } catch {
@@ -130,11 +132,20 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<number> {
     renderer.finish();
     return 0;
   }
-  if (action.kind === 'quit') return 0;
+  if (action.kind === 'quit') {
+    renderer.localDone(action.command);
+    renderer.finish();
+    return 0;
+  }
   if (action.kind === 'error') {
     fatal(action.message);
+    if (action.command) renderer.localFailed(action.command, action.message);
     return action.exitCode;
   }
+
+  // A local command that needs a session (`/tools`, `/compact`, …) ends with a `result` line
+  // even when the session or its MCP servers fail (stream-json; see headless/render.ts).
+  const localCommand = action.kind === 'session-local' ? action.command : action.kind === 'compact' ? '/compact' : undefined;
 
   const ui: SessionUI = {
     requestApproval: async () => ({ kind: 'deny', message: HEADLESS_DENIAL }),
@@ -151,9 +162,15 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<number> {
     const msg = errText(e);
     // Session errors may carry their exit code (agent not found ⇒ 4, 01 §3).
     const code = typeof (e as { exitCode?: unknown }).exitCode === 'number' ? ((e as { exitCode: number }).exitCode) : 1;
-    if (isAuthError(msg) || /not logged in/i.test(msg)) fatal(notLoggedInMessage(ctx.progName));
-    else fatal(/^(error|Error)[: ]|^Failed to start session/.test(msg) ? msg : `error: ${msg}`);
+    const message =
+      isAuthError(msg) || /not logged in/i.test(msg)
+        ? notLoggedInMessage(ctx.progName)
+        : /^(error|Error)[: ]|^Failed to start session/.test(msg)
+          ? msg
+          : `error: ${msg}`;
+    fatal(message);
     if (code === 4) fatal('stopping (exit 4)');
+    if (localCommand) renderer.localFailed(localCommand, message);
     if (session) await session.close().catch(() => undefined);
     return code;
   }
@@ -192,6 +209,7 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<number> {
       const problem = await waitForMcpStartup(s, timeout, opts.mcpPollMs);
       if (problem) {
         fatal(problem);
+        if (localCommand) renderer.localFailed(localCommand, problem);
         return 3;
       }
     }
@@ -201,7 +219,9 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<number> {
       try {
         text = await action.run(s);
       } catch (e) {
-        fatal(`error: ${action.command}: ${errText(e)}`);
+        const message = `error: ${action.command}: ${errText(e)}`;
+        fatal(message);
+        renderer.localFailed(action.command, message);
         return 1;
       }
       renderer.local(action.command, text);
@@ -227,7 +247,9 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<number> {
       result = step.value;
     } catch (e) {
       const msg = errText(e);
-      fatal(isAuthError(msg) ? notLoggedInMessage(ctx.progName) : `error: ${msg}`);
+      const message = isAuthError(msg) ? notLoggedInMessage(ctx.progName) : `error: ${msg}`;
+      fatal(message);
+      if (localCommand) renderer.localFailed(localCommand, message);
       return 1;
     }
 

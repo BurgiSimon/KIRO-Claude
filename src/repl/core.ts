@@ -323,6 +323,11 @@ export class Repl implements ReplContext {
     if (code !== undefined) this.exitCode = code;
   }
 
+  forgetConversation(): void {
+    this.lastText = undefined;
+    this.log.length = 0;
+  }
+
   async refreshUsage(): Promise<void> {
     if (!this.usageIndicator) return;
     const u = await withTimeout(this.current.usage(), USAGE_TIMEOUT_MS);

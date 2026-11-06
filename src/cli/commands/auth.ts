@@ -68,7 +68,8 @@ export function configuredClaudePath(ctx: CliContext): string {
 export async function locateClaude(ctx: CliContext): Promise<{ bin?: ClaudeBinary; error?: string }> {
   const explicitPath = ctx.settings.getString('kiroClaude.claudePath');
   try {
-    const bin = await findClaudeBinary({ ...(explicitPath ? { explicitPath } : {}), env: ctx.ws.env });
+    // The setting ranks below $KIRO_CLAUDE_BIN (claude/binary.ts precedence, 08 KC-ENV-05).
+    const bin = await findClaudeBinary({ ...(explicitPath ? { settingPath: explicitPath } : {}), env: ctx.ws.env });
     return { bin };
   } catch (e) {
     return { error: e instanceof ClaudeNotFoundError ? e.message : errorText(e) };

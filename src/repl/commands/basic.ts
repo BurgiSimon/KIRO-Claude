@@ -56,6 +56,8 @@ export const clearCommand: BuiltinCommand = {
     }
     if (ans.trim().toLowerCase() !== 'y') return;
     await r.session.clear();
+    // /reply, /copy and /transcript must not bring back what was just erased
+    r.forgetConversation();
     await r.refreshUsage();
     r.write(`\n${c.green('Conversation history cleared.')}\n\n`);
   },

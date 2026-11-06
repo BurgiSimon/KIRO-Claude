@@ -8,7 +8,9 @@
  *  3. fast paths that never spawn Claude: `--list-models` (cache or static list, 08 KC-CLI-06:
  *     JSON is the object `{"models":[…]}`), `--list-sessions`, `--delete-session <id>` (the
  *     index file, its lock and the kiro-cli journal `<id>.jsonl`; never Claude transcripts), and the
- *     headless `/usage` (handed straight to the headless runner, before agent resolution);
+ *     headless local commands that need no session (`/usage`, `/help`, `/agent list`, `/prompts`,
+ *     `/quit`; headless/local.ts), handed straight to the headless runner before agent resolution —
+ *     whether they come as INPUT or, without INPUT, from piped stdin (read here for that reason);
  *  4. agent: `--agent` > `chat.defaultAgent` > `kiro_default` (config/agents selectAgent).
  *     `--no-interactive` with an unavailable `--agent` (or, on a fresh run, an unavailable
  *     `chat.defaultAgent`) ⇒ `stopping (exit 4)`; interactive ⇒ Q's fallback warnings;
@@ -38,7 +40,8 @@ import { SessionStore, formatListTime, formatSessionList, sessionsDir } from '..
 import { levelFromVerbosity, log } from '../../util/log.js';
 import type { ParsedArgs } from '../args.js';
 import { loadRunRepl, type FrontEndSessionOptions, type RunReplFn } from '../entries.js';
-import { err, out, parseOrExit, readLine } from '../io.js';
+import { classifyHeadlessInput } from '../../headless/local.js';
+import { err, out, parseOrExit, readAll, readLine } from '../io.js';
 import { CHAT_DEF } from './chatArgs.js';
 
 export { CHAT_DEF } from './chatArgs.js';
@@ -117,6 +120,17 @@ async function pickSession(ctx: CliContext, records: SessionRecord[]): Promise<S
     const k = Number.parseInt(line.trim(), 10);
     if (Number.isInteger(k) && k >= 1 && k <= records.length && String(k) === line.trim()) return records[k - 1];
     err(ctx, `Please enter a number between 1 and ${records.length}.`);
+  }
+}
+
+/** Piped stdin as text (`undefined` for a TTY; '' when it is closed or unreadable). */
+async function readPipedStdin(stdin: NodeJS.ReadableStream & { isTTY?: boolean; readableEnded?: boolean; destroyed?: boolean }): Promise<string | undefined> {
+  if (stdin.isTTY) return undefined;
+  if (stdin.readableEnded || stdin.destroyed) return '';
+  try {
+    return await readAll(stdin);
+  } catch {
+    return '';
   }
 }
 
@@ -208,9 +222,22 @@ export async function runChatCommand(args: string[], ctxIn: CliContext, deps: Ch
   const runHeadless: RunHeadlessFn =
     deps.runHeadless ?? (async (o) => (await import('../../headless/run.js')).runHeadless(o));
 
-  // headless /usage: answered locally, before anything else (08 KC-CLI-07)
-  if (!interactive && input !== undefined && input.trim() === '/usage') {
-    return runHeadless({ ctx, sessionOptions: { env }, input, ...(outputFormat ? { outputFormat } : {}) });
+  // Headless local commands without a session (/usage, …): answered before anything else
+  // (08 KC-CLI-07). The task comes from INPUT or, without it, from piped stdin (01 §3), which is
+  // read here so both paths behave the same; runHeadless gets the text and does not read again.
+  let headlessInput = input;
+  if (!interactive) {
+    if (headlessInput === undefined || headlessInput.trim() === '') {
+      const piped = await readPipedStdin(ctx.stdin);
+      if (piped !== undefined) headlessInput = piped;
+    }
+    const text = (headlessInput ?? '').trim();
+    if (text.startsWith('/')) {
+      const kind = classifyHeadlessInput(text, ctx.ws, ctx.settings).kind;
+      if (kind === 'output' || kind === 'quit') {
+        return runHeadless({ ctx, sessionOptions: { env }, input: headlessInput!, ...(outputFormat ? { outputFormat } : {}) });
+      }
+    }
   }
 
   if (env.KIRO_API_KEY) err(ctx, 'WARNING: KIRO_API_KEY is ignored: kiro-claude uses your Claude Code login');
@@ -229,10 +256,13 @@ export async function runChatCommand(args: string[], ctxIn: CliContext, deps: Ch
       resume = r.record;
     } else {
       const records = store.list({ cwd: ctx.ws.cwd }).filter((r) => r.forkKind !== 'tangent');
-      if (records.length === 0) {
+      // `--resume` continues the user's latest chat; KiroCrew/ACP sessions in the same directory
+      // are skipped (store.latestResumable). The picker still lists every session.
+      const latest = p.has('resume') ? store.latestResumable(ctx.ws.cwd) : undefined;
+      if (p.has('resume') ? latest === undefined : records.length === 0) {
         err(ctx, 'No saved chat sessions for this directory. Starting a new session.');
       } else if (p.has('resume')) {
-        resume = records[0];
+        resume = latest;
       } else {
         if (!interactive) {
           err(ctx, 'error: --resume-picker needs interactive mode; use --resume-id <ID> with --no-interactive');
@@ -299,7 +329,7 @@ export async function runChatCommand(args: string[], ctxIn: CliContext, deps: Ch
     return runHeadless({
       ctx,
       sessionOptions,
-      input: input ?? '',
+      input: headlessInput ?? '',
       ...(outputFormat ? { outputFormat } : {}),
       ...(p.has('require-mcp-startup') ? { requireMcpStartup: true } : {}),
     });

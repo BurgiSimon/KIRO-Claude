@@ -29,7 +29,9 @@
  * descriptions (what an approval prompt shows) render control and bidi-override characters
  * visibly (`\x1b`, `\x0d`, `\u{202e}`) so a command cannot hide or rewrite part of itself;
  * assistant text, thinking, tool output, denial reasons and todo subjects have escape
- * sequences and C0/C1 controls (except tab / newline / CR) removed.
+ * sequences and C0/C1 controls (except tab / newline / CR) removed ({@link TerminalSanitizer};
+ * streamed text and thinking keep one sanitizer each, so a sequence split across deltas is
+ * removed whole).
  *
  * Pure apart from the `write` callback and timers (spinner).
  */
@@ -82,16 +84,116 @@ export function displayPath(p: string, cwd: string): string {
   return rel;
 }
 
-/** ESC sequences: CSI, OSC (BEL / ST terminated, or cut at the end of the chunk), DCS/SOS/PM/APC, 2-byte. */
-const ESC_SEQUENCE = /\u001b(?:\[[0-?]*[ -/]*[@-~]?|\][^\u0007\u001b]*(?:\u0007|\u001b\\)?|[PX^_][^\u001b]*(?:\u001b\\)?|[ -~])?/g;
-/** C0 (except tab, newline, CR), DEL and C1 controls. */
-const CONTROL_CHARS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g;
 /** Every control except tab / newline, plus bidi embedding/override/isolate characters. */
 const INVISIBLE_CHARS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f‪-‮⁦-⁩]/g;
+/** C0, DEL and C1 controls: the characters that are not plain text outside a sequence. */
+const CONTROL_CHAR = /[\u0000-\u001f\u007f-\u009f]/g;
+
+// TerminalSanitizer states
+const GROUND = 0;
+const ESC = 1;
+const ESC_INTER = 2;
+const CSI = 3;
+const CSI_INTER = 4;
+const OSC = 5;
+const OSC_ESC = 6;
+const STR = 7;
+const STR_ESC = 8;
+
+/**
+ * Streaming removal of terminal escape sequences and control characters (keeps `\t`, `\n`,
+ * `\r`). Sequences: CSI (`ESC [` params, intermediates, final), OSC (`ESC ]` … BEL or ST),
+ * DCS/SOS/PM/APC (`ESC P|X|^|_` … ST), nF / two-byte `ESC` sequences; an `ESC` that is not ST
+ * ends an OSC/DCS and starts a new sequence; a byte that cannot continue a CSI or `ESC`
+ * sequence ends it and is treated as text. C0 (except tab / newline / CR), DEL and C1 controls
+ * are dropped.
+ *
+ * A sequence split across chunks (streamed deltas) is completed by the following chunks: its
+ * start is held back (as parser state; nothing of a sequence is ever printed) instead of
+ * leaving its tail (`[31m`, an OSC 52 payload) as visible text. {@link reset} drops an
+ * unfinished sequence; the renderer calls it at block and turn boundaries so a cut sequence
+ * cannot swallow the start of unrelated text. An unterminated OSC/DCS swallows the rest of its
+ * block, as it would on a terminal.
+ */
+export class TerminalSanitizer {
+  private state = GROUND;
+
+  /** Sanitize the next chunk; returns the text that is safe to print now. */
+  push(chunk: string): string {
+    let out = '';
+    let i = 0;
+    const n = chunk.length;
+    while (i < n) {
+      if (this.state === GROUND) {
+        CONTROL_CHAR.lastIndex = i;
+        const m = CONTROL_CHAR.exec(chunk);
+        const j = m ? m.index : n;
+        if (j > i) out += chunk.slice(i, j);
+        if (!m) break;
+        const ch = chunk.charCodeAt(j);
+        if (ch === 0x1b) this.state = ESC;
+        else if (ch === 0x09 || ch === 0x0a || ch === 0x0d) out += chunk[j];
+        i = j + 1;
+        continue;
+      }
+      const ch = chunk.charCodeAt(i);
+      switch (this.state) {
+        case ESC:
+          if (ch === 0x5b) this.state = CSI; // [
+          else if (ch === 0x5d) this.state = OSC; // ]
+          else if (ch === 0x50 || ch === 0x58 || ch === 0x5e || ch === 0x5f) this.state = STR; // P X ^ _
+          else if (ch >= 0x20 && ch <= 0x2f) this.state = ESC_INTER;
+          else if (ch >= 0x30 && ch <= 0x7e) this.state = GROUND;
+          else {
+            this.state = GROUND; // a lone ESC: dropped, the byte is text again
+            continue;
+          }
+          break;
+        case ESC_INTER:
+          if (ch >= 0x20 && ch <= 0x2f) break;
+          this.state = GROUND;
+          if (ch >= 0x30 && ch <= 0x7e) break;
+          continue;
+        case CSI:
+        case CSI_INTER:
+          if (ch >= 0x30 && ch <= 0x3f && this.state === CSI) break;
+          if (ch >= 0x20 && ch <= 0x2f) {
+            this.state = CSI_INTER;
+            break;
+          }
+          this.state = GROUND;
+          if (ch >= 0x40 && ch <= 0x7e) break;
+          continue;
+        case OSC:
+          if (ch === 0x07) this.state = GROUND;
+          else if (ch === 0x1b) this.state = OSC_ESC;
+          break;
+        case STR:
+          if (ch === 0x1b) this.state = STR_ESC;
+          break;
+        case OSC_ESC:
+        case STR_ESC:
+          if (ch === 0x5c) {
+            this.state = GROUND; // ST
+            break;
+          }
+          this.state = ESC; // a new sequence starts at that ESC
+          continue;
+      }
+      i++;
+    }
+    return out;
+  }
+
+  /** Drop an unfinished sequence (end of a block or turn). */
+  reset(): void {
+    this.state = GROUND;
+  }
+}
 
 /** Remove terminal escape sequences and control characters (keeps `\t`, `\n`, `\r`). */
 export function stripTerminalControls(s: string): string {
-  return s.replace(ESC_SEQUENCE, '').replace(CONTROL_CHARS, '');
+  return new TerminalSanitizer().push(s);
 }
 
 /** Show control and bidi characters as `\xNN` / `\u{NNNN}` (tool descriptions, see module doc). */
@@ -295,6 +397,9 @@ export class TurnRenderer {
   private renderedText = false;
   private text = '';
   private readonly glyphs: Glyphs;
+  /** Per-stream sanitizers: a sequence split across deltas is completed, not shown in parts. */
+  private readonly textSan = new TerminalSanitizer();
+  private readonly thinkingSan = new TerminalSanitizer();
 
   constructor(
     private readonly out: (s: string) => void,
@@ -336,6 +441,8 @@ export class TurnRenderer {
   }
 
   beginTurn(): void {
+    this.textSan.reset();
+    this.thinkingSan.reset();
     this.responseStarted = false;
     this.thinking = false;
     this.renderedText = false;
@@ -365,12 +472,16 @@ export class TurnRenderer {
       if (this.thinkingCol > 0) this.write('\n');
       this.thinking = false;
       this.thinkingCol = 0;
+      this.thinkingSan.reset();
     }
   }
 
   private endResponse(): void {
     this.pause();
     this.responseStarted = false;
+    // block boundary (tool, notice, end of turn): an unfinished sequence is dropped
+    this.textSan.reset();
+    this.thinkingSan.reset();
   }
 
   /** Render assistant text (deltas or whole blocks). */
@@ -379,7 +490,7 @@ export class TurnRenderer {
       this.pause();
       this.newline();
     }
-    let t = stripTerminalControls(text);
+    let t = this.textSan.push(text);
     if (!this.responseStarted) {
       t = t.replace(/^\s+/, '');
       if (t === '') return;
@@ -405,10 +516,12 @@ export class TurnRenderer {
   }
 
   private pushThinking(raw: string): void {
-    const text = stripTerminalControls(raw);
-    if (!this.settings.showThinking || text === '') return;
+    if (!this.settings.showThinking) return;
+    const text = this.thinkingSan.push(raw);
+    if (text === '') return;
     if (this.md) this.pause();
     if (!this.thinking) {
+      this.textSan.reset(); // a thinking block ends the text block before it
       this.blankLine();
       this.thinking = true;
       this.thinkingCol = 0;
@@ -461,7 +574,10 @@ export class TurnRenderer {
       case 'text_delta':
       case 'text':
         this.text += ev.text;
+        // a complete block is sanitized on its own
+        if (ev.type === 'text') this.textSan.reset();
         this.pushText(ev.text);
+        if (ev.type === 'text') this.textSan.reset();
         if (ev.type === 'text' && !ev.text.endsWith('\n') && this.md) this.md.push('\n');
         return;
       case 'thinking_delta':
@@ -551,6 +667,7 @@ export class TurnRenderer {
   endTurn(result: TurnResult | undefined, opts: { progName: string }): void {
     if (result && !this.renderedText && !result.isError && result.text.trim() !== '' && result.stopReason !== 'local_command') {
       this.text = result.text;
+      this.textSan.reset();
       this.pushText(result.text);
     }
     this.endResponse();

@@ -19,6 +19,9 @@
  * {@link SessionEvent} except `raw` (tool events carry Kiro names instead of the full call),
  * `{"type":"result",…}` per turn, `{"type":"interrupted"}` when a run is interrupted and
  * `{"type":"error","message"}` for fatal errors. Nothing but JSON lines is written to stdout.
+ * A local command (`/usage`, `/tools`, `/quit`, `/clear` refused, …) always ends with a
+ * `result` line carrying `localCommand` (`stopReason: "local_command"`, or `"error"` with
+ * `isError` and `error` when it failed), so a stream consumer always gets a terminal frame.
  */
 
 import type { KiroToolCall, SessionEvent, TurnResult } from '../types.js';
@@ -53,6 +56,10 @@ export interface HeadlessRenderer {
   result(r: TurnResult, info: { sessionId: string }): void;
   /** Output of a local command (no model turn). */
   local(command: string, text: string): void;
+  /** A local command that prints nothing (`/quit`) finished. */
+  localDone(command: string): void;
+  /** A local command failed (its message was already reported through {@link error}). */
+  localFailed(command: string, message: string): void;
   notice(level: 'info' | 'warn' | 'error', message: string): void;
   /** Fatal error before or outside a turn. */
   error(message: string): void;
@@ -171,6 +178,14 @@ export class TextRenderer implements HeadlessRenderer {
     this.text(text.endsWith('\n') ? text : `${text}\n`);
   }
 
+  localDone(): void {
+    // nothing in text mode (`/quit` is silent)
+  }
+
+  localFailed(): void {
+    // the error line on stderr is all text mode prints
+  }
+
   notice(_level: 'info' | 'warn' | 'error', message: string): void {
     this.stderr.write(message.endsWith('\n') ? message : `${message}\n`);
   }
@@ -264,6 +279,14 @@ export class JsonRenderer implements HeadlessRenderer {
   local(command: string, text: string): void {
     this.emit({ type: 'text', text });
     this.emit({ type: 'result', stopReason: 'local_command', isError: false, text, localCommand: command, permissionDenials: [] });
+  }
+
+  localDone(command: string): void {
+    this.emit({ type: 'result', stopReason: 'local_command', isError: false, text: '', localCommand: command, permissionDenials: [] });
+  }
+
+  localFailed(command: string, message: string): void {
+    this.emit({ type: 'result', stopReason: 'error', isError: true, text: '', error: message, localCommand: command, permissionDenials: [] });
   }
 
   notice(level: 'info' | 'warn' | 'error', message: string): void {

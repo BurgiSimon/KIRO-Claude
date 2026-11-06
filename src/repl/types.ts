@@ -80,6 +80,8 @@ export interface ReplContext extends ReplHost {
   refreshUsage(): Promise<void>;
   /** Ask the REPL to exit after the current command (with an exit code). */
   requestExit(code?: number): void;
+  /** Forget the REPL's own copy of the conversation (last answer, transcript) after /clear. */
+  forgetConversation(): void;
   /** Read one answer line (default prompt: yellow `> `); undefined on Ctrl+C / EOF. */
   readAnswer(prompt?: string): Promise<string | undefined>;
   /** Send `text` as a user turn with the main-prompt follow-ups (plan handoff, usage refresh). */

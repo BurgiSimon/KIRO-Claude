@@ -10,7 +10,7 @@
  *    /usage inside kiro-claude chat.` — no session, no `claude` spawn (08 KC-CLI-07 / KC-BIN-05;
  *    never prints `Estimated Usage`, which KiroCrew would parse as Kiro credits);
  *  - `/help`, `/agent [list]`, `/prompts [list [word]]` ⇒ from the configuration, no session;
- *  - `/quit`, `/exit`, `/q` ⇒ nothing, exit 0;
+ *  - `/quit`, `/exit`, `/q` ⇒ nothing (stream-json: only the `result` line), exit 0;
  *  - `/context [show]`, `/tools`, `/mcp`, `/model`, `/hooks` ⇒ answered from a started session
  *    (the `claude` child is spawned and initialized, but no user turn is sent);
  *  - `/compact [instructions]` ⇒ the session's compaction (useful with `--resume`);
@@ -43,10 +43,10 @@ export const INTERACTIVE_ONLY_COMMANDS: readonly string[] = [
 export type HeadlessAction =
   /** Print `text` and exit 0 without a session. */
   | { kind: 'output'; command: string; text: string }
-  /** Exit 0 silently. */
-  | { kind: 'quit' }
-  /** Print `message` (stderr) and exit with `exitCode`. */
-  | { kind: 'error'; message: string; exitCode: number }
+  /** Exit 0 silently (`command` as typed, e.g. `/exit`). */
+  | { kind: 'quit'; command: string }
+  /** Print `message` (stderr) and exit with `exitCode` (`command`: the refused local command). */
+  | { kind: 'error'; message: string; exitCode: number; command?: string }
   /** Start the session, run `run`, print its text; no user turn. */
   | { kind: 'session-local'; command: string; run: (s: KiroSession) => Promise<string> }
   /** `/compact [instructions]`. */
@@ -204,7 +204,7 @@ export function classifyHeadlessInput(input: string, ws: WorkspaceContext, setti
     case 'quit':
     case 'exit':
     case 'q':
-      return { kind: 'quit' };
+      return { kind: 'quit', command: `/${lower}` };
     case 'agent':
       if (words.length === 0 || words[0] === 'list') return { kind: 'output', command: '/agent', text: agentListText(ws, settings) };
       break;
@@ -237,12 +237,12 @@ export function classifyHeadlessInput(input: string, ws: WorkspaceContext, setti
         if (p) return { kind: 'prompt', text: expandPrompt(p, inv.args) };
       }
       if (INTERACTIVE_ONLY_COMMANDS.includes(lower)) {
-        return { kind: 'error', message: `error: /${name} is only available in interactive chat`, exitCode: 1 };
+        return { kind: 'error', message: `error: /${name} is only available in interactive chat`, exitCode: 1, command: `/${lower}` };
       }
       return { kind: 'prompt', text: input, skill: { name, rawArgs: rest } };
     }
   }
-  return { kind: 'error', message: `error: /${name} ${rest} is only available in interactive chat`, exitCode: 1 };
+  return { kind: 'error', message: `error: /${name} ${rest} is only available in interactive chat`, exitCode: 1, command: `/${lower}` };
 }
 
 /** Expand `/<skill> args` against the session agent's skills; undefined when no such skill. */

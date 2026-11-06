@@ -245,3 +245,44 @@ test('mcp status: agent-defined servers (JSON and Markdown agents) are masked th
   assert.ok(r.stdout.includes('Env Vars: SLACK_BOT_TOKEN=****, REF=${env:HIDDEN}, MODE=on'), r.stdout);
   assert.ok(r.stdout.includes('Env Vars: OPENAI_API_KEY=****, REF=${env:HIDDEN}'), r.stdout);
 });
+
+test('mcp list / status: headers and URLs passed as arguments are masked; ${VAR:-default} and lower-case $words are not plain references', async () => {
+  t.write(globalFile(), {
+    mcpServers: {
+      // mcp-remote: the usual way a stdio client reaches a remote server with an auth header
+      remote: {
+        command: 'npx',
+        args: [
+          'mcp-remote', 'https://mcp.example.com/sse?token=argurlsecret&x=1', '--header', 'Authorization: Bearer hdrsecret',
+          '-H', 'X-Api-Key:keysecret', '--header', 'Authorization:${AUTH_HEADER}', '--header', 'X-Trace: visible',
+          '--url=https://ops:urlpass@ops.example.com/', '--header=Cookie: sid=cookiesecret',
+        ],
+      },
+      // the MCP docs' Postgres example: the connection string carries the password
+      pg: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-postgres', 'postgresql://admin:pgsecret@localhost/db'] },
+      d: {
+        command: 'x',
+        args: ['--token', '${TOKEN:-argdefaultsecret}'],
+        env: { API_TOKEN: '${TOKEN:-defaultsecret}', DB_PASSWORD: '$ecretP4ss', OTHER_KEY: '$UPPER_REF', AUTH_REF: '${env:AUTH}' },
+      },
+      u: { url: 'https://${env:U}:${env:P}@refs.example.com/mcp' },
+    },
+  });
+  const secrets = ['argurlsecret', 'hdrsecret', 'keysecret', 'urlpass', 'cookiesecret', 'pgsecret', 'argdefaultsecret', 'defaultsecret', 'ecretP4ss'];
+  const ls = await run(t, ['mcp', 'list']);
+  assert.equal(ls.code, 0, ls.stderr);
+  for (const s of secrets) assert.ok(!ls.stdout.includes(s) && !ls.stderr.includes(s), `${s} leaked:\n${ls.stdout}`);
+  assert.ok(
+    ls.stdout.includes(
+      '    • remote       npx mcp-remote https://mcp.example.com/sse?token=****&x=1 --header Authorization: **** -H X-Api-Key:**** --header Authorization:${AUTH_HEADER} --header X-Trace: visible --url=https://****@ops.example.com/ --header=Cookie: ****\n',
+    ),
+    ls.stdout,
+  );
+  assert.ok(ls.stdout.includes('    • pg           npx -y @modelcontextprotocol/server-postgres postgresql://****@localhost/db\n'), ls.stdout);
+  assert.ok(ls.stdout.includes('    • d            x --token ****\n'), ls.stdout);
+  assert.ok(ls.stdout.includes('    • u            https://${env:U}:${env:P}@refs.example.com/mcp\n'), ls.stdout);
+  const st = await run(t, ['mcp', 'status', '--name', 'd', '--no-check']);
+  assert.equal(st.code, 0, st.stderr);
+  for (const s of secrets) assert.ok(!st.stdout.includes(s), `${s} leaked:\n${st.stdout}`);
+  assert.ok(st.stdout.includes('Env Vars: API_TOKEN=****, DB_PASSWORD=****, OTHER_KEY=$UPPER_REF, AUTH_REF=${env:AUTH}'), st.stdout);
+});

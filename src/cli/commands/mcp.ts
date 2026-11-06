@@ -22,6 +22,15 @@
  *    `claude` child is started with only that server (`--strict-mcp-config --mcp-config`) and
  *    its MCP status is read through the control protocol (no user turn, no model call).
  *
+ * Secrets on screen (DECISION, hardening): `list` and `status` show the configuration as
+ * written (Q prints the file's values, not the `${env:VAR}`-substituted ones, which could be
+ * secrets from the environment) and print `****` for the values of env vars, headers, URL
+ * query parameters and `--flag value` / `--flag=value` / `NAME=value` arguments whose name
+ * matches {@link SECRET_NAME}, every `Authorization` / `Cookie` header value and URL userinfo;
+ * arguments that are URLs or `Name: value` headers are masked the same way. A value made only
+ * of `${env:VAR}` / `${VAR}` / `$VAR` references (optionally after an auth scheme such as
+ * `Bearer`) holds no secret and stays visible (not `${VAR:-default}` or a lower-case `$word`).
+ *
  * Q writes these messages to stderr (`Self::Mcp(args) => args.execute(os, &mut stderr())`);
  * kiro-claude does the same, except for `list` and `status`, whose output is data (stdout).
  */
@@ -34,6 +43,7 @@ import { ClaudeProcess } from '../../claude/process.js';
 import { loadAgents } from '../../config/agents.js';
 import { addMcpServer, loadMcpFile, mcpConfigPaths, readMcpFileRaw, removeMcpServer, toClaudeMcpConfig } from '../../config/mcp.js';
 import { setOwn } from '../../config/diag.js';
+import { parseFrontMatter } from '../../util/frontmatter.js';
 import { parseJsonText, writeJsonAtomic } from '../../util/fsx.js';
 import { expandTilde } from '../../util/paths.js';
 import { missingRequired, type CommandDef, type SubcommandInfo } from '../args.js';
@@ -323,9 +333,161 @@ async function runRemove(args: string[], ctx: CliContext): Promise<number> {
   return 0;
 }
 
-function serverLine(name: string, s: McpServerConfig): string {
-  const what = s.type === 'stdio' ? [s.command ?? '', ...s.args].join(' ').trim() : (s.url ?? '');
-  return `    • ${name.padEnd(12)} ${what}${s.disabled ? ' (disabled)' : ''}`;
+// ───────────────────────────── secrets on screen (see module doc) ─────────────────────────────
+
+/** Names (env vars, headers, URL parameters, flags) whose values are secrets on screen. */
+export const SECRET_NAME = /token|secret|password|passwd|key|auth|credential|cookie|session/i;
+/** Headers whose every value is a secret. */
+const SECRET_HEADER = /^(?:proxy-)?authorization$|^(?:set-)?cookie2?$/i;
+/**
+ * One environment reference: `${env:VAR}` / `${VAR}` with an identifier inside (so not
+ * `${VAR:-default}`, whose default may be a literal secret) or `$VAR` in capitals (the env var
+ * convention; a lower-case `$word` is more likely a literal such as a password).
+ */
+const REFERENCE = String.raw`(?:\$\{(?:env:)?[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Z_][A-Z0-9_]*)`;
+const REFERENCES_ONLY = new RegExp(`^(?:${REFERENCE})+$`);
+/** URL userinfo (`user:password`) made only of references. */
+const USERINFO_REFERENCES = new RegExp(`^(?:${REFERENCE})+(?::(?:${REFERENCE})+)?$`);
+/** An auth scheme word before a reference (`Bearer ${env:TOKEN}`). */
+const AUTH_SCHEME = /^(?:bearer|basic|token|bot|digest|apikey)\s+/i;
+export const SECRET_MASK = '****';
+
+/** `****` unless `value` only references environment variables (optionally after an auth scheme). */
+export function maskSecret(value: string): string {
+  return REFERENCES_ONLY.test(value.trim().replace(AUTH_SCHEME, '')) ? value : SECRET_MASK;
+}
+
+/** An env var (or other named) value for display. */
+export function maskNamedValue(name: string, value: string): string {
+  return SECRET_NAME.test(name) ? maskSecret(value) : value;
+}
+
+/** A header value for display (every Authorization / Cookie value is a secret). */
+export function maskHeaderValue(name: string, value: string): string {
+  return SECRET_HEADER.test(name.trim()) || SECRET_NAME.test(name) ? maskSecret(value) : value;
+}
+
+/** A URL for display: userinfo and secret-named query parameters masked. */
+export function maskUrl(url: string): string {
+  const withUser = url.replace(/^([a-z][a-z0-9+.-]*:\/\/)([^/?#\s]*)@/i, (all: string, scheme: string, info: string) =>
+    USERINFO_REFERENCES.test(info) ? all : `${scheme}${SECRET_MASK}@`,
+  );
+  const q = withUser.indexOf('?');
+  if (q < 0) return withUser;
+  const hash = withUser.indexOf('#', q);
+  const end = hash < 0 ? withUser.length : hash;
+  const query = withUser
+    .slice(q + 1, end)
+    .split('&')
+    .map((pair) => {
+      const eq = pair.indexOf('=');
+      if (eq < 0) return pair;
+      let key = pair.slice(0, eq);
+      try {
+        key = decodeURIComponent(key);
+      } catch {
+        // keep it as written
+      }
+      return SECRET_NAME.test(key) ? `${pair.slice(0, eq)}=${maskSecret(pair.slice(eq + 1))}` : pair;
+    })
+    .join('&');
+  return `${withUser.slice(0, q + 1)}${query}${withUser.slice(end)}`;
+}
+
+const URL_ARG = /^[a-z][a-z0-9+.-]*:\/\//i;
+/** `Name: value` (a header given as an argument, e.g. mcp-remote's `--header`). */
+const HEADER_ARG = /^([A-Za-z][A-Za-z0-9_-]*)([ \t]*:[ \t]*)([\s\S]*)$/;
+
+/** One argument (or `--flag=` value) that may itself be a URL or a `Name: value` header. */
+function maskArgValue(v: string): string {
+  if (URL_ARG.test(v)) return maskUrl(v);
+  const h = HEADER_ARG.exec(v);
+  return h ? `${h[1]}${h[2]}${maskHeaderValue(h[1]!, h[3]!)}` : v;
+}
+
+/**
+ * Command arguments for display: values of secret-named flags and `NAME=value` words masked;
+ * URLs (userinfo, secret query parameters) and `Name: value` headers masked like `url` and
+ * `headers` (mcp-remote `--header "Authorization: Bearer …"`, Postgres connection strings).
+ */
+export function maskArgs(args: readonly string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    const kv = /^(--?[A-Za-z0-9][\w.-]*|[A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(a);
+    if (kv) {
+      out.push(`${kv[1]}=${SECRET_NAME.test(kv[1]!) ? maskSecret(kv[2]!) : maskArgValue(kv[2]!)}`);
+      continue;
+    }
+    out.push(maskArgValue(a));
+    const next = args[i + 1];
+    if (/^--?[A-Za-z0-9][\w.-]*$/.test(a) && SECRET_NAME.test(a) && next !== undefined && !next.startsWith('-')) {
+      out.push(maskSecret(next));
+      i++;
+    }
+  }
+  return out;
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+/** Where a server definition was read from (to show its values as written). */
+type ServerSource = { file?: string; kind: 'mcp' | 'json' | 'md' };
+
+/** The raw (unsubstituted) entry of `name` in its source file, if readable. */
+function rawServerEntry(src: ServerSource, name: string): Record<string, unknown> | undefined {
+  if (!src.file) return undefined;
+  try {
+    let data: unknown;
+    if (src.kind === 'mcp') data = readMcpFileRaw(src.file);
+    else {
+      const text = fs.readFileSync(src.file, 'utf8');
+      data = src.kind === 'md' ? parseFrontMatter(text).data : parseJsonText<unknown>(text, src.file);
+    }
+    const servers = isRecord(data) ? data.mcpServers : undefined;
+    const e = isRecord(servers) && Object.prototype.hasOwnProperty.call(servers, name) ? servers[name] : undefined;
+    return isRecord(e) ? e : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function rawString(v: unknown): string | undefined {
+  return typeof v === 'string' ? v : typeof v === 'number' || typeof v === 'boolean' ? String(v) : undefined;
+}
+
+interface ServerDisplay {
+  /** `command args…` (stdio) or the URL (remote), masked. */
+  what: string;
+  env: Array<[string, string]>;
+  headers: Array<[string, string]>;
+}
+
+/** The configuration of `s` as written in its file, with secrets masked (see module doc). */
+function displayServer(name: string, s: McpServerConfig, src: ServerSource): ServerDisplay {
+  const raw = rawServerEntry(src, name) ?? {};
+  const rawEnv = isRecord(raw.env) ? raw.env : {};
+  const rawHeaders = isRecord(raw.headers) ? raw.headers : {};
+  const asWritten = (rec: Record<string, unknown>, k: string, loaded: string): string =>
+    Object.prototype.hasOwnProperty.call(rec, k) ? (rawString(rec[k]) ?? loaded) : loaded;
+  let what: string;
+  if (s.type === 'stdio') {
+    const command = typeof raw.command === 'string' && raw.command.trim() !== '' ? raw.command.trim() : (s.command ?? '');
+    what = [command, ...maskArgs(s.args)].join(' ').trim();
+  } else {
+    what = maskUrl(typeof raw.url === 'string' && raw.url.trim() !== '' ? raw.url.trim() : (s.url ?? ''));
+  }
+  return {
+    what,
+    env: Object.entries(s.env).map(([k, v]) => [k, maskNamedValue(k, asWritten(rawEnv, k, v))]),
+    headers: Object.entries(s.headers).map(([k, v]) => [k, maskHeaderValue(k, asWritten(rawHeaders, k, v))]),
+  };
+}
+
+function serverLine(name: string, s: McpServerConfig, src: ServerSource): string {
+  return `    • ${name.padEnd(12)} ${displayServer(name, s, src).what}${s.disabled ? ' (disabled)' : ''}`;
 }
 
 async function runList(args: string[], ctx: CliContext): Promise<number> {
@@ -339,7 +501,7 @@ async function runList(args: string[], ctx: CliContext): Promise<number> {
   // `default` is the global file, as for `add` / `remove --scope default` (scopePath).
   const want = wantArg === 'default' ? 'global' : wantArg;
   const paths = mcpConfigPaths(ctx.ws);
-  const sections: Array<{ label: string; file?: string; servers: Record<string, McpServerConfig>; agent?: string }> = [];
+  const sections: Array<{ label: string; file?: string; kind: ServerSource['kind']; servers: Record<string, McpServerConfig>; agent?: string }> = [];
   const scopes: Array<['workspace' | 'global', string]> = [
     ['workspace', paths.workspace],
     ['global', paths.global],
@@ -350,7 +512,7 @@ async function runList(args: string[], ctx: CliContext): Promise<number> {
     if (label === 'workspace' && path.resolve(file) === path.resolve(paths.global)) continue;
     const r = loadMcpFile(file, label, ctx.ws.env);
     for (const w of r.warnings) if (w.code !== 'mcp-env-unset') warnings.push(w.message);
-    if (fs.existsSync(file)) sections.push({ label, file, servers: r.servers });
+    if (fs.existsSync(file)) sections.push({ label, file, kind: 'mcp', servers: r.servers });
   }
   if (want === undefined || want === 'workspace' || want === 'global') {
     const { agents } = loadAgents(ctx.ws, { settings: ctx.settings });
@@ -358,7 +520,7 @@ async function runList(args: string[], ctx: CliContext): Promise<number> {
       if (Object.keys(a.mcpServers).length === 0 || !a.path) continue;
       const scope = a.scope === 'workspace' ? 'workspace' : 'global';
       if (want !== undefined && want !== scope) continue;
-      sections.push({ label: scope, agent: a.name, file: a.path, servers: a.mcpServers });
+      sections.push({ label: scope, agent: a.name, file: a.path, kind: a.format === 'md' ? 'md' : 'json', servers: a.mcpServers });
     }
   }
   for (const w of warnings) err(ctx, w);
@@ -371,7 +533,7 @@ async function runList(args: string[], ctx: CliContext): Promise<number> {
     lines.push('', `${s.label === 'workspace' ? '📄 workspace' : '🌍 global'}${s.agent ? ` (agent ${s.agent})` : ''}:`, '', `  ${s.file}`);
     const names = Object.keys(s.servers).sort();
     if (names.length === 0) lines.push('    (empty)');
-    for (const n of names) lines.push(serverLine(n, s.servers[n]!));
+    for (const n of names) lines.push(serverLine(n, s.servers[n]!, { ...(s.file ? { file: s.file } : {}), kind: s.kind }));
   }
   lines.push('');
   out(ctx, lines.join('\n'));
@@ -424,9 +586,9 @@ async function runImport(args: string[], ctx: CliContext): Promise<number> {
   return 0;
 }
 
-/** All configured definitions of a server: `[scope label, agent?, config]`. */
-function findServerConfigs(ctx: CliContext, name: string): Array<{ scope: string; agent?: string; server: McpServerConfig }> {
-  const out: Array<{ scope: string; agent?: string; server: McpServerConfig }> = [];
+/** All configured definitions of a server: `[scope label, agent?, config, source]`. */
+function findServerConfigs(ctx: CliContext, name: string): Array<{ scope: string; agent?: string; server: McpServerConfig; source: ServerSource }> {
+  const out: Array<{ scope: string; agent?: string; server: McpServerConfig; source: ServerSource }> = [];
   const paths = mcpConfigPaths(ctx.ws);
   for (const [label, file] of [
     ['workspace', paths.workspace],
@@ -435,12 +597,19 @@ function findServerConfigs(ctx: CliContext, name: string): Array<{ scope: string
     if (label === 'workspace' && path.resolve(file) === path.resolve(paths.global)) continue;
     const r = loadMcpFile(file, label, ctx.ws.env);
     const s = r.servers[name];
-    if (s) out.push({ scope: label === 'workspace' ? '📄 workspace' : '🌍 global', server: s });
+    if (s) out.push({ scope: label === 'workspace' ? '📄 workspace' : '🌍 global', server: s, source: { file, kind: 'mcp' } });
   }
   const { agents } = loadAgents(ctx.ws, { settings: ctx.settings });
   for (const a of agents.values()) {
     const s = Object.prototype.hasOwnProperty.call(a.mcpServers, name) ? a.mcpServers[name] : undefined;
-    if (s) out.push({ scope: a.scope === 'workspace' ? '📄 workspace' : '🌍 global', agent: a.name, server: s });
+    if (s) {
+      out.push({
+        scope: a.scope === 'workspace' ? '📄 workspace' : '🌍 global',
+        agent: a.name,
+        server: s,
+        source: { ...(a.path ? { file: a.path } : {}), kind: a.format === 'md' ? 'md' : 'json' },
+      });
+    }
   }
   return out;
 }
@@ -500,18 +669,20 @@ async function runStatus(args: string[], ctx: CliContext): Promise<number> {
     return 1;
   }
   const lines: string[] = [];
+  const pairs = (kv: Array<[string, string]>): string => (kv.length ? kv.map(([k, v]) => `${k}=${v}`).join(', ') : '(none)');
   for (const f of found) {
     const s = f.server;
-    const envText = Object.keys(s.env).length ? Object.entries(s.env).map(([k, v]) => `${k}=${v}`).join(', ') : '(none)';
+    const d = displayServer(name, s, f.source);
     lines.push(
       '',
       '─────────────',
       `Scope   : ${f.scope}`,
       `Agent   : ${f.agent ?? '(mcp.json)'}`,
-      s.type === 'stdio' ? `Command : ${[s.command ?? '', ...s.args].join(' ').trim()}` : `URL     : ${s.url ?? ''}`,
+      s.type === 'stdio' ? `Command : ${d.what}` : `URL     : ${d.what}`,
+      ...(s.type === 'stdio' ? [] : [`Headers : ${pairs(d.headers)}`]),
       `Timeout : ${s.timeoutMs ?? MCP_DEFAULT_TIMEOUT_MS} ms`,
       `Disabled: ${s.disabled}`,
-      `Env Vars: ${envText}`,
+      `Env Vars: ${pairs(d.env)}`,
     );
   }
   out(ctx, lines.join('\n'));

@@ -411,7 +411,7 @@ test('/usage', async () => {
   const withFree = formatUsage({ model: 'auto', contextTokens: 100, contextWindowTokens: 1000, contextPercent: 10, categories: [{ name: 'Messages', tokens: 100 }, { name: 'Free space', tokens: 900 }] }, 80);
   // colours are off in this file: the free-space filler is '░' (see the colour-mode test below)
   assert.ok(withFree.includes('█'.repeat(7) + '░'.repeat(63) + '  10.00%'), withFree);
-  assert.ok(withFree.includes('█ Messages: ~100 tokens (10.00%)\n█ Free space: ~900 tokens (90.00%)\n'));
+  assert.ok(withFree.includes('█ Messages: ~100 tokens (10.00%)\n░ Free space: ~900 tokens (90.00%)\n'));
   assert.ok(formatUsage({ model: 'auto', contextPercent: 5.5 }, 80).includes('Current context window (5.5% used)'));
   assert.ok(formatUsage({ model: 'auto', contextTokens: 300, contextWindowTokens: 100, contextPercent: 300 }, 80).includes('300.00%'));
 });
@@ -431,9 +431,13 @@ test('/usage bar: free space is a grey █ with colours, ░ without (never conf
   assert.ok(line.startsWith(`\u001b[36m${'█'.repeat(7)}\u001b[39m\u001b[90m${'█'.repeat(63)}\u001b[39m`), JSON.stringify(line));
   assert.ok(!line.includes('░'));
   assert.equal(stripAnsi(line), `${'█'.repeat(70)}  10.00%`);
-  const plain = bar(formatUsage(report, 80));
+  const plainText = formatUsage(report, 80);
+  const plain = bar(plainText);
   assert.equal(plain, `${'█'.repeat(7)}${'░'.repeat(63)}  10.00%`);
   assert.ok(!plain.includes('\u001b'));
+  // the legend uses the same glyphs as the bar
+  assert.ok(plainText.includes('█ Messages: ~100 tokens (10.00%)\n░ Free space: ~900 tokens (90.00%)\n'), plainText);
+  assert.ok(colored.includes(`\u001b[90m█ Free space: ~900 tokens (90.00%)\u001b[39m\n`), JSON.stringify(colored));
   // nothing used yet: the whole bar is filler
   const empty = bar(formatUsage({ model: 'auto', contextTokens: 0, contextWindowTokens: 1000, contextPercent: 0, categories: [] }, 80).replace('0.00%', '10.00%'));
   assert.equal(empty, `${'░'.repeat(70)}  10.00%`);

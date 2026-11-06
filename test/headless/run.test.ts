@@ -384,3 +384,36 @@ test('classifyHeadlessInput table', () => {
 test('renderToolListing: none', () => {
   assert.equal(renderToolListing([]), 'No tools are currently enabled.');
 });
+
+test('stream-json: a local command whose session cannot start, or whose MCP servers fail, still ends with a result line', async () => {
+  const lines = (out: string): Array<Record<string, unknown>> => out.trim().split('\n').map((l) => JSON.parse(l) as Record<string, unknown>);
+  for (const cmd of ['/tools', '/mcp', '/compact']) {
+    const r = await headless(cmd, { startError: new Error('Claude Code CLI (claude) was not found.') }, { outputFormat: 'stream-json' });
+    assert.equal(r.code, 1, cmd);
+    const l = lines(r.stdout);
+    assert.deepEqual(l.map((x) => x.type), ['error', 'result'], `${cmd}: ${r.stdout}`);
+    assert.deepEqual(l[1], {
+      type: 'result', stopReason: 'error', isError: true, text: '', error: 'error: Claude Code CLI (claude) was not found.', localCommand: cmd, permissionDenials: [],
+    });
+  }
+  // an agent that cannot be found (exit 4): both error lines, then the result
+  const gone = Object.assign(new Error('Error: no agent with name ghost found'), { exitCode: 4 });
+  const g = await headless('/context', { startError: gone }, { outputFormat: 'stream-json' });
+  assert.equal(g.code, 4);
+  const gl = lines(g.stdout);
+  assert.deepEqual(gl.map((x) => x.type), ['error', 'error', 'result'], g.stdout);
+  assert.equal(gl[2]!.localCommand, '/context');
+  assert.equal(gl[2]!.error, 'Error: no agent with name ghost found');
+  // --require-mcp-startup failure before a local command (exit 3)
+  const m = await headless('/tools', { mcp: [[{ name: 'b', status: 'failed', error: 'spawn ENOENT' }]] }, { outputFormat: 'stream-json', requireMcpStartup: true, mcpStartupTimeoutMs: 2000 });
+  assert.equal(m.code, 3);
+  const ml = lines(m.stdout);
+  assert.deepEqual(ml.map((x) => x.type), ['session', 'error', 'result'], m.stdout);
+  assert.equal(ml[2]!.localCommand, '/tools');
+  assert.equal(ml[2]!.error, "error: MCP server 'b' failed to start: spawn ENOENT");
+  // text mode is unchanged: the error on stderr only
+  const tx = await headless('/tools', { startError: new Error('Claude Code CLI (claude) was not found.') });
+  assert.equal(tx.code, 1);
+  assert.equal(tx.stdout, '');
+  assert.equal(tx.stderr, 'error: Claude Code CLI (claude) was not found.\n');
+});

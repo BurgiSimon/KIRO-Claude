@@ -5,7 +5,8 @@
  *    written to stderr like Q (`root_command_args.rs:91-114`);
  *  - `create <name> [-d workspace|global|<dir>] [-f <template agent>]` (legacy `--name/-n`):
  *    writes `<dir>/<name>.json` (default global agents dir) from the Kiro template
- *    (config/agents agentCreateTemplate) or a copy of `--from`, opens `$EDITOR`, re-validates
+ *    (config/agents agentCreateTemplate) or a copy of `--from` (a Markdown agent is copied to
+ *    `<name>.md` with only its front matter `name` set, {@link renameMarkdownAgent}), opens `$EDITOR`, re-validates
  *    (`Post write validation failed for agent '<n>' at path: <p>. Malformed config detected:
  *    <e>`), prints `\n📁 Created agent <n> '<path>'\n`; existing ⇒
  *    `Agent with name <n> already exists. Aborting`;
@@ -40,6 +41,7 @@ import {
   parseAgent,
 } from '../../config/agents.js';
 import { legacyGlobalDir } from '../../config/workspace.js';
+import { resolvePlainScalar } from '../../util/yaml.js';
 import { mkdirp } from '../../util/fsx.js';
 import { missingRequired, type CommandDef, type SubcommandInfo } from '../args.js';
 import { err, errorText, openInEditor, out, parseOrExit } from '../io.js';
@@ -160,6 +162,56 @@ function safeName(name: string): boolean {
   return name.trim() !== '' && !name.split(/[\\/]/).some((s) => s === '..' || s === '.' || s === '') && !path.isAbsolute(name);
 }
 
+/** `name` as a YAML scalar: plain when YAML reads it back as that string, else double-quoted. */
+function yamlName(name: string): string {
+  const plain = /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(name) && !/^(?:y|n|yes|no|on|off|true|false|null)$/i.test(name);
+  return plain && resolvePlainScalar(name) === name ? name : JSON.stringify(name);
+}
+
+/**
+ * Set the `name` of a Markdown agent (`agent create --from`): only the YAML front matter
+ * changes, the body (the prompt) is kept byte for byte. An existing top-level `name:` line (plus
+ * its indented continuation lines) is replaced; without one, `name:` is added as the first key;
+ * text without front matter gets one. BOM and line endings are kept.
+ */
+export function renameMarkdownAgent(text: string, name: string): string {
+  const bom = text.charCodeAt(0) === 0xfeff ? '\ufeff' : '';
+  const src = text.slice(bom.length);
+  const line = `name: ${yamlName(name)}`;
+  const open = /^---[ \t]*(\r?\n)/.exec(src);
+  if (open) {
+    const nl = open[1]!;
+    // the closing delimiter: the first later line that is exactly `---` or `...` (util/frontmatter.ts)
+    const lines = src.slice(open[0].length).split(/(?<=\n)/);
+    let close = -1;
+    for (let i = 0; i < lines.length; i++) {
+      if (/^(?:---|\.\.\.)[ \t]*\r?\n?$/.test(lines[i]!)) {
+        close = i;
+        break;
+      }
+    }
+    if (close >= 0) {
+      const fm = lines.slice(0, close);
+      const at = fm.findIndex((l) => /^(["']?)name\1[ \t]*:(?:[ \t]|\r?\n?$)/.test(l));
+      if (at >= 0) {
+        // the value's continuation: indented lines, blank lines between them (block scalars)
+        let end = at + 1;
+        for (let i = at + 1; i < fm.length; i++) {
+          if (/^[ \t]+\S/.test(fm[i]!)) end = i + 1;
+          else if (!/^\s*$/.test(fm[i]!)) break;
+        }
+        const eol = /\r?\n$/.exec(fm[at]!)?.[0] ?? nl;
+        fm.splice(at, end - at, `${line}${eol}`);
+      } else {
+        fm.unshift(`${line}${nl}`);
+      }
+      return bom + open[0] + fm.join('') + lines.slice(close).join('');
+    }
+  }
+  const nl = /\r\n/.test(src) ? '\r\n' : '\n';
+  return `${bom}---${nl}${line}${nl}---${nl}${src}`;
+}
+
 function resolveCreateDir(ctx: CliContext, dir: string | undefined): string {
   if (dir === undefined || dir === 'global') return agentDirs(ctx.ws).global;
   if (dir === 'workspace') return path.join(ctx.ws.workspaceRoot, '.kiro', 'agents');
@@ -210,8 +262,14 @@ function runCreate(args: string[], ctx: CliContext): number {
       }
     } else if (src.path && src.format === 'md') {
       ext = '.md';
-      const text = fs.readFileSync(src.path, 'utf8');
-      content = /^---\r?\n[\s\S]*?^name:.*$/m.test(text) ? text.replace(/^name:.*$/m, `name: ${name}`) : text;
+      let text: string;
+      try {
+        text = fs.readFileSync(src.path, 'utf8');
+      } catch (e) {
+        err(ctx, `error: cannot read ${src.path}: ${errorText(e)}`);
+        return 1;
+      }
+      content = renameMarkdownAgent(text, name);
     } else {
       const t = agentCreateTemplate(name, {
         ...(src.description !== undefined ? { description: src.description } : {}),

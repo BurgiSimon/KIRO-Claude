@@ -99,6 +99,7 @@ test('renameMarkdownAgent: front matter only (quoted keys, multi-line values, CR
   assert.equal(renameMarkdownAgent('\ufeff---\ntools: []\n---\nbody\n', 'new'), '\ufeff---\nname: new\ntools: []\n---\nbody\n');
   assert.equal(renameMarkdownAgent('---\n"name": "old"\n---\nx', 'new'), '---\nname: new\n---\nx');
   assert.equal(renameMarkdownAgent("---\nname: >\n  folded\n  old name\ndescription: d\n---\nx", 'new'), '---\nname: new\ndescription: d\n---\nx');
+  assert.equal(renameMarkdownAgent('---\nname: |\n  a\n\n  b\n\ntools: []\n---\nx', 'new'), '---\nname: new\n\ntools: []\n---\nx');
   assert.equal(renameMarkdownAgent('---\ndescription: d\n  name: nested-looking continuation\n---\nx', 'new'), '---\nname: new\ndescription: d\n  name: nested-looking continuation\n---\nx');
   assert.equal(renameMarkdownAgent('---\n---\nbody', 'new'), '---\nname: new\n---\nbody');
   // no front matter: one is added, the body stays byte-for-byte

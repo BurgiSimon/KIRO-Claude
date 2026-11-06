@@ -6,7 +6,9 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { buildReplay } from '../../src/acp/replay.js';
@@ -24,7 +26,7 @@ import {
   writeJournalRecords,
   type JournalBlock,
 } from '../../src/session/kiroFiles.js';
-import { KiroSessionImpl, NO_SAVED_SESSIONS, type KiroSessionInternalOptions } from '../../src/session/kiroSession.js';
+import { importSessionExport, KiroSessionImpl, NO_SAVED_SESSIONS, type KiroSessionInternalOptions } from '../../src/session/kiroSession.js';
 import { isLatestResumeCandidate, LATEST_RESUME_SKIPPED_ORIGINS, pidAlive, SessionStore } from '../../src/session/store.js';
 import type { SessionRecord, SettingsStore } from '../../src/types.js';
 import { closeAll, drain, fakeBinary, fakeCaps, fakeClaudePath, flagValue, mkSandbox, recordingUI, type RecordingUI, type Sandbox } from './helpers.js';
@@ -187,25 +189,24 @@ describe('hardening: journal growth caps', () => {
     const small = b64(10);
     const r1 = promptRecord('look', { images: [{ mediaType: 'image/png', dataBase64: small }] });
     assert.deepEqual(r1.data.content![1], { kind: 'image', data: { format: 'png', source: { kind: 'bytes', data: Array(10).fill(7) } } });
-    const three = 3 * 1024 * 1024;
+    // the budget is per record (small budget here so the test does not expand megabytes)
     const r2 = promptRecord('two', {
+      maxImageBytes: 100,
       images: [
-        { mediaType: 'image/png', dataBase64: b64(three) },
-        { mediaType: 'image/jpeg', dataBase64: b64(three) },
+        { mediaType: 'image/png', dataBase64: b64(60) },
+        { mediaType: 'image/jpeg', dataBase64: b64(60) },
         { mediaType: 'image/gif', dataBase64: small },
       ],
     });
     const c = r2.data.content!;
-    assert.equal(c.length, 4);
-    assert.equal(c[0]!.kind, 'text');
-    assert.equal(c[1]!.kind, 'image');
-    assert.deepEqual(c[2], { kind: 'text', data: `[image not stored in the session journal: jpeg, ${three} bytes; images over 5242880 bytes per message are not kept]` });
-    assert.equal(c[3]!.kind, 'image', 'a later image that still fits is kept');
-    const r3 = promptRecord('', { images: [{ mediaType: 'image/webp', dataBase64: b64(JOURNAL_IMAGE_MAX_BYTES_PER_RECORD + 1) }] });
-    assert.equal(r3.data.content![1]!.kind, 'text');
+    assert.deepEqual(c.map((b) => b.kind), ['text', 'image', 'text', 'image'], 'a later image that still fits is kept');
+    assert.deepEqual(c[2], { kind: 'text', data: '[image not stored in the session journal: jpeg, 60 bytes; images over 100 bytes per message are not kept]' });
+    assert.equal(promptRecord('', { maxImageBytes: 100, images: [{ mediaType: 'image/png', dataBase64: b64(100) }] }).data.content![1]!.kind, 'image', 'exactly at the limit is kept');
+    // the real default: one image just over 5 MiB is not stored at all
+    const over = JOURNAL_IMAGE_MAX_BYTES_PER_RECORD + 1;
+    const r3 = promptRecord('', { images: [{ mediaType: 'image/webp', dataBase64: b64(over) }] });
+    assert.deepEqual(r3.data.content![1], { kind: 'text', data: `[image not stored in the session journal: webp, ${over} bytes; images over 5242880 bytes per message are not kept]` });
     assert.ok(Buffer.byteLength(JSON.stringify(r3), 'utf8') < 1024, 'nothing of the oversized image is stored');
-    const r4 = promptRecord('', { images: [{ mediaType: 'image/png', dataBase64: b64(JOURNAL_IMAGE_MAX_BYTES_PER_RECORD, 1) }] });
-    assert.equal(r4.data.content![1]!.kind, 'image', 'exactly at the limit is kept');
   });
 
   it('replay (kiroFiles + ACP session/load) works on capped records', () => {
@@ -268,7 +269,8 @@ describe('hardening: journal growth caps', () => {
 
 describe('hardening: kiroClaude.* launch settings are read through the SettingsStore only', () => {
   it('values in the workspace kiro-claude.json the store does not return never reach the launch', async () => {
-    const sb = mkSandbox({ env: { KIRO_CLAUDE_BIN: path.join(path.sep, 'nonexistent', 'claude'), ANTHROPIC_API_KEY: 'dummy-test-value' } });
+    // no $KIRO_CLAUDE_BIN (it outranks the setting): the binary must come from the store's claudePath
+    const sb = mkSandbox({ env: { KIRO_CLAUDE_BIN: undefined, ANTHROPIC_API_KEY: 'dummy-test-value' } });
     sb.write('.kiro/settings/kiro-claude.json', JSON.stringify({
       'kiroClaude.extraClaudeArgs': ['--name', 'from-workspace-file'],
       'kiroClaude.claudeSettingSources': 'project,local',
@@ -394,4 +396,160 @@ describe('hardening: createSession failure paths leak nothing', () => {
       assertNoLeaks(sb, { keep: parent ? [`${parent.sessionId}.json`] : [] });
     });
   }
+});
+
+// ───────────────────────────── verifier: further edge cases ─────────────────────────────
+
+/** A process that is alive and is not us (a lock holder `heldByOther` must respect). */
+function sleeper(): { pid: number; stop(): void } {
+  const c = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 120000)'], { stdio: 'ignore' });
+  return { pid: c.pid!, stop: () => void c.kill('SIGKILL') };
+}
+
+/** Every `*.jsonl` under the sandbox Claude config dir (transcripts). */
+function claudeTranscripts(sb: Sandbox): string[] {
+  const out: string[] = [];
+  const walk = (d: string): void => {
+    let ents: fs.Dirent[];
+    try {
+      ents = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of ents) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.name.endsWith('.jsonl')) out.push(p);
+    }
+  };
+  walk(path.join(sb.claudeConfig, 'projects'));
+  return out;
+}
+
+describe('hardening (verifier): locks held by a live KiroCrew process', () => {
+  it('resume by id of a session another live process holds: rejects, keeps the record and that lock, spawns nothing', async () => {
+    const sb = mkSandbox();
+    const store = new SessionStore(sb.sessionsDir);
+    const rec = store.create({ origin: 'acp', cwd: sb.cwd, agent: 'kiro_default', model: 'auto', turns: [turn('crew')], messageCount: 1 });
+    const before = fs.readFileSync(store.pathFor(rec.sessionId), 'utf8');
+    const holder = sleeper();
+    try {
+      const lockText = `${JSON.stringify({ pid: holder.pid, started_at: '2026-01-01T00:00:00.000Z', host: os.hostname() })}\n`;
+      fs.writeFileSync(store.lockPathFor(rec.sessionId), lockText);
+      await assert.rejects(open(sb, { resume: { sessionId: rec.sessionId } }), new RegExp(`active in another process \\(PID ${holder.pid}\\)`));
+      assert.equal(sb.starts().length, 0, 'nothing spawned');
+      assertNoLeaks(sb, { keep: [`${rec.sessionId}.json`, `${rec.sessionId}.lock`] });
+      assert.equal(fs.readFileSync(store.pathFor(rec.sessionId), 'utf8'), before, 'the record is untouched (not deleted, not rewritten)');
+      assert.equal(fs.readFileSync(store.lockPathFor(rec.sessionId), 'utf8'), lockText, "the other process's lock is untouched");
+    } finally {
+      holder.stop();
+    }
+  });
+
+  it('resume latest while KiroCrew holds its newer session: opens the user chat; the KiroCrew lock is untouched', async () => {
+    const sb = mkSandbox();
+    const store = new SessionStore(sb.sessionsDir);
+    const mine = store.create({ origin: 'headless', cwd: sb.cwd, agent: 'kiro_default', model: 'auto', updatedAt: '2026-01-01T00:00:00.000Z', turns: [turn('mine')], messageCount: 1 });
+    const crew = store.create({ origin: 'acp', cwd: sb.cwd, agent: 'kiro_default', model: 'auto', updatedAt: '2026-06-01T00:00:00.000Z', turns: [turn('crew')], messageCount: 1 });
+    const holder = sleeper();
+    try {
+      const lockText = `${JSON.stringify({ pid: holder.pid, started_at: '2026-01-01T00:00:00.000Z', host: os.hostname() })}\n`;
+      fs.writeFileSync(store.lockPathFor(crew.sessionId), lockText);
+      const { s } = await open(sb, { resume: { latest: true } });
+      try {
+        assert.equal(s.id, mine.sessionId);
+      } finally {
+        await closeAll(s);
+      }
+      assert.equal(fs.readFileSync(store.lockPathFor(crew.sessionId), 'utf8'), lockText);
+    } finally {
+      holder.stop();
+    }
+  });
+});
+
+describe('hardening (verifier): more createSession failure paths', () => {
+  it('spawn failure of a fork drops the fork record, keeps the parent, removes the runtime dir', async () => {
+    const sb = mkSandbox({ env: { FAKE_CLAUDE_EXIT_ON_START: '3', FAKE_CLAUDE_STDERR: 'kaboom' } });
+    const store = new SessionStore(sb.sessionsDir);
+    const parent = store.create({ origin: 'repl', cwd: sb.cwd, agent: 'kiro_default', model: 'auto', turns: [turn('p')], messageCount: 1 });
+    const before = fs.readFileSync(store.pathFor(parent.sessionId), 'utf8');
+    await assert.rejects(open(sb, { fork: { fromClaudeSessionId: parent.claudeSessionId, kind: 'rewind', parentId: parent.sessionId } }), /kaboom|exit/i);
+    assertNoLeaks(sb, { keep: [`${parent.sessionId}.json`] });
+    assert.equal(fs.readFileSync(store.pathFor(parent.sessionId), 'utf8'), before);
+  });
+
+  for (const how of ['lock', 'spawn'] as const) {
+    it(`import (/chat load) failing at ${how}: no record, journal or re-keyed transcript is left`, async () => {
+      const sb = mkSandbox(how === 'spawn' ? { env: { FAKE_CLAUDE_EXIT_ON_START: '3', FAKE_CLAUDE_STDERR: 'kaboom' } } : {});
+      const src = U(4);
+      const exported = {
+        version: 1,
+        kind: 'kiro-claude-export',
+        exportedAt: '2026-01-01T00:00:00.000Z',
+        session: { kind: 'kiro-claude-session', sessionId: src, claudeSessionId: src, cwd: sb.cwd, agent: 'kiro_default', model: 'auto', turns: [turn('x')], messageCount: 1 },
+        claudeTranscript: `${JSON.stringify({ type: 'user', sessionId: src, uuid: U(3), message: { role: 'user', content: 'x' } })}\n`,
+        kiroJournal: `${JSON.stringify(promptRecord('x'))}\n`,
+      };
+      sb.write('saved.json', JSON.stringify(exported));
+      const orig = SessionStore.prototype.acquireLock;
+      if (how === 'lock') {
+        SessionStore.prototype.acquireLock = function (): never {
+          throw new Error('Failed to start session: simulated lock failure');
+        };
+      }
+      try {
+        await assert.rejects(
+          importSessionExport('saved.json', { ws: sb.ws, origin: 'repl', interactive: true, ui: recordingUI(), env: sb.env }),
+          how === 'lock' ? /simulated lock failure/ : /kaboom|exit/i,
+        );
+      } finally {
+        SessionStore.prototype.acquireLock = orig;
+      }
+      assertNoLeaks(sb);
+      assert.deepEqual(claudeTranscripts(sb), [], 'the re-keyed transcript is removed');
+    });
+  }
+});
+
+describe('hardening (verifier): settings through the real SettingsStore', () => {
+  it('launch keys in the workspace kiro-claude.json are ignored end to end; the global ones apply', async () => {
+    const sb = mkSandbox({ env: { KIRO_CLAUDE_BIN: undefined, ANTHROPIC_API_KEY: 'dummy-test-value' } });
+    sb.write('.kiro/settings/kiro-claude.json', JSON.stringify({
+      'kiroClaude.extraClaudeArgs': ['--name', 'from-workspace-file'],
+      'kiroClaude.claudeSettingSources': 'project,local',
+      'kiroClaude.claudePath': path.join(path.sep, 'nonexistent', 'workspace-claude'),
+      'kiroClaude.allowApiKey': true,
+    }));
+    sb.write(path.join(sb.kiroHome, 'settings', 'kiro-claude.json'), JSON.stringify({
+      'kiroClaude.extraClaudeArgs': ['--name', 'from-global'],
+      'kiroClaude.claudeSettingSources': 'user',
+      'kiroClaude.claudePath': fakeClaudePath(),
+    }));
+    // no `settings` option: the session opens the real store itself
+    const s = await KiroSessionImpl.create({ ws: sb.ws, origin: 'repl', interactive: true, ui: recordingUI(), env: sb.env });
+    try {
+      const start = sb.log().filter((e) => e.event === 'start' && (e.argv as string[]).includes('-p')).at(-1)!;
+      const argv = start.argv as string[];
+      assert.equal(flagValue(argv, '--name'), 'from-global');
+      assert.ok(!argv.includes('from-workspace-file'));
+      assert.equal(flagValue(argv, '--setting-sources'), 'user');
+      assert.ok(!('ANTHROPIC_API_KEY' in (start.env as Record<string, unknown>)), 'the workspace allowApiKey is ignored');
+    } finally {
+      await closeAll(s);
+    }
+  });
+});
+
+describe('hardening (verifier): tool-result cap at a 4-byte character boundary', () => {
+  it('never splits a surrogate pair; the omitted count is exact', () => {
+    const text = `a${'😀'.repeat(70_000)}`; // 1 + 280 000 bytes; the cap falls inside an emoji
+    const capped = capToolResultText(text);
+    const body = capped.slice(0, capped.indexOf('\n… [kiro-claude:'));
+    assert.ok(!body.includes('�'));
+    assert.match(body, /^a(😀)+$/u);
+    const kept = Buffer.byteLength(body, 'utf8');
+    assert.ok(kept <= JOURNAL_TOOL_RESULT_MAX_BYTES && kept > JOURNAL_TOOL_RESULT_MAX_BYTES - 4);
+    assert.match(capped, new RegExp(`: ${280_001 - kept} of 280001 bytes omitted\\]$`));
+  });
 });

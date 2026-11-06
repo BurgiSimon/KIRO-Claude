@@ -10,7 +10,7 @@ import * as path from 'node:path';
 import type { KiroHook, UsageReport } from '../../types.js';
 import { c, isColorEnabled } from '../../util/ansi.js';
 import { notSupported } from '../prompt.js';
-import { formatResetTime, formatTodos } from '../render.js';
+import { formatResetTime, formatTodos, stripTerminalControls } from '../render.js';
 import type { BuiltinCommand, TranscriptEntry } from '../types.js';
 
 const HOOKS_DOC = 'https://kiro.dev/docs/cli/hooks';
@@ -110,6 +110,8 @@ export function formatUsage(u: UsageReport, columns: number): string {
   const free = (u.categories ?? []).filter((x) => FREE_CATEGORY.test(x.name.trim()));
   if (u.contextTokens !== undefined && u.contextWindowTokens) {
     const p = pct ?? (u.contextTokens / u.contextWindowTokens) * 100;
+    // free space: a grey █ with colours, ░ without (bar and legend alike)
+    const freeGlyph = isColorEnabled() ? '█' : '░';
     s += `${c.bold(`Current context window (${u.contextTokens} of ${Math.round(u.contextWindowTokens / 1000)}k tokens used)`)}\n`;
     const width = Math.max(10, Math.min(columns, 80) - 10);
     let bar = '';
@@ -135,7 +137,7 @@ export function formatUsage(u: UsageReport, columns: number): string {
         filled = n;
       }
       // without colour the grey filler would be indistinguishable from used cells
-      bar += c.gray((isColorEnabled() ? '█' : '░').repeat(Math.max(0, width - filled)));
+      bar += c.gray(freeGlyph.repeat(Math.max(0, width - filled)));
     }
     s += `${bar}  ${p.toFixed(2)}%\n\n`;
     used.forEach((cat, i) => {
@@ -143,7 +145,7 @@ export function formatUsage(u: UsageReport, columns: number): string {
       const cp = (cat.tokens / u.contextWindowTokens!) * 100;
       s += `${color('█')} ${cat.name}: ~${cat.tokens} tokens (${cp.toFixed(2)}%)\n`;
     });
-    for (const cat of free) s += `${c.gray(`█ ${cat.name}: ~${cat.tokens} tokens (${((cat.tokens / u.contextWindowTokens!) * 100).toFixed(2)}%)`)}\n`;
+    for (const cat of free) s += `${c.gray(`${freeGlyph} ${cat.name}: ~${cat.tokens} tokens (${((cat.tokens / u.contextWindowTokens!) * 100).toFixed(2)}%)`)}\n`;
     if (used.length || free.length) s += '\n';
   } else if (pct !== undefined) {
     s += `${c.bold(`Current context window (${pct.toFixed(1)}% used)`)}\n\n`;
@@ -240,6 +242,7 @@ export const transcriptCommand: BuiltinCommand = {
       r.write('\nThe transcript is empty.\n\n');
       return;
     }
-    r.write(`\n${text}\n`);
+    // model text is shown like the live answer: no terminal escape sequences (the file keeps them)
+    r.write(`\n${stripTerminalControls(text)}\n`);
   },
 };

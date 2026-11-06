@@ -8,12 +8,15 @@
  * fresh from `$KIRO_HOME/agents` at every spawn).
  *
  * Lifecycle
- *  - {@link createSession} resolves the session record (new / `resume` latest-for-cwd or by id
- *    / `fork` / import), the agent (`--agent` > saved agent > `chat.defaultAgent` >
- *    `kiro_default`; a missing `--agent` is fatal for non-interactive sessions, exit 4), the
- *    model (`--model` > saved > agent `model` > `chat.defaultModel` > `auto`; an invalid
- *    explicit id is fatal, others warn and fall back) and the effort (`--effort` > saved >
- *    `chat.modelDefaults.<model>.output_config.effort`), takes the session lock and starts.
+ *  - {@link createSession} resolves the session record (new / `resume` latest-for-cwd — never an
+ *    ACP / KiroCrew session, store `latestResumable` — or by id / `fork` / import), the agent
+ *    (`--agent` > saved agent > `chat.defaultAgent` > `kiro_default`; a missing `--agent` is
+ *    fatal for non-interactive sessions, exit 4), the model (`--model` > saved > agent `model` >
+ *    `chat.defaultModel` > `auto`; an invalid explicit id is fatal, others warn and fall back)
+ *    and the effort (`--effort` > saved >
+ *    `chat.modelDefaults.<model>.output_config.effort`), takes the session lock and starts. Any
+ *    failure (lock, spawn, `initialize` timeout or error, auth) releases the lock, removes a
+ *    record this call created and the runtime dir; ClaudeProcess kills a child it started.
  *  - {@link KiroSessionImpl.start}: SessionStart (agentSpawn) hooks run BEFORE the child is
  *    spawned; their outputs go into the system-prompt file, agent-action prompts are prepended
  *    to the first user turn. Then session/launch `buildLaunch` + `ClaudeProcess.start`.
@@ -372,7 +375,8 @@ async function resolveClaude(explicitPath: string | undefined, env: NodeJS.Proce
   let p = binaryCache.get(key);
   if (!p) {
     p = (async () => {
-      const binary = await findClaudeBinary({ ...(explicitPath ? { explicitPath } : {}), env });
+      // SessionOptions.claudePath / kiroClaude.claudePath rank below $KIRO_CLAUDE_BIN (claude/binary.ts, 08 KC-ENV-05).
+      const binary = await findClaudeBinary({ ...(explicitPath ? { settingPath: explicitPath } : {}), env });
       const caps = await probeCapabilities(binary, { env });
       return { binary, caps };
     })();
@@ -561,7 +565,8 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     let mode: LaunchMode = preset?.mode ?? { kind: 'new' };
     if (!preset && opts.resume) {
       if ('latest' in opts.resume) {
-        rec = store.latest(ws.cwd);
+        // the user's own latest chat: never a KiroCrew / ACP-client session (store doc)
+        rec = store.latestResumable(ws.cwd);
         if (!rec) notices.push({ level: 'info', message: NO_SAVED_SESSIONS });
       } else {
         rec = store.read(opts.resume.sessionId);
@@ -662,8 +667,27 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
 
     let lock: SessionLock | undefined;
     let fresh = !!preset || (!!opts.fork && !preset);
-    if (rec) {
+    const created = !rec;
+    if (!rec) {
+      rec = store.create({
+        origin: opts.origin,
+        cwd: ws.cwd,
+        agent: agent.name,
+        model,
+        ...(effort ? { effort } : {}),
+        additionalDirectories: opts.additionalDirectories ?? [],
+      });
+      fresh = true;
+    }
+    try {
       lock = store.acquireLock(rec.sessionId);
+    } catch (e) {
+      // a record this call created (new session, fork) must not outlive the failed start; a
+      // preset (import) record is removed by its caller
+      if (fresh && !preset) store.delete(rec.sessionId);
+      throw e;
+    }
+    if (!created) {
       rec.agent = agent.name;
       rec.model = model;
       if (effort) rec.effort = effort;
@@ -674,17 +698,6 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       // session never silently auto-approves every tool because an earlier run did. Per-tool
       // trust (`t`, `/tools trust`, ACP allow_always) stays with the session (00 §5.4).
       if (rec.trust.trustAll && !opts.trustAllTools) rec.trust.trustAll = false;
-    } else {
-      rec = store.create({
-        origin: opts.origin,
-        cwd: ws.cwd,
-        agent: agent.name,
-        model,
-        ...(effort ? { effort } : {}),
-        additionalDirectories: opts.additionalDirectories ?? [],
-      });
-      fresh = true;
-      lock = store.acquireLock(rec.sessionId);
     }
 
     let s: KiroSessionImpl;
