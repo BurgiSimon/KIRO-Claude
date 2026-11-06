@@ -220,6 +220,11 @@ export interface ResultFrame extends FrameBase {
   stop_reason?: string | null;
   errors?: string[];
   session_id: string;
+  /**
+   * Set (never by the CLI) on the result `ClaudeProcess.turn()` synthesises when its user line
+   * was `cancelled` before it started (`is_error:true`, `terminal_reason:"cancelled"`).
+   */
+  synthetic?: boolean;
 }
 
 /** `--include-partial-messages` raw Anthropic stream events (04 §6.4). */
