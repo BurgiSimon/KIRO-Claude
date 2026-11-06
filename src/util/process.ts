@@ -9,6 +9,13 @@
  *    anything else gets `-c`).
  *  - The child runs in its own process group on Unix (`detached`), so a timeout or abort
  *    SIGKILLs the whole group (grandchildren included). On Windows `taskkill /T /F` is used.
+ *  - A running child cannot outlive kiro-claude (review C12): being in its own group and
+ *    session, it gets neither the terminal's signals nor our death, and the timeout timer dies
+ *    with us. So it is registered with claude/lifecycle.ts as a non-graceful group child until
+ *    it exits: the process-`'exit'` sweep SIGKILLs its group, a fatal SIGTERM/SIGHUP/SIGINT
+ *    nothing else handles is forwarded to it first, and `shutdownTrackedChildren()` (run.ts,
+ *    once main() resolved) SIGKILLs it at once. Background grandchildren left behind by a shell
+ *    that already exited are not tracked (they may be meant to outlive the hook).
  *  - stdin: `opts.stdin` is written and the pipe closed; without it stdin is closed at once
  *    (EOF). EPIPE from children that do not read stdin is ignored.
  *  - stdout/stderr are captured (UTF-8) up to `maxOutputBytes` each (default 1 MiB, cut on a
@@ -27,6 +34,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { utf8SafePrefixLength } from './text.js';
 import { log } from './log.js';
+// claude/lifecycle.ts has no runtime imports, so this adds no import cycle.
+import { trackChild } from '../claude/lifecycle.js';
 
 export interface ShellResult {
   exitCode: number | null;
@@ -261,6 +270,9 @@ export function runShell(command: string, opts: RunShellOptions): Promise<ShellR
       finish(null, null, e instanceof Error ? e.message : String(e));
       return;
     }
+
+    // Until it exits (no pid = spawn failed: nothing to track). SIGKILL on our exit/shutdown.
+    trackChild(child, !isWin, { graceful: false });
 
     child.on('error', (e: Error) => {
       log.debug('runShell spawn error', command, e.message);

@@ -8,7 +8,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import { journalPrefix, promptRecord, assistantRecord, compactionRecord, readJournal, replayItems, textBlock, journalBeforeMessage } from '../../src/session/kiroFiles.js';
-import { importSessionExport, KiroSessionImpl, SessionNotFoundError, toolSearchEnv, type KiroSessionInternalOptions } from '../../src/session/kiroSession.js';
+import { claudeSettingsEnv, importSessionExport, KiroSessionImpl, SessionNotFoundError, toolSearchEnv, type KiroSessionInternalOptions } from '../../src/session/kiroSession.js';
 import { sanitizeExtraArgs } from '../../src/session/launch.js';
 import type { SessionEvent } from '../../src/types.js';
 import { closeAll, drain, fakeBinary, fakeCaps, flagValue, mkSandbox, recordingUI, type RecordingUI, type Sandbox } from './helpers.js';
@@ -470,6 +470,34 @@ describe('review: toolSearch overlay (08 KC-FS-05)', () => {
       assert.equal((s as unknown as { childEnv(): NodeJS.ProcessEnv }).childEnv().ENABLE_TOOL_SEARCH, 'true');
     } finally {
       delete sb.env.ENABLE_TOOL_SEARCH;
+      await closeAll(s);
+    }
+  });
+});
+
+describe('C21: Kiro settings with a Claude Code equivalent reach the child env', () => {
+  it('only when set; the user env wins; nonsense values are dropped', async () => {
+    const stub = (vals: Record<string, unknown>) => ({ get: (k: string) => vals[k] });
+    assert.deepEqual(claudeSettingsEnv(stub({})), {});
+    assert.deepEqual(claudeSettingsEnv(stub({ 'chat.disableAutoCompaction': false, 'mcp.initTimeout': 0, 'api.timeout': 'x' })), {});
+    assert.deepEqual(claudeSettingsEnv(stub({ 'chat.disableAutoCompaction': 'true', 'mcp.initTimeout': '12000', 'api.timeout': 90 })), {
+      DISABLE_AUTO_COMPACT: '1',
+      MCP_TIMEOUT: '12000',
+      API_TIMEOUT_MS: '90000',
+    });
+    const sb = mkSandbox();
+    sb.write('.kiro/settings/cli.json', JSON.stringify({ 'chat.disableAutoCompaction': true, 'mcp.initTimeout': 20000, 'api.timeout': 600 }));
+    const { s } = await open(sb);
+    const childEnv = (): NodeJS.ProcessEnv => (s as unknown as { childEnv(): NodeJS.ProcessEnv }).childEnv();
+    try {
+      const env = childEnv();
+      assert.equal(env.DISABLE_AUTO_COMPACT, '1');
+      assert.equal(env.MCP_TIMEOUT, '20000');
+      assert.equal(env.API_TIMEOUT_MS, '600000');
+      sb.env.MCP_TIMEOUT = '1234';
+      assert.equal(childEnv().MCP_TIMEOUT, '1234');
+    } finally {
+      delete sb.env.MCP_TIMEOUT;
       await closeAll(s);
     }
   });

@@ -777,6 +777,8 @@ test('turnFailure table', () => {
   assert.equal(turnFailure({ ...base, isError: true, error: 'x' }), 'x');
   assert.equal(turnFailure({ ...base, stopReason: 'error' }), 'the turn ended with an error');
   assert.equal(turnFailure({ ...base, stopReason: 'refusal' }), 'the model refused the request');
+  // C20: never Claude's own "Please run /login" advice
+  assert.equal(turnFailure({ ...base, isError: true, authError: true, error: 'Not logged in · Please run /login' }), 'you are not logged in to Claude Code (run kiro-claude login)');
 });
 
 test('tasks.md written by a phase turn is normalized', async () => {

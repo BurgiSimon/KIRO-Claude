@@ -47,7 +47,9 @@ export interface SettingSchemaEntry {
 /**
  * Known settings (Kiro keys from 01 §7.2 that kiro-claude honors or accepts, plus adapter
  * keys). Used by `settings list --all` and for type hints; unknown keys are still accepted
- * (forward compatibility, 01 §2.3 "Port").
+ * (forward compatibility, 01 §2.3 "Port"). A key kiro-claude stores but does not implement
+ * says so in its description (`not supported in kiro-claude`, `accepted and ignored`, `no
+ * effect`); every other key is read somewhere in src/ (test/config/docs-consistency.test.ts).
  */
 export const SETTINGS_SCHEMA: Record<string, SettingSchemaEntry> = {
   // ── chat core ──
@@ -60,27 +62,57 @@ export const SETTINGS_SCHEMA: Record<string, SettingSchemaEntry> = {
   'chat.greeting.enabled': { type: 'boolean', default: true, description: 'Show the welcome text when a chat starts' },
   'chat.enablePromptHints': { type: 'boolean', default: true, description: 'Show startup tips' },
   'chat.enableNotifications': { type: 'boolean', default: false, description: 'Notify when a response completes' },
-  'chat.notificationMethod': { type: 'string', default: 'auto', description: 'Notification method: auto, bel or osc9' },
+  'chat.notificationMethod': {
+    type: 'string',
+    default: 'auto',
+    description: 'Notification method: auto, bel or osc9 (not supported in kiro-claude; notifications always ring the bell)',
+  },
   'chat.disableMarkdownRendering': { type: 'boolean', default: false, description: 'Print raw model output instead of rendered Markdown' },
   'chat.disableWrap': { type: 'boolean', default: false, description: 'Do not hard-wrap output lines' },
-  'chat.disableAutoCompaction': { type: 'boolean', default: false, description: 'Disable automatic conversation compaction' },
-  'compaction.excludeMessages': { type: 'number', default: 2, description: 'Minimum message pairs kept verbatim by compaction' },
-  'compaction.excludeContextWindowPercent': { type: 'number', default: 2, description: 'Minimum percent of the context window kept by compaction' },
-  'chat.editMode': { type: 'string', description: 'Line editor mode: vi (default emacs)' },
-  'chat.enableHistoryHints': { type: 'boolean', default: false, description: 'Show history ghost hints while typing' },
+  'chat.disableAutoCompaction': {
+    type: 'boolean',
+    default: false,
+    description: 'Disable automatic conversation compaction (Claude Code DISABLE_AUTO_COMPACT; /compact still works)',
+  },
+  'compaction.excludeMessages': {
+    type: 'number',
+    default: 2,
+    description: 'Minimum message pairs kept verbatim by compaction (not supported in kiro-claude)',
+  },
+  'compaction.excludeContextWindowPercent': {
+    type: 'number',
+    default: 2,
+    description: 'Minimum percent of the context window kept by compaction (not supported in kiro-claude)',
+  },
+  'chat.editMode': { type: 'string', description: 'Line editor mode: vi (default emacs) (not supported in kiro-claude)' },
+  'chat.enableHistoryHints': { type: 'boolean', default: false, description: 'Show history ghost hints while typing (not supported in kiro-claude)' },
   'chat.enableContextUsageIndicator': { type: 'boolean', default: false, description: 'Show context usage percentage in the prompt' },
   'chat.historyMode': { type: 'string', default: 'session', description: 'Up/Down history scope: session or global' },
-  'chat.diffTool': { type: 'string', description: 'External diff tool used to show file changes (e.g. delta)' },
-  'chat.disableGranularTrust': { type: 'boolean', default: false, description: 'Disable the tiered trust menu in tool approvals' },
+  'chat.diffTool': { type: 'string', description: 'External diff tool used to show file changes (e.g. delta) (not supported in kiro-claude)' },
+  'chat.disableGranularTrust': {
+    type: 'boolean',
+    default: false,
+    description: 'Disable the tiered trust menu in tool approvals (not supported in kiro-claude, which has no tiered menu)',
+  },
   'chat.autoExpandToolOutput': { type: 'boolean', default: false, description: 'Show full tool output instead of a truncated preview' },
-  'chat.outputStyle': { type: 'string', description: 'Output style of the agent' },
+  'chat.outputStyle': { type: 'string', description: 'Output style of the agent (not supported in kiro-claude)' },
   'chat.showThinking': { type: 'boolean', default: true, description: 'Show model reasoning blocks' },
   'chat.enableThinking': { type: 'boolean', default: false, description: 'Enable the thinking tool (no effect: Claude thinks natively)' },
   'chat.allowAnimations': { type: 'boolean', default: true, description: 'Show spinners and animations' },
   'chat.allowAsciiArt': { type: 'boolean', default: true, description: 'Use Unicode glyphs (false: ASCII only)' },
-  'chat.allowIcons': { type: 'boolean', default: true, description: 'Show status icons' },
-  'chat.terminalTitle': { type: 'boolean', default: false, description: 'Set the terminal title', scope: 'global-only' },
-  'chat.screenReader': { type: 'string', default: 'auto', description: 'Screen reader mode: auto, on or off', scope: 'global-only' },
+  'chat.allowIcons': { type: 'boolean', default: true, description: 'Show status icons (not supported in kiro-claude)' },
+  'chat.terminalTitle': {
+    type: 'boolean',
+    default: false,
+    description: 'Set the terminal title (not supported in kiro-claude; /title sets it regardless)',
+    scope: 'global-only',
+  },
+  'chat.screenReader': {
+    type: 'string',
+    default: 'auto',
+    description: 'Screen reader mode: auto, on or off (not supported in kiro-claude)',
+    scope: 'global-only',
+  },
   'chat.agentEngine': { type: 'string', description: 'Kiro agent engine (v3, v2, v1); accepted and ignored', scope: 'global-only' },
   'chat.uiMode': { type: 'string', description: 'Legacy render mode; accepted and ignored', scope: 'global-only' },
   'chat.enableAutoAgentUpgrade': { type: 'boolean', description: 'Auto-upgrade 2.x agents to V3; accepted and ignored', scope: 'global-only' },
@@ -91,36 +123,76 @@ export const SETTINGS_SCHEMA: Record<string, SettingSchemaEntry> = {
   },
   'chat.enableKnowledge': { type: 'boolean', description: 'Enable knowledge bases (not supported by kiro-claude)' },
   'chat.enableCodeIntelligence': { type: 'boolean', description: 'Enable code intelligence (not supported by kiro-claude)' },
-  'chat.enableTangentMode': { type: 'boolean', default: false, description: 'Enable /tangent' },
-  'chat.tangentModeKey': { type: 'string', default: 't', description: 'Key (with Ctrl) that toggles tangent mode' },
-  'introspect.tangentMode': { type: 'boolean', default: false, description: 'Run introspect questions in a tangent' },
-  'chat.enableTodoList': { type: 'boolean', default: false, description: 'Enable /todos' },
-  'chat.enableCheckpoint': { type: 'boolean', default: false, description: 'Enable /checkpoint' },
+  'chat.enableTangentMode': {
+    type: 'boolean',
+    default: false,
+    description: 'Enable /tangent (not supported in kiro-claude; /tangent is always available)',
+  },
+  'chat.tangentModeKey': { type: 'string', default: 't', description: 'Key (with Ctrl) that toggles tangent mode (not supported in kiro-claude)' },
+  'introspect.tangentMode': { type: 'boolean', default: false, description: 'Run introspect questions in a tangent (not supported in kiro-claude)' },
+  'chat.enableTodoList': { type: 'boolean', default: false, description: 'Enable /todos (not supported in kiro-claude; /todos is always available)' },
+  'chat.enableCheckpoint': { type: 'boolean', default: false, description: 'Enable /checkpoint (not supported in kiro-claude)' },
   'chat.enableDelegate': { type: 'boolean', default: false, description: 'Enable the delegate tool (not supported)' },
   'chat.enableWorkflows': { type: 'boolean', default: false, description: 'Enable workflows (not supported)' },
   'chat.workflowLaunch': { type: 'string', default: 'when-asked', description: 'Workflow launch policy (not supported)' },
-  'chat.skimCommandKey': { type: 'string', default: 's', description: 'Key (with Ctrl) for fuzzy command search' },
-  'chat.autocompletionKey': { type: 'string', default: 'g', description: 'Key (with Ctrl) that accepts a completion hint' },
-  'chat.keybindings.cancelStream': { type: 'string', default: 'esc', description: 'Key that cancels a streaming response' },
-  'chat.keybindings.closeMenu': { type: 'string', default: 'esc', description: 'Key that closes a menu' },
-  'chat.keybindings.quit': { type: 'string', default: 'ctrl+c', description: 'Key that quits' },
-  'chat.sessionDashboard.scope': { type: 'string', default: 'current', description: 'Session list scope: current or all' },
-  'chat.sessionDashboard.indexResponses': { type: 'boolean', default: true, description: 'Index responses for session search' },
-  'chat.enableCustomSpinnerVerbs': { type: 'boolean', default: false, description: 'Use chat.spinnerVerbs' },
-  'chat.spinnerVerbs': { type: 'object', description: 'Custom spinner verbs: {"mode":"append"|"replace","verbs":[...]}' },
+  'chat.skimCommandKey': { type: 'string', default: 's', description: 'Key (with Ctrl) for fuzzy command search (not supported in kiro-claude)' },
+  'chat.autocompletionKey': {
+    type: 'string',
+    default: 'g',
+    description: 'Key (with Ctrl) that accepts a completion hint (not supported in kiro-claude)',
+  },
+  'chat.keybindings.cancelStream': {
+    type: 'string',
+    default: 'esc',
+    description: 'Key that cancels a streaming response (not supported in kiro-claude)',
+  },
+  'chat.keybindings.closeMenu': { type: 'string', default: 'esc', description: 'Key that closes a menu (not supported in kiro-claude)' },
+  'chat.keybindings.quit': { type: 'string', default: 'ctrl+c', description: 'Key that quits (not supported in kiro-claude)' },
+  'chat.sessionDashboard.scope': {
+    type: 'string',
+    default: 'current',
+    description: 'Session list scope: current or all (not supported in kiro-claude)',
+  },
+  'chat.sessionDashboard.indexResponses': {
+    type: 'boolean',
+    default: true,
+    description: 'Index responses for session search (not supported in kiro-claude)',
+  },
+  'chat.enableCustomSpinnerVerbs': { type: 'boolean', default: false, description: 'Use chat.spinnerVerbs (not supported in kiro-claude)' },
+  'chat.spinnerVerbs': {
+    type: 'object',
+    description: 'Custom spinner verbs: {"mode":"append"|"replace","verbs":[...]} (not supported in kiro-claude)',
+  },
   'chat.preserveScrollback': { type: 'boolean', default: true, description: 'Preserve terminal scrollback (accepted and ignored)' },
   // ── MCP / API / app ──
-  'mcp.initTimeout': { type: 'number', default: 5000, description: 'MCP server initialization timeout (ms)' },
+  'mcp.initTimeout': { type: 'number', default: 5000, description: 'MCP server initialization timeout (ms); passed to Claude Code as MCP_TIMEOUT when set' },
   'mcp.noInteractiveTimeout': { type: 'number', default: 30000, description: 'MCP initialization timeout in non-interactive mode (ms)' },
-  'mcp.loadedBefore': { type: 'boolean', description: 'Internal: the MCP safety note was shown' },
-  'api.timeout': { type: 'number', default: 3600, description: 'Request timeout (seconds)' },
-  'api.streamIdleSoftTimeout': { type: 'number', default: 60, description: 'Seconds without stream output before a stall warning' },
-  'api.streamIdleHardTimeout': { type: 'number', default: 300, description: 'Seconds without stream output before giving up' },
-  'api.subagentTimeout': { type: 'number', default: 3600, description: 'Subagent timeout (seconds)' },
-  'app.disableAutoupdates': { type: 'boolean', default: false, description: 'Disable automatic updates' },
-  'app.warnOnElevatedPrivileges': { type: 'boolean', default: true, description: 'Warn when running as root', scope: 'global-only' },
+  'mcp.loadedBefore': { type: 'boolean', description: 'Internal: the MCP safety note was shown (not supported in kiro-claude)' },
+  'api.timeout': { type: 'number', default: 3600, description: 'Request timeout (seconds); passed to Claude Code as API_TIMEOUT_MS when set' },
+  'api.streamIdleSoftTimeout': {
+    type: 'number',
+    default: 60,
+    description: 'Seconds without stream output before a stall warning (not supported in kiro-claude)',
+  },
+  'api.streamIdleHardTimeout': {
+    type: 'number',
+    default: 300,
+    description: 'Seconds without stream output before giving up (not supported in kiro-claude)',
+  },
+  'api.subagentTimeout': { type: 'number', default: 3600, description: 'Subagent timeout (seconds) (not supported in kiro-claude)' },
+  'app.disableAutoupdates': {
+    type: 'boolean',
+    default: false,
+    description: 'Disable automatic updates (not supported in kiro-claude, which never updates itself)',
+  },
+  'app.warnOnElevatedPrivileges': {
+    type: 'boolean',
+    default: true,
+    description: 'Warn when running as root (not supported in kiro-claude)',
+    scope: 'global-only',
+  },
   'acp.agentEngine': { type: 'string', description: 'ACP agent engine; accepted and ignored', scope: 'global-only' },
-  'telemetry.enabled': { type: 'boolean', description: 'Telemetry (kiro-claude sends none)' },
+  'telemetry.enabled': { type: 'boolean', description: 'Telemetry (not supported in kiro-claude, which sends none)' },
   'knowledge.defaultIncludePatterns': { type: 'array', description: 'Knowledge base include globs (not supported)' },
   'knowledge.defaultExcludePatterns': { type: 'array', description: 'Knowledge base exclude globs (not supported)' },
   'knowledge.maxFiles': { type: 'number', description: 'Knowledge base file limit (not supported)' },
@@ -129,7 +201,7 @@ export const SETTINGS_SCHEMA: Record<string, SettingSchemaEntry> = {
   'knowledge.indexType': { type: 'string', description: 'Knowledge base index type (not supported)' },
   'toolSearch.enabled': { type: 'boolean', description: 'Defer MCP tools behind tool search' },
   'toolSearch.minPct': { type: 'number', default: 5, description: 'Tool search threshold (% of context window)' },
-  'toolSearch.minTokens': { type: 'number', default: 50000, description: 'Tool search threshold (tokens)' },
+  'toolSearch.minTokens': { type: 'number', default: 50000, description: 'Tool search threshold (tokens) (not supported in kiro-claude)' },
   // ── kiro-claude adapter keys (kiro-claude.json) ──
   'kiroClaude.claudePath': {
     type: 'string',
@@ -154,7 +226,11 @@ export const SETTINGS_SCHEMA: Record<string, SettingSchemaEntry> = {
     description: 'Default spec workflow: requirements-first or design-first (unset: ask)',
   },
   'kiroClaude.spec.maxParallelTasks': { type: 'number', default: 1, description: 'Spec tasks run concurrently by /spec run (1-4)' },
-  'kiroClaude.autonomy': { type: 'string', default: 'autopilot', description: 'Agent autonomy: autopilot or supervised' },
+  'kiroClaude.autonomy': {
+    type: 'string',
+    default: 'autopilot',
+    description: 'Agent autonomy: autopilot or supervised (not supported in kiro-claude)',
+  },
 };
 
 /**
@@ -165,7 +241,7 @@ export const SETTINGS_SCHEMA: Record<string, SettingSchemaEntry> = {
  * A cloned repository must not control these, so they are honoured only from the global
  * (`KIRO_HOME`) settings: a workspace value is ignored with a ConfigWarning naming the key, and
  * `set(key, v, 'workspace')` is refused. Every other `kiroClaude.*` key (spec workflow
- * preferences, autonomy) keeps workspace-over-global semantics. (Found by grepping every
+ * preferences, the unimplemented autonomy) keeps workspace-over-global semantics. (Found by grepping every
  * `kiroClaude.` read in src/: session/launch.ts, session/kiroSession.ts, cli/commands/*.ts.)
  */
 export const CLAUDE_LAUNCH_KEYS: ReadonlySet<string> = new Set([

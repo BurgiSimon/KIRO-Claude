@@ -65,7 +65,7 @@ export type MockStep =
   | { raw: Record<string, unknown> }
   | { sleepMs: number }
   | { result: Partial<TurnResult> }
-  | { subagent: { state: 'started' | 'finished'; agentType: string; toolUseId?: string } }
+  | { subagent: { state: 'started' | 'finished'; agentType: string; toolUseId?: string; description?: string; prompt?: string; isError?: boolean; error?: string } }
   | { compaction: true };
 
 export interface MockTurn {
@@ -86,6 +86,8 @@ export interface MockWorld {
   /** Make `start()` fail with this message. */
   startError?: string;
   toolListing?: ToolListingEntry[];
+  /** What `steer()` returns (default: nothing, i.e. the line's uuid is unknown to the server). */
+  steerLine?: (text: string) => { uuid: string; withdraw(): Promise<boolean> } | void;
 }
 
 export function createWorld(turns: MockTurn[] = []): MockWorld {
@@ -358,9 +360,10 @@ export class MockSession extends EventEmitter implements KiroSession {
     };
   }
 
-  steer(text: string): void {
+  steer(text: string): { uuid: string; withdraw(): Promise<boolean> } | void {
     this.world.calls.push(`steer:${text}`);
     this.steers.push(text);
+    return this.world.steerLine?.(text);
   }
 
   async interrupt(): Promise<void> {

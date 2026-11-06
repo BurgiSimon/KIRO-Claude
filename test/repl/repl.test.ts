@@ -162,6 +162,271 @@ test('repl: Ctrl+C during a turn interrupts the session', async () => {
   run.t.cleanup();
 });
 
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** Poll `cond` (bounded, so a regression fails instead of hanging the suite). */
+async function until(cond: () => boolean, ms = 15_000): Promise<void> {
+  const t0 = Date.now();
+  while (!cond() && Date.now() - t0 < ms) await sleep(5);
+}
+
+/** A slash command that runs until the session is interrupted (or closed), e.g. a summary turn. */
+function slowCommand(onRun?: () => void): SlashCommand {
+  return {
+    name: 'slow',
+    summary: 'test: runs until interrupted',
+    async run(_args, _raw, host) {
+      onRun?.();
+      const s = host.session as MockSession;
+      await until(() => s.interrupted > 0 || s.closed);
+      host.print(s.closed ? 'slow: closed' : 'slow: interrupted');
+    },
+  };
+}
+
+for (const tty of [false, true]) {
+  test(`repl: Ctrl+C during a slash command interrupts the session, not the next prompt (C11, ${tty ? 'terminal' : 'line'} mode)`, { timeout: 20_000 }, async () => {
+    const s = new MockSession();
+    let started = false;
+    const run = startRepl({ session: s, tty, keepOpen: true, extraCommands: [slowCommand(() => (started = true))] });
+    const nl = tty ? '\r' : '\n';
+    await run.waitFor('> ');
+    run.stdin.write(`/slow${nl}`);
+    await until(() => started);
+    run.stdin.write(tty ? '\u0003' : '\u0003\n');
+    await run.waitFor('slow: interrupted');
+    await sleep(30);
+    assert.equal(s.interrupted, 1);
+    assert.ok(!run.out().includes('To exit the CLI'), `no exit hint from a press made during the command:\n${run.out()}`);
+    // one more press at the idle prompt is the FIRST exit press (hint), not the second
+    run.stdin.write(tty ? '\u0003' : '\u0003\n');
+    await run.waitFor('To exit the CLI');
+    run.stdin.write(tty ? '/quit\r' : '/quit\n');
+    assert.equal(await run.exit, 0);
+    assert.equal(s.closed, true);
+    assert.equal(run.sessions.length, 1, 'no forced stop for a command that ended after the interrupt');
+    run.t.cleanup();
+  });
+}
+
+test('repl: a second Ctrl+C within the grace while the turn ends normally does not stop Claude Code (C16)', { timeout: 20_000 }, async () => {
+  let run!: ReturnType<typeof startRepl>;
+  const s = new MockSession().script(
+    {
+      steps: [
+        text('working...'),
+        {
+          run: () => {
+            run.send('\u0003');
+            run.send('\u0003');
+          },
+        },
+        { waitInterrupt: true },
+      ],
+      result: { stopReason: 'cancelled' },
+    },
+    { result: { text: 'second answer' } },
+  );
+  run = startRepl({ session: s, input: ['long task'], keepOpen: true });
+  await run.waitFor('working...');
+  await sleep(1300); // past the grace
+  run.send('next');
+  await run.waitFor('second answer');
+  run.send('/quit');
+  assert.equal(await run.exit, 0);
+  assert.equal(s.interrupted, 1);
+  assert.equal(s.called('close').length, 1, 'closed once, at exit');
+  assert.equal(run.sessions.length, 1);
+  assert.ok(!run.out().includes('did not stop'), run.out());
+  run.t.cleanup();
+});
+
+test('repl: a second Ctrl+C stops Claude Code when the turn does not end; the next input resumes the session (C16)', { timeout: 20_000 }, async () => {
+  let run!: ReturnType<typeof startRepl>;
+  // the session ignores the interrupt: the turn only ends once the session is closed
+  const s = new MockSession().script({
+    steps: [
+      text('working...'),
+      { run: () => run.send('\u0003') },
+      {
+        run: async ({ session }) => {
+          await until(() => session.interrupted > 0);
+          run.send('\u0003');
+          await until(() => session.closed);
+        },
+      },
+    ],
+    result: { stopReason: 'cancelled' },
+    noRecord: true,
+  });
+  s.trust.trustAll = true;
+  const next = new MockSession({ id: s.id }).script({ result: { text: 'second answer' } });
+  run = startRepl({ session: s, input: ['long task'], keepOpen: true, nextSession: () => next, sessionOptions: { trustTools: ['read'] } });
+  await run.waitFor('working...');
+  // the record exists on disk (a finished earlier turn): the session is resumed under its id
+  const { SessionStore, sessionsDir } = await import('../../src/session/store.js');
+  new SessionStore(sessionsDir(run.ws)).write({ ...s.record, turns: [{ userUuid: 'u0', assistantUuid: 'a0', preview: 'earlier', at: new Date().toISOString() }], messageCount: 1 });
+  await run.waitFor('Claude Code did not stop after the interrupt; stopping it.', 5000);
+  await run.waitFor(/stopping it\.\n[\s\S]*> $/, 5000);
+  assert.equal(s.closed, true, 'the stuck session was closed');
+  assert.equal(run.sessions.length, 1, 're-created lazily, at the next input');
+  run.send('next');
+  await run.waitFor('second answer', 5000);
+  assert.equal(run.sessions.length, 2);
+  const o = run.created[1]!;
+  assert.deepEqual(o.resume, { sessionId: s.id });
+  assert.equal(o.trustAllTools, true, 'trust-all as it was');
+  assert.deepEqual(o.trustTools, ['read'], 'launch options kept');
+  assert.equal(o.agentName, s.agent.name);
+  assert.deepEqual(next.prompts.map((p) => p.text), ['next']);
+  run.send('/quit');
+  assert.equal(await run.exit, 0);
+  assert.equal(next.closed, true);
+  assert.equal(s.interrupted, 1, 'one interrupt; the second press escalates');
+  run.t.cleanup();
+});
+
+test('repl: a forced stop of a conversation without a finished turn starts a new one; /quit does not restart (C16)', { timeout: 20_000 }, async () => {
+  let run!: ReturnType<typeof startRepl>;
+  const stuck = (): MockSession =>
+    new MockSession().script({
+      steps: [
+        { run: () => run.send('\u0003') },
+        {
+          run: async ({ session }) => {
+            await until(() => session.interrupted > 0);
+            run.send('\u0003');
+            await until(() => session.closed);
+          },
+        },
+      ],
+      noRecord: true,
+    });
+  const s = stuck();
+  run = startRepl({ session: s, input: ['first'], keepOpen: true });
+  await run.waitFor(/stopping it\.\n[\s\S]*> $/, 5000);
+  run.send('again');
+  await run.waitFor(/again\n[\s\S]*> $/, 5000);
+  assert.equal(run.sessions.length, 2);
+  assert.equal(run.created[1]!.resume, undefined, 'nothing to resume: closing dropped the empty record');
+  assert.deepEqual(run.sessions[1]!.prompts.map((p) => p.text), ['again']);
+  run.t.cleanup();
+  // stopped, then /quit: no new session just to close it
+  const s2 = stuck();
+  const run2 = (run = startRepl({ session: s2, input: ['first'], keepOpen: true }));
+  await run2.waitFor(/stopping it\.\n[\s\S]*> $/, 5000);
+  run2.send('/quit');
+  assert.equal(await run2.exit, 0);
+  assert.equal(run2.sessions.length, 1);
+  assert.ok(run2.out().endsWith(`To resume this session: kiro-claude chat --resume-id ${s2.id}\n`), run2.out());
+  run2.t.cleanup();
+});
+
+test('repl: a second Ctrl+C stops Claude Code during a stuck slash command too (C16)', { timeout: 20_000 }, async () => {
+  const s = new MockSession();
+  const cmd: SlashCommand = {
+    name: 'stuck',
+    summary: 'test: ignores the interrupt',
+    async run(_a, _r, host) {
+      const ss = host.session as MockSession;
+      await until(() => ss.closed);
+      throw new Error('Merge cancelled — interrupted');
+    },
+  };
+  const run = startRepl({ session: s, keepOpen: true, extraCommands: [cmd] });
+  await run.waitFor('> ');
+  run.send('/stuck');
+  await sleep(50);
+  run.send('\u0003');
+  await sleep(50);
+  run.send('\u0003');
+  await run.waitFor('Claude Code did not stop after the interrupt; stopping it.', 5000);
+  await run.waitFor('Failed to execute command: Merge cancelled — interrupted', 5000);
+  assert.equal(s.interrupted, 1);
+  assert.ok(!run.out().includes('To exit the CLI'), run.out());
+  run.send('/session-id');
+  await run.waitFor(/\/session-id\n[\s\S]*> $/, 5000);
+  assert.equal(run.sessions.length, 2, 're-created for the next command');
+  run.send('/quit');
+  assert.equal(await run.exit, 0);
+  run.t.cleanup();
+});
+
+/** A session whose turn ignores the interrupt; `presses` sends Ctrl+C twice (the forced stop). */
+function stuckSession(press: () => void): MockSession {
+  return new MockSession().script({
+    steps: [
+      { run: press },
+      {
+        run: async ({ session }) => {
+          await until(() => session.interrupted > 0);
+          press();
+          await until(() => session.closed);
+        },
+      },
+    ],
+    noRecord: true,
+  });
+}
+
+for (const tty of [false, true]) {
+  test(`repl: Ctrl+C while Claude Code is being restarted cancels that input and is not replayed at the next prompt (C16, ${tty ? 'terminal' : 'line'} mode)`, { timeout: 20_000 }, async () => {
+    let run!: ReturnType<typeof startRepl>;
+    const press = (): void => {
+      run.stdin.write(tty ? '\u0003' : '\u0003\n');
+    };
+    const nl = tty ? '\r' : '\n';
+    const s = stuckSession(press);
+    const next = new MockSession().script({ result: { text: 'second answer' } });
+    let starting = false;
+    next.start = async (): Promise<void> => {
+      starting = true;
+      await sleep(400); // spawning and initializing Claude Code takes a while
+      next.started = true;
+    };
+    run = startRepl({ session: s, tty, keepOpen: true, nextSession: () => next });
+    await run.waitFor('> ');
+    run.stdin.write(`long task${nl}`);
+    await run.waitFor(/stopping it\.\n[\s\S]*> $/, 5000);
+    const mark = run.out().length;
+    run.stdin.write(`next${nl}`);
+    await until(() => starting);
+    press();
+    await sleep(50);
+    press(); // impatient double tap while the restart runs
+    await run.waitFor(/> $/, 5000);
+    await sleep(100);
+    assert.equal(run.sessions.length, 2, 'Claude Code was restarted');
+    assert.deepEqual(next.prompts, [], 'the input the restart was for was cancelled');
+    const after = run.out().slice(mark);
+    assert.ok(!after.includes('To exit the CLI'), `no replayed exit press:\n${after}`);
+    // the next idle press is the FIRST exit press
+    press();
+    await run.waitFor('To exit the CLI');
+    run.stdin.write(`/quit${nl}`);
+    assert.equal(await run.exit, 0);
+    assert.equal(next.closed, true);
+    run.t.cleanup();
+  });
+}
+
+test('repl: a failed restart after a forced stop reports it and exits 1 (C16)', { timeout: 20_000 }, async () => {
+  let run!: ReturnType<typeof startRepl>;
+  const s = stuckSession(() => run.send('\u0003'));
+  const next = new MockSession();
+  next.start = async (): Promise<void> => {
+    throw new Error('claude exited during start');
+  };
+  run = startRepl({ session: s, input: ['long task'], keepOpen: true, nextSession: () => next });
+  await run.waitFor(/stopping it\.\n[\s\S]*> $/, 5000);
+  run.send('next');
+  assert.equal(await run.exit, 1);
+  assert.ok(run.out().includes('Failed to restart Claude Code: claude exited during start'), run.out());
+  assert.equal(next.closed, true, 'the half-started session was closed');
+  assert.deepEqual(next.prompts, []);
+  run.t.cleanup();
+});
+
 test('repl: multi-line input (trailing backslash, code fences)', async () => {
   const s = new MockSession().script({}, {});
   const { run } = await runToEnd({ session: s, input: ['line one\\', 'line two', '```', 'code here', '```'] });

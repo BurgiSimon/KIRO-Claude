@@ -35,7 +35,7 @@ async function currentEntry(r: ReplContext): Promise<{ entries: ModelEntry[]; en
 export const modelCommand: BuiltinCommand = {
   name: 'model',
   summary: 'Select a model for the current conversation session',
-  usage: '/model                       Pick a model\n/model <id>                  Switch to <id>\n/model set-current-as-default  Make the current model the default for new sessions',
+  usage: '/model                       Pick a model\n/model <id | name>           Switch to <id> or <name> (e.g. Haiku 4.5)\n/model set-current-as-default  Make the current model the default for new sessions',
   async run(args, _raw, r) {
     const sub = args[0];
     if (sub === 'set-current-as-default') {
@@ -63,9 +63,12 @@ export const modelCommand: BuiltinCommand = {
       if (idx === undefined) return;
       chosen = entries[idx];
     } else {
-      chosen = findModelEntry(entries, sub);
+      // the whole argument is the id or name (01 §5.4): `/model Haiku 4.5` as the picker shows
+      // it; its first word alone could match another model's alias (`haiku` = the newest Haiku)
+      const name = args.join(' ');
+      chosen = findModelEntry(entries, name);
       if (!chosen) {
-        r.write(`\n${c.red(`Model '${sub}' does not exist. Available models: ${entries.map((e) => e.kiroId).join(', ')}`)}\n\n`);
+        r.write(`\n${c.red(`Model '${name}' does not exist. Available models: ${entries.map((e) => e.kiroId).join(', ')}`)}\n\n`);
         return;
       }
     }

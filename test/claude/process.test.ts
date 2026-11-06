@@ -255,15 +255,18 @@ describe('turns', () => {
     await waitFor(() => results.length === 2 && !h.proc.busy, 5000, 'two results');
   });
 
-  it('priority "next" folds a steer message into the running turn', async () => {
+  it('priority "next" with no tool boundary left is answered in its own turn, inside the same turn()', async () => {
+    // claude 2.1.319 folds a `next` line in only at a tool boundary; otherwise it runs it right
+    // after the result (VERIFIED), and turn() continues through that turn (see steer-queue.test.ts)
     const h = await fake({ script: { turns: [{ steps: [{ sleepMs: 300 }, { text: 'done' }] }] } });
     const steerUuid = '22222222-2222-4222-8222-222222222222';
     const gen = h.proc.turn('long task');
     const p = collectTurn(gen);
     await new Promise((r) => setTimeout(r, 60));
     h.proc.sendUserMessage('also do X', { uuid: steerUuid, priority: 'next' });
-    const { result } = await p;
+    const { frames, result } = await p;
     assert.ok(result.user_message_uuids?.includes(steerUuid));
+    assert.equal(frames.filter((f) => f.type === 'result').length, 2);
     assert.equal(h.proc.busy, false);
     assert.equal(h.stdinLines().find((l) => l.uuid === steerUuid)!.priority, 'next');
   });

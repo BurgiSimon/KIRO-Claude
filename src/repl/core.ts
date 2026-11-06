@@ -25,8 +25,17 @@
  * already did so (detected through the last `record.turns` preview — the contract leaves open
  * which side sends it).
  *
- * Ctrl+C during a turn ⇒ `session.interrupt()`; a second Ctrl+C aborts the prompt's signal.
- * At the idle prompt the first Ctrl+C / Ctrl+D prints Q's hint, the second exits.
+ * Ctrl+C during a turn, or during a slash command that runs without a turn of the REPL's own
+ * (`/tangent merge` runs a model summary turn, `/agent swap` respawns Claude Code), ⇒
+ * `session.interrupt()`; the press is never kept as type-ahead for the next prompt. A second
+ * Ctrl+C aborts the prompt's signal and, when the turn / command still runs
+ * {@link FORCE_STOP_GRACE_MS} later (Claude Code did not end it after the interrupt), stops
+ * Claude Code like headless (session close) and ACP (`replaceStuckSession`) do: the session is
+ * closed (stdin EOF, SIGTERM after 2 s, then SIGKILL; 00 §2.3 / 04 §8.4), the REPL returns to
+ * its prompt and the next input re-creates the session with `--resume` (a conversation without
+ * a finished turn, which closing drops, starts afresh; a tangent continues as its own
+ * conversation; a Ctrl+C while it restarts cancels that input). At the idle prompt the first
+ * Ctrl+C / Ctrl+D prints Q's hint, the second exits.
  *
  * Slash commands are shlex-split; unbalanced quotes fall back to a whitespace split so free-text
  * commands (`/plan I don't …`) work. `/<steering>` sends `#steering:<name> …` with
@@ -43,7 +52,7 @@ import { loadPrompts, findPrompt, expandPrompt, parsePromptInvocation } from '..
 import { discoverSkills, expandSkillInvocation, pluginSkillName } from '../config/skills.js';
 import { loadSteering } from '../config/steering.js';
 import { findModelEntry } from '../models/models.js';
-import { previewText } from '../session/store.js';
+import { SessionStore, previewText, sessionsDir } from '../session/store.js';
 import type {
   ApprovalRequest,
   ApprovalResponse,
@@ -73,6 +82,13 @@ import { Spinner, TurnRenderer } from './render.js';
 import type { EditorResult, ReplContext, ReplDeps, ReplSessionOptions, RunReplOptions, TranscriptEntry } from './types.js';
 
 const USAGE_TIMEOUT_MS = 2000;
+/** After a second Ctrl+C: how long the turn / command may still take before Claude Code is stopped. */
+export const FORCE_STOP_GRACE_MS = 1000;
+/** Bound on closing a stopped session (ClaudeProcess.close: stdin EOF, 2 s, SIGTERM, 2 s, SIGKILL). */
+const FORCE_CLOSE_TIMEOUT_MS = 10_000;
+/** A turn / command still unfinished this long after its session was closed is abandoned. */
+const ABANDON_AFTER_CLOSE_MS = 2000;
+const ABANDONED = Symbol('abandoned');
 const NOTIFY_TERMS = [
   'xterm', 'xterm-256color', 'screen', 'screen-256color', 'tmux', 'tmux-256color', 'rxvt', 'rxvt-unicode', 'linux',
   'konsole', 'gnome', 'gnome-256color', 'alacritty', 'iterm2', 'eat-truecolor', 'eat-256color', 'eat-color',
@@ -122,6 +138,21 @@ function previewMatches(stored: string | undefined, text: string): boolean {
   return a === b || a.startsWith(b) || b.startsWith(a);
 }
 
+/** Ctrl+C handling while a turn or a slash command runs (see the module doc). */
+interface InterruptScope {
+  /** The reader's `'interrupt'` listener. */
+  readonly listener: () => void;
+  /** Presses counted so far. */
+  readonly presses: number;
+  /**
+   * Resolves {@link ABANDONED} {@link ABANDON_AFTER_CLOSE_MS} after a forced stop of this scope
+   * closed the session (never otherwise).
+   */
+  readonly abandoned: Promise<typeof ABANDONED>;
+  /** The turn / command is over: no forced stop starts any more. */
+  end(): void;
+}
+
 export class Repl implements ReplContext {
   readonly ctx: CliContext;
   readonly ws: WorkspaceContext;
@@ -147,6 +178,8 @@ export class Repl implements ReplContext {
   private approving = false;
   private deferred: SessionEvent[] = [];
   private sigHandler: (() => void) | undefined;
+  /** A session closed by a forced stop (second Ctrl+C); re-created at the next input. */
+  private stoppedSession: { session: KiroSession; closing: Promise<void>; tangentParent?: string } | undefined;
 
   constructor(
     private readonly opts: RunReplOptions,
@@ -530,6 +563,12 @@ export class Repl implements ReplContext {
   async submit(raw: string): Promise<void | 'quit'> {
     const text = sanitizeUnicodeTags(raw).trim();
     if (text === '') return;
+    // Claude Code was stopped (second Ctrl+C): bring the session back first (not just to quit)
+    if (this.stoppedSession && !this.isQuitCommand(text)) {
+      const restarted = await this.restartStopped();
+      if (restarted === 'failed') return 'quit';
+      if (restarted === 'cancelled') return;
+    }
     if (text.startsWith('/')) return this.runSlash(text);
     if (text.startsWith('!')) {
       await this.runBang(text.slice(1));
@@ -543,6 +582,11 @@ export class Repl implements ReplContext {
       }
     }
     return this.sendPrompt({ text });
+  }
+
+  private isQuitCommand(text: string): boolean {
+    const m = /^\/(\S+)\s*$/.exec(text);
+    return !!m && this.registry.find(m[1]!)?.cmd.name === 'quit';
   }
 
   private async runSlash(text: string): Promise<void | 'quit'> {
@@ -563,13 +607,26 @@ export class Repl implements ReplContext {
         this.write(formatCommandHelp(entry.cmd));
         return;
       }
+      // Ctrl+C while the command runs outside a turn of its own (`/tangent merge`'s summary
+      // turn, a Claude Code respawn) interrupts the session instead of waiting as type-ahead
+      // for the next prompt (where it would count as an exit press); a turn the command starts
+      // handles its own presses (runEvents)
+      const scope = this.interruptScope(undefined, () => !this.turnActive);
+      this.reader.on('interrupt', scope.listener);
       try {
-        const r = await (entry.cmd as SlashCommand).run(args, raw, this);
+        const r = await this.unlessAbandoned((entry.cmd as SlashCommand).run(args, raw, this), scope);
+        if (r === ABANDONED) {
+          this.write(`\n${c.red('Failed to execute command: Claude Code was stopped')}\n\n`);
+          return this.quitting ? 'quit' : undefined;
+        }
         if (r === 'quit') this.quitting = true;
         return this.quitting ? 'quit' : r;
       } catch (e) {
         this.write(`\n${c.red(`Failed to execute command: ${errText(e)}`)}\n\n`);
         return this.quitting ? 'quit' : undefined;
+      } finally {
+        scope.end();
+        this.reader.off('interrupt', scope.listener);
       }
     }
     // /<prompt> args (V3), prompts first (00 §2.2)
@@ -625,20 +682,135 @@ export class Repl implements ReplContext {
     return errorResult('a response is still running', false);
   }
 
-  /** Render a session event stream like a turn (Ctrl+C ⇒ interrupt, twice ⇒ abort). */
+  /**
+   * Ctrl+C while a turn or slash command runs (see the module doc): the first press interrupts
+   * the session; a second one runs `onSecond` and arms the forced stop. `active` limits the
+   * scope (a command's scope ignores presses while a turn it started handles them).
+   */
+  private interruptScope(onSecond?: () => void, active: () => boolean = () => true): InterruptScope {
+    let presses = 0;
+    let ended = false;
+    let timer: NodeJS.Timeout | undefined;
+    let resolveStopped!: () => void;
+    const abandoned = new Promise<void>((resolve) => {
+      resolveStopped = resolve;
+    }).then(
+      () =>
+        new Promise<typeof ABANDONED>((resolve) => {
+          const t = setTimeout(() => resolve(ABANDONED), ABANDON_AFTER_CLOSE_MS);
+          t.unref?.();
+        }),
+    );
+    const listener = (): void => {
+      if (ended || !active()) return;
+      presses++;
+      if (presses === 1) {
+        void this.current.interrupt().catch(() => undefined);
+        return;
+      }
+      onSecond?.();
+      if (timer || this.stoppedSession) return;
+      timer = setTimeout(() => {
+        if (ended) return;
+        void this.forceStop().then(resolveStopped);
+      }, FORCE_STOP_GRACE_MS);
+      timer.unref?.();
+    };
+    return {
+      listener,
+      get presses() {
+        return presses;
+      },
+      abandoned,
+      end(): void {
+        ended = true;
+        if (timer) clearTimeout(timer);
+      },
+    };
+  }
+
+  /**
+   * Stop Claude Code: close the current session (its child gets stdin EOF, SIGTERM after 2 s,
+   * then SIGKILL; the stuck turn ends with it). The REPL keeps the closed session until the
+   * next input re-creates it ({@link restartStopped}).
+   */
+  private forceStop(): Promise<void> {
+    if (this.stoppedSession) return this.stoppedSession.closing;
+    const session = this.current;
+    this.notice('warn', 'Claude Code did not stop after the interrupt; stopping it.');
+    const tangentParent = session.tangent?.parentId;
+    const closing = withTimeout(session.close(), FORCE_CLOSE_TIMEOUT_MS).then(() => undefined);
+    this.stoppedSession = { session, closing, ...(tangentParent ? { tangentParent } : {}) };
+    return closing;
+  }
+
+  /** `p`, or {@link ABANDONED} when a forced stop closed the session and `p` still did not settle. */
+  private unlessAbandoned<T>(p: Promise<T>, scope: InterruptScope): Promise<T | typeof ABANDONED> {
+    return Promise.race([p, scope.abandoned]);
+  }
+
+  /**
+   * After a forced stop: re-create the stopped session under its id with `--resume` (agent,
+   * model, effort, trust-all as they were; per-tool trust, context rules and plan mode come back
+   * with the record), or a new one when closing dropped the record (no finished turn yet).
+   * `'failed'` when that failed (the REPL then exits 1). A Ctrl+C while this runs (spawning
+   * Claude Code takes a while) cancels the input it runs for (`'cancelled'`; the session is
+   * still re-created) instead of waiting as type-ahead, where it would count as an exit press.
+   */
+  private async restartStopped(): Promise<'ok' | 'cancelled' | 'failed'> {
+    const st = this.stoppedSession;
+    if (!st) return 'ok';
+    this.stoppedSession = undefined;
+    let pressed = false;
+    const onPress = (): void => {
+      pressed = true;
+    };
+    this.reader.on('interrupt', onPress);
+    try {
+      await st.closing;
+      // replaced meanwhile (e.g. a spec task session handed back): nothing to re-create
+      if (this.current === st.session) {
+        const old = st.session;
+        let resumable = false;
+        try {
+          resumable = new SessionStore(sessionsDir(this.ws)).read(old.id) !== undefined;
+        } catch {
+          resumable = false;
+        }
+        let fresh: KiroSession | undefined;
+        try {
+          fresh = await this.createSession({ trustAllTools: old.trust.trustAll, ...(resumable ? { resume: { sessionId: old.id } } : {}) });
+          await fresh.start();
+        } catch (e) {
+          if (fresh) await fresh.close().catch(() => undefined);
+          this.write(`\n${c.red(`Failed to restart Claude Code: ${errText(e)}`)}\n\n`);
+          this.requestExit(1);
+          return 'failed';
+        }
+        this.replaceSession(fresh);
+        if (st.tangentParent && resumable) {
+          this.write(`${c.gray(`The tangent continues as its own conversation; the main one is saved as ${st.tangentParent} (/chat resume).`)}\n`);
+        }
+      }
+    } finally {
+      this.reader.off('interrupt', onPress);
+    }
+    if (pressed) {
+      this.write('\n');
+      return 'cancelled';
+    }
+    return 'ok';
+  }
+
+  /** Render a session event stream like a turn (Ctrl+C ⇒ interrupt, twice ⇒ stop Claude Code). */
   async runEvents(
     start: (signal: AbortSignal) => AsyncGenerator<SessionEvent, TurnResult>,
   ): Promise<{ result: TurnResult; seen: Set<SessionEvent['type']> }> {
     const busy = this.refuseNestedTurn();
     if (busy) return { result: busy, seen: new Set() };
     const ac = new AbortController();
-    let interrupts = 0;
-    const onInterrupt = (): void => {
-      interrupts++;
-      if (interrupts === 1) void this.current.interrupt().catch(() => undefined);
-      else ac.abort();
-    };
-    this.reader.on('interrupt', onInterrupt);
+    const scope = this.interruptScope(() => ac.abort());
+    this.reader.on('interrupt', scope.listener);
     this.turnActive = true;
     this.renderer.beginTurn();
     this.spinner.start();
@@ -647,9 +819,14 @@ export class Repl implements ReplContext {
     try {
       const gen = start(ac.signal);
       for (;;) {
-        const n = await gen.next();
+        const n = await this.unlessAbandoned(gen.next(), scope);
+        if (n === ABANDONED) {
+          void gen.return(errorResult('stopped', true)).catch(() => undefined);
+          result = errorResult('Claude Code was stopped', true);
+          break;
+        }
         if (n.done) {
-          result = n.value ?? errorResult('the turn ended without a result', interrupts > 0);
+          result = n.value ?? errorResult('the turn ended without a result', scope.presses > 0);
           break;
         }
         seen.add(n.value.type);
@@ -662,10 +839,11 @@ export class Repl implements ReplContext {
         if (n.value.type === 'tool_end') this.spinner.start();
       }
     } catch (e) {
-      result = errorResult(errText(e), interrupts > 0 || ac.signal.aborted);
+      result = errorResult(errText(e), scope.presses > 0 || ac.signal.aborted);
     } finally {
+      scope.end();
       this.spinner.stop();
-      this.reader.off('interrupt', onInterrupt);
+      this.reader.off('interrupt', scope.listener);
       this.turnActive = false;
       // an approval still open when the stream ended (withdrawn request): keep the order
       if (!this.approving) this.flushDeferred();
@@ -695,7 +873,7 @@ export class Repl implements ReplContext {
       this.redirectText = undefined;
       this.log.push({ role: 'user', text: cur.text, at: new Date().toISOString() });
       ({ result } = await this.runEvents((signal) => this.current.prompt(cur, { signal })));
-      if (this.quitting) break;
+      if (this.quitting || this.stoppedSession) break;
       const redirect = this.redirectText as string | undefined;
       this.redirectText = undefined;
       if (redirect !== undefined) {

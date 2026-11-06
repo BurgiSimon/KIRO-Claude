@@ -315,6 +315,8 @@ function out(rt: SpecRuntime, text: string): void {
 /** Why a turn failed, or undefined when it completed normally. */
 export function turnFailure(r: TurnResult): string | undefined {
   if (r.stopReason === 'cancelled') return 'interrupted';
+  // Claude's own text says "Please run /login", a command the chat does not have
+  if (r.authError) return 'you are not logged in to Claude Code (run kiro-claude login)';
   if (r.isError || r.stopReason === 'error') return r.error || 'the turn ended with an error';
   if (r.stopReason === 'max_turns') return 'the turn hit the maximum number of turns';
   if (r.stopReason === 'refusal') return 'the model refused the request';

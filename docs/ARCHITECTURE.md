@@ -48,7 +48,7 @@ credentials.
 * Driving the official `claude` binary in headless stream-json mode is the supported way to
   automate Claude Code. Authentication stays inside Claude Code.
 
-## Permission gate (verified against claude 2.1.318)
+## Permission gate (verified against claude 2.1.318 and 2.1.319)
 
 The first stdin line is a control-protocol `initialize` request registering in-process hook
 callbacks. `PreToolUse` (no matcher → every tool, including tools Claude would auto-allow)
@@ -71,6 +71,23 @@ Claude Code fixes the system prompt per process. Changing agent, context files, 
 or tools mid-session restarts the `claude` child with `--resume <session-id>` and
 `--system-prompt-snapshot off` (when supported), so history is kept and the new appended
 system prompt takes effect. Model changes use the `set_model` control request when possible.
+
+## Steering a running turn (ACP `_session/steer`)
+
+A steer is held by the ACP server and written to Claude Code at the next tool boundary as a
+user line with `priority: "next"`. Claude Code folds such a line into the running turn at its
+next tool boundary, or answers it in a turn of its own right after the result; its
+`command_lifecycle` frames (`queued`, `started`, `completed`, `cancelled`) say which.
+kiro-claude reports `AgentExecutionSteeringInjected` when Claude Code *starts* the line (not
+when it is written), keeps such a turn's reply inside the same prompt request, and starts the
+reply on a new paragraph. A steer still held when the turn ends is sent as a continuation
+prompt inside the same request.
+
+`_session/steer/clear` drops the held steers and withdraws written ones Claude Code has not
+started yet (`cancel_async_message`), reporting all of them in one
+`AgentExecutionUserMessageCleared`. `session/cancel` sends `interrupt` with `cancel_queued`
+(when the installed Claude Code supports it), so a written steer never runs in a turn the client
+cannot see.
 
 ## KiroCrew (persistent pipeline) on Claude Code
 

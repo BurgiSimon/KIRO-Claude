@@ -392,7 +392,8 @@ describe('session: hooks', () => {
       const { events, result } = await drain(s.prompt({ text: 'start' }));
       assert.equal(result.text, 'continued');
       assert.deepEqual(sb.userLines().map(contentText), ['start', 'keep going']);
-      assert.deepEqual(semantic(events).filter((e) => e.type === 'text_delta').map((e) => (e as { text: string }).text).join(''), 'firstcontinued');
+      // the continuation's answer is a new paragraph, not glued onto the first one (C18)
+      assert.deepEqual(semantic(events).filter((e) => e.type === 'text_delta').map((e) => (e as { text: string }).text).join(''), 'first\n\ncontinued');
       assert.equal(s.record.turns.length, 2);
     } finally {
       await closeAll(s);
@@ -484,7 +485,7 @@ describe('session: events and tracking', () => {
     }
   });
 
-  it('subagent events, rate limits (rejected ⇒ notice), auth errors', async () => {
+  it('subagent events, rate limits (rejected ⇒ one rate_limit event, no extra notice), auth errors', async () => {
     const sb = mkSandbox({
       script: {
         turns: [
@@ -507,7 +508,8 @@ describe('session: events and tracking', () => {
       assert.deepEqual(sem.filter((e) => e.type === 'subagent').map((e) => (e as { state: string }).state), ['started', 'finished']);
       const rl = sem.find((e) => e.type === 'rate_limit') as Extract<SessionEvent, { type: 'rate_limit' }>;
       assert.deepEqual(rl, { type: 'rate_limit', status: 'rejected', resetsAt: 1794081600, utilization: 1 });
-      assert.ok(sem.some((e) => e.type === 'notice' && e.level === 'error' && /usage limit/.test(e.message)));
+      // the front ends render the rejected rate_limit themselves: a session notice would be a second message (C19)
+      assert.equal(sem.some((e) => e.type === 'notice' && /usage limit/.test(e.message)), false);
       const usage = await s.usage();
       assert.equal(usage.rateLimit?.status, 'rejected');
       assert.equal(usage.rateLimit?.window, 'five_hour');
@@ -515,6 +517,8 @@ describe('session: events and tracking', () => {
       assert.equal(auth.result.authError, true);
       assert.equal(auth.result.isError, true);
       assert.equal(auth.result.stopReason, 'error');
+      // Claude's synthetic 'Not logged in · Please run /login' is not rendered as the answer (C20)
+      assert.equal(semantic(auth.events).filter((e) => e.type === 'text' || e.type === 'text_delta').length, 0);
     } finally {
       await closeAll(s);
     }

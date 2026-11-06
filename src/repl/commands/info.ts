@@ -65,6 +65,12 @@ export const hooksCommand: BuiltinCommand = {
         return;
       }
       const out = await r.session.runManualHook(name);
+      if (hook.action.type === 'agent') {
+        // an agent action's prompt goes to the model as its own user turn (03 §2.5)
+        if (out.trim()) return r.sendPrompt({ text: out });
+        r.write(`\n${c.gray(`Hook '${name}' has an empty prompt.`)}\n\n`);
+        return;
+      }
       r.write(out.trim() ? `\n${out.replace(/\s+$/, '')}\n\n` : `\n${c.gray(`Hook '${name}' produced no output.`)}\n\n`);
       return;
     }

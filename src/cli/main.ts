@@ -279,11 +279,16 @@ export async function runCli(argv: readonly string[], io: CliIo = {}): Promise<n
 
 /** Entry point used by src/bin/kiro-claude.ts. */
 export async function main(argv: string[]): Promise<number> {
-  // A closed stdout (`kiro-claude --help | head -1`) must not crash the process.
+  // A closed stdout (`kiro-claude --help | head -1`) or stderr (`… 2>&1 | head`, a reader of
+  // the tool lines that went away) must not crash the process: an unhandled 'error' would kill
+  // it before the session is closed (SessionEnd hooks, session lock, runtime dir). Lost
+  // diagnostics are harmless; a lost stdout is noticed by the commands that write answers there
+  // (headless interrupts and exits 1).
   const ignoreEpipe = (e: NodeJS.ErrnoException): void => {
-    if (e.code !== 'EPIPE') throw e;
+    if (e.code !== 'EPIPE' && e.code !== 'ERR_STREAM_DESTROYED') throw e;
   };
   process.stdout.on('error', ignoreEpipe);
+  process.stderr.on('error', ignoreEpipe);
   return runCli(argv);
 }
 

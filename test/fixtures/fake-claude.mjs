@@ -8,8 +8,9 @@
  * 04 §5–§12, 07): initialize, system/init per turn, assistant/user/stream_event/result frames,
  * hook_callback + can_use_tool control requests, interrupt, set_model, get_context_usage,
  * mcp_status, get_settings, local slash commands (/clear, /compact, /effort, /model, /cost,
- * /context), command_lifecycle, priority:"next" injection, and (opt-in) transcript persistence
- * for --resume / --fork-session / --resume-session-at.
+ * /context), command_lifecycle, the priority:"next" queue (folded in at the next tool boundary,
+ * else run as its own turn after the result; plain interrupt keeps it, `cancel_queued` drops
+ * it), and (opt-in) transcript persistence for --resume / --fork-session / --resume-session-at.
  *
  * Turns are scripted with $FAKE_CLAUDE_SCRIPT (JSON file) or $FAKE_CLAUDE_SCRIPT_JSON (inline).
  * See test/fixtures/README.md for the script format and every FAKE_CLAUDE_* variable.
@@ -808,6 +809,8 @@ function main() {
       queued_turn_count: queue.length, result_index: resultIndex++, ...fields, ...(t.resultOverrides || {}),
     };
     lastResultIsError = result.is_error === true;
+    // lines folded in at a tool boundary report `completed` just before the result (VERIFIED)
+    for (const u of t.folded || []) lifecycle(u, 'completed');
     emit(result);
     return result;
   }
@@ -865,6 +868,7 @@ function main() {
           case 'lastToolResult': return t.lastToolResult;
           case 'lastHookContext': return t.lastHookContext;
           case 'lastControlResponse': return t.lastControlResponse;
+          case 'steerText': return (t.steerTexts || []).join(' | ');
           case 'turnIndex': return String(turnCounter);
           case 'historyCount': return String(historyUserTexts().length);
           case 'historyUserTexts': return historyUserTexts().join(' | ');
@@ -1144,6 +1148,22 @@ function main() {
       t.inTokens += Math.ceil(o.content.length / 4);
     }
     if (outcomes.some((o) => o.interrupted)) t.abort(t.abortReason || 'interrupt');
+    // The queue snapshot is taken right after the boundary's tool results, in the same tick: a
+    // `next` line the host writes after SEEING these frames waits for the following boundary.
+    else if (parent === null && !t.signal.aborted) foldNext(t);
+  }
+
+  /** Fold every `priority:"next"` line received so far into the running turn (tool boundary). */
+  function foldNext(t) {
+    for (const m of t.pendingNext.splice(0)) {
+      if (m.uuid) {
+        t.uuids.push(m.uuid);
+        t.folded.push(m.uuid);
+        lifecycle(m.uuid, 'started');
+      }
+      t.steerTexts.push(userTextOf(m.message && m.message.content));
+      appendTranscript({ type: 'user', uuid: m.uuid || uuid(), message: m.message });
+    }
   }
 
   /* --- turns ----------------------------------------------------------------------------- */
@@ -1159,6 +1179,9 @@ function main() {
       numTurns: 0, inTokens: 0, outTokens: 0, denials: [], resultText: '', resultMsgId: null, msg: null,
       lastToolResult: '', lastHookContext: '', lastControlResponse: '', resultOverrides: null, abortReason: null,
       signal: ac.signal, inTools: false,
+      // `priority:"next"` lines received while this turn runs and not yet folded in; uuids folded
+      // in (at a tool boundary) and their texts ({{steerText}})
+      pendingNext: [], folded: [], steerTexts: [],
       abort(reason) {
         if (!t.abortReason) t.abortReason = reason;
         ac.abort();
@@ -1368,7 +1391,12 @@ function main() {
       emitResult(t, { subtype: 'error_during_execution', is_error: true, errors: [String(e)] });
     } finally {
       running = null;
-      for (const u of t.uuids) lifecycle(u, 'completed');
+      // `next` lines that found no tool boundary run next, each as its own turn (VERIFIED
+      // 2.1.319: own result → own `completed` → steer `started` → system/init)
+      if (t.pendingNext.length) queue.unshift(...t.pendingNext.splice(0));
+      // an interrupted line reports `cancelled` after its result (VERIFIED), others `completed`
+      const interrupted = t.abortReason === 'interrupt' || t.abortReason === 'streaming';
+      if (msg.uuid) lifecycle(msg.uuid, interrupted ? 'cancelled' : 'completed');
     }
   }
 
@@ -1390,11 +1418,8 @@ function main() {
     if (replay) emit({ ...msg, session_id: sessionId, isReplay: true, timestamp: now(), uuid: msg.uuid || uuid() });
     if (msg.uuid) lifecycle(msg.uuid, 'queued');
     if (running && msg.priority === 'next') {
-      if (msg.uuid) {
-        running.uuids.push(msg.uuid);
-        lifecycle(msg.uuid, 'started');
-      }
-      appendTranscript({ type: 'user', uuid: msg.uuid || uuid(), message: msg.message });
+      // queued for the running turn: folded in at its next tool boundary, else run after it
+      running.pendingNext.push(msg);
       return;
     }
     if (running && msg.priority === 'now') {
@@ -1449,10 +1474,37 @@ function main() {
             session_state: running ? 'running' : 'idle',
           });
         }
-        case 'interrupt':
-          respond(id, { still_queued: [] });
+        case 'interrupt': {
+          // The plain interrupt keeps queued sends (they run after the interrupted result);
+          // `cancel_queued:true` drops them: `command_lifecycle cancelled` for each, then the
+          // answer lists them (VERIFIED 2.1.319, capability interrupt_cancel_queued_v1).
+          const queued = [...(running ? running.pendingNext : []), ...queue];
+          const ids = queued.map((m) => m.uuid).filter((u) => typeof u === 'string' && u);
+          if (req.cancel_queued === true) {
+            if (running) running.pendingNext.length = 0;
+            queue.length = 0;
+            for (const u of ids) lifecycle(u, 'cancelled');
+            respond(id, { still_queued: [], cancelled: ids });
+          } else {
+            respond(id, { still_queued: ids });
+          }
           if (running) running.abort(running.inTools ? 'interrupt' : 'streaming');
           return;
+        }
+        case 'cancel_async_message': {
+          // Withdraws a line still queued (a `next` line not folded in yet, or one waiting for its
+          // own turn): `command_lifecycle cancelled`, then {cancelled:true}; a line no longer
+          // queued (started / unknown) answers {cancelled:false} (VERIFIED 2.1.319).
+          if (typeof req.message_uuid !== 'string') return respondError(id, 'cancel_async_message: message_uuid must be a string');
+          for (const list of [running ? running.pendingNext : [], queue]) {
+            const i = list.findIndex((m) => m.uuid === req.message_uuid);
+            if (i < 0) continue;
+            list.splice(i, 1);
+            lifecycle(req.message_uuid, 'cancelled');
+            return respond(id, { cancelled: true });
+          }
+          return respond(id, { cancelled: false });
+        }
         case 'set_model':
           model = resolveModel(req.model);
           return respond(id, { model });

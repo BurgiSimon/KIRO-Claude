@@ -32,8 +32,8 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it works.
 * **Node.js ≥ 18.17** (developed and tested on Node 22).
 * **Claude Code** installed and logged in: `claude --version` works and `claude auth status`
   says you are logged in. Install it from <https://claude.com/claude-code>.
-* For `kiro-claude crew`: git, Node ≥ 22.12, Python ≥ 3.12 and `make`. The KiroCrew build
-  needs about 3 GB of disk space.
+* For `kiro-claude crew`: git, Node ≥ 22.12 and Python ≥ 3.12 (`make` too, but only for
+  `crew setup --full`). The KiroCrew build needs about 3 GB of disk space (4 GB with `--full`).
 
 ## Install
 
@@ -116,7 +116,11 @@ kiro-claude reads the same files as Kiro CLI:
 | Settings | `~/.kiro/settings/cli.json` | `.kiro/settings/cli.json` |
 | Sessions | `~/.kiro/sessions/cli/` | — |
 
-`KIRO_HOME` moves `~/.kiro`. `kiro-claude settings list --all` shows every setting.
+`KIRO_HOME` moves `~/.kiro`. `kiro-claude settings list --all` shows every setting; those
+described as not supported or ignored are stored (so a `cli.json` shared with Kiro CLI keeps
+working) but have no effect. Three Kiro settings are passed on to Claude Code when you set them:
+`chat.disableAutoCompaction` (as `DISABLE_AUTO_COMPACT`), `mcp.initTimeout` (as `MCP_TIMEOUT`)
+and `api.timeout` (as `API_TIMEOUT_MS`); a variable already set in your environment wins.
 
 kiro-claude's own settings live in `kiro-claude.json` next to `cli.json`:
 
@@ -169,8 +173,10 @@ kiro-claude crew doctor    # checks every piece of the integration
 What `crew setup` does:
 
 1. Fetches KiroCrew at the commit pinned by this repository's `vendor/KiroCrew` submodule
-   (or uses `--dir <checkout>`) and builds it from source with its own `make build`.
-   KiroCrew's code is not modified.
+   (or uses `--dir <checkout>`) and builds it from source: the dashboard (`npm ci` and
+   `npm run build`), a `.venv` with KiroCrew installed by `pip install -e`, and the staged
+   frontend. `--full` runs KiroCrew's own `make build` instead, which its pytest suites need;
+   `--no-build` skips the build. KiroCrew's code is not modified.
 2. Writes a small `kiro-claude` launcher under `~/.local/share/kiro-claude/crew/bin/` with
    absolute paths to Node, kiro-claude and `claude`. It then configures KiroCrew to use it as
    its `kiro-cli` (`KIROCREW_KIRO_BIN`, `agent.acp_backend kiro`, `auto_update false`).

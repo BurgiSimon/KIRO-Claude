@@ -176,6 +176,9 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<number> {
   }
 
   // Ctrl+C: first ⇒ interrupt the turn, second ⇒ close the session. Closed stdout ⇒ interrupt.
+  // Closed stderr (tool lines, notices) ⇒ only diagnostics are lost: the turn goes on and its
+  // answer still reaches stdout; the listener keeps a broken pipe from becoming an uncaught
+  // error that would skip closing the session.
   let interrupted = false;
   let stdoutBroken = false;
   const s = session;
@@ -192,9 +195,12 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<number> {
     stdoutBroken = true;
     if (e.code === 'EPIPE' || e.code === 'ERR_STREAM_DESTROYED') void s.interrupt().catch(() => undefined);
   };
+  const onStderrError = (): void => undefined;
   process.on('SIGINT', onSigint);
   const stdoutEmitter = ctx.stdout as unknown as NodeJS.EventEmitter;
   if (typeof stdoutEmitter.on === 'function') stdoutEmitter.on('error', onStdoutError);
+  const stderrEmitter = ctx.stderr as unknown as NodeJS.EventEmitter;
+  if (typeof stderrEmitter.on === 'function') stderrEmitter.on('error', onStderrError);
 
   try {
     renderer.session({
@@ -270,5 +276,7 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<number> {
     if (typeof stdoutEmitter.removeListener === 'function') stdoutEmitter.removeListener('error', onStdoutError);
     renderer.finish();
     await s.close().catch(() => undefined);
+    // after close: SessionEnd hook warnings are written to stderr too
+    if (typeof stderrEmitter.removeListener === 'function') stderrEmitter.removeListener('error', onStderrError);
   }
 }

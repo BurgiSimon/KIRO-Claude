@@ -909,6 +909,65 @@ test('S12 steer, steer, clear, steer: only the last one is injected (steering-cl
   await done(s);
 });
 
+test('_session/steer/clear: a written steer Claude already took in is reported injected (once), before the Cleared of the held ones', async () => {
+  const U = '44444444-4444-4444-8444-444444444444';
+  const s = setup([
+    {
+      steps: [
+        { tool: { name: 'Bash', id: 'tw', input: { command: 'sleep 1' }, durationMs: 400, permission: 'allow' } },
+        { sleepMs: 1200 },
+        // Claude's own report of the start, behind the clear (the generator lags behind the child)
+        { raw: { type: 'command_lifecycle', command_uuid: U, state: 'started' } },
+        { text: 'x' },
+      ],
+    },
+  ]);
+  const withdrawn: string[] = [];
+  s.world.steerLine = (text) => (text === 'ALPHA' ? { uuid: U, withdraw: async () => (withdrawn.push(U), false) } : undefined);
+  const sid = await newSession(s);
+  const p = prompt(s.c, sid, 'go');
+  await s.c.waitFor(isUpdate('tool_call'));
+  await s.c.call('_session/steer', { sessionId: sid, message: 'ALPHA' });
+  await until(() => s.world.calls.includes('steer:ALPHA'));
+  await s.c.call('_session/steer', { sessionId: sid, message: 'BETA' }); // held: no boundary left
+  const ids = s.c.frames.filter((f) => f.params?.update?.sessionUpdate === 'AgentExecutionUserMessageQueued').map((f) => f.params.update.messageId as string);
+  assert.deepEqual(await s.c.call('_session/steer/clear', { sessionId: sid }), { cleared: true });
+  const cleared = await s.c.waitFor((f) => f.params?.update?.sessionUpdate === 'AgentExecutionUserMessageCleared');
+  assert.deepEqual(withdrawn, [U]);
+  assert.deepEqual(cleared.params.update.messageIds, [ids[1]], 'only the held steer was dropped');
+  const inj = () => s.c.frames.filter((f) => f.params?.update?.sessionUpdate === 'AgentExecutionSteeringInjected');
+  assert.equal(inj().length, 1);
+  assert.equal(inj()[0]!.params.update.messageId, ids[0]);
+  assert.ok(s.c.frames.indexOf(inj()[0]!) < s.c.frames.indexOf(cleared), 'injected before the drop is reported (KiroCrew resends what a drop took)');
+  assert.equal((await p).result.stopReason, 'end_turn');
+  assert.equal(inj().length, 1, 'its later `started` is not reported again');
+  assert.deepEqual(s.world.calls.filter((x) => x.startsWith('steer:')), ['steer:ALPHA']);
+  await done(s);
+});
+
+test('_session/steer/clear right after session/cancel leaves the written steer to the cancel: reported cleared, never injected', async () => {
+  const U = '55555555-5555-4555-8555-555555555555';
+  const s = setup([{ steps: [{ tool: { name: 'Bash', id: 'tk', input: { command: 'sleep 1' }, durationMs: 300, permission: 'allow' } }, { sleepMs: 3000 }, { text: 'x' }] }]);
+  const withdrawn: string[] = [];
+  // the cancel's interrupt dropped it, so Claude no longer has it queued
+  s.world.steerLine = () => ({ uuid: U, withdraw: async () => (withdrawn.push(U), false) });
+  const sid = await newSession(s);
+  const p = prompt(s.c, sid, 'go');
+  await s.c.waitFor(isUpdate('tool_call'));
+  await s.c.call('_session/steer', { sessionId: sid, message: 'ALPHA' });
+  await until(() => s.world.calls.includes('steer:ALPHA'));
+  const id = s.c.frames.find((f) => f.params?.update?.sessionUpdate === 'AgentExecutionUserMessageQueued')!.params.update.messageId as string;
+  s.c.notify('session/cancel', { sessionId: sid });
+  assert.deepEqual(await s.c.call('_session/steer/clear', { sessionId: sid }), { cleared: true });
+  assert.equal((await p).result.stopReason, 'cancelled');
+  await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(withdrawn, []);
+  assert.equal(s.c.frames.filter((f) => f.params?.update?.sessionUpdate === 'AgentExecutionSteeringInjected').length, 0);
+  const cleared = s.c.frames.filter((f) => f.params?.update?.sessionUpdate === 'AgentExecutionUserMessageCleared');
+  assert.deepEqual(cleared.map((f) => f.params.update.messageIds), [[id]]);
+  await done(s);
+});
+
 test('a steer still held when the turn ends runs as a continuation inside the same prompt request', async () => {
   const s = setup([
     { match: /pineapple/, steps: [{ text: 'second' }] },
@@ -920,7 +979,8 @@ test('a steer still held when the turn ends runs as a continuation inside the sa
   await s.c.call('_session/steer', { sessionId: sid, message: 'say pineapple' });
   const r = await p;
   assert.equal(r.result.stopReason, 'end_turn');
-  assert.deepEqual(s.c.updates('agent_message_chunk', sid).map((u) => u.content.text), ['first', 'second']);
+  // the continuation's reply is its own paragraph, not glued onto 'first' ('firstsecond')
+  assert.deepEqual(s.c.updates('agent_message_chunk', sid).map((u) => u.content.text), ['first', '\n\nsecond']);
   const inj = s.c.frames.find((f) => f.params?.update?.sessionUpdate === 'AgentExecutionSteeringInjected')!;
   assert.ok(respIndex(s.c, inj) < respIndex(s.c, r));
   assert.equal(s.world.sessions[0]!.turnCount, 2);
@@ -1013,7 +1073,9 @@ test('subagent inner tool calls are reported under the parent sessionId with par
   assert.deepEqual(inner[0]!.params.update._meta, { kiro: { toolName: 'read' }, claudeCode: { toolName: 'Read', parentToolUseId: 'toolu_agent' } });
   assert.equal(inner[inner.length - 1]!.params.update.status, 'completed');
   const lists = s.c.notifications('_kiro.dev/subagent/list_update').map((f) => f.params.subagents);
-  assert.deepEqual(lists, [[{ id: 'toolu_agent', name: 'general-purpose', status: 'running' }], [{ id: 'toolu_agent', name: 'general-purpose', status: 'completed' }]]);
+  // the roster shape KiroCrew reads (review C4); the mock's events carry no task, so the type stands in
+  const entry = (type: string) => ({ sessionId: 'toolu_agent', sessionName: 'general-purpose', agentName: 'general-purpose', role: 'general-purpose', initialQuery: 'general-purpose', status: { type, message: '' } });
+  assert.deepEqual(lists, [[entry('working')], [entry('completed')]]);
   await done(s);
 });
 

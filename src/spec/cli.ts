@@ -62,8 +62,10 @@ import {
 export type CreateSessionFn = (opts: KiroSessionOptions) => Promise<KiroSession>;
 
 export interface SpecCliIO {
-  /** Ask a free-form question (interactive only). */
+  /** Ask a free-form question (interactive only); '' once the input has ended. */
   question(prompt: string): Promise<string>;
+  /** True once the input has ended (Ctrl+D, closed pipe): every later answer is ''. */
+  isClosed?(): boolean;
   close(): void;
 }
 
@@ -186,6 +188,7 @@ function readlineIO(ctx: CliContext): SpecCliIO {
       if (closed) return Promise.resolve('');
       return new Promise((resolve) => waiters.push(resolve));
     },
+    isClosed: () => closed,
     close(): void {
       rl?.close();
     },
@@ -295,7 +298,15 @@ function sessionUI(ctx: CliContext, interactive: boolean, io: () => SpecCliIO): 
         for (;;) {
           const a = (await io().question("Allow this action? Use 't' to trust (always allow) this tool for the session. [y/n/t]: ")).trim();
           if (signal.aborted) return { kind: 'cancelled' };
-          if (a === '') continue;
+          if (a === '') {
+            // Ctrl+D / closed input cancels like the REPL does (06 §2.2); re-asking would spin
+            // forever on answers that are already resolved (and starve every signal handler)
+            if (io().isClosed?.()) {
+              ctx.stdout.write('\n');
+              return { kind: 'cancelled' };
+            }
+            continue;
+          }
           const l = a.toLowerCase();
           if (l === 'y' || l === 'yes') return { kind: 'allow-once' };
           if (l === 't') return { kind: 'allow-always' };

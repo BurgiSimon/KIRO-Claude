@@ -37,6 +37,10 @@
  * (`PostFileCreate` when the Write/Edit/NotebookEdit target did not exist at PreToolUse,
  * else `PostFileSave`; 03 §2.5) and deps.onPostToolContext, and returns their text as
  * `additionalContext`. `PostFileDelete` (Bash + git status diff) is not derived here.
+ *
+ * preToolUse / postToolUse / hookCallback take the hook_callback's cancel signal and pass it
+ * to the Kiro hooks (HookRunContext.signal), so a cancelled callback or turn kills the running
+ * hook commands (review C12).
  */
 
 import * as fs from 'node:fs';
@@ -160,8 +164,12 @@ export interface GateDeps {
   v3Scopes(): { userRules: PermissionRule[]; workspaceRules: PermissionRule[]; presetRules: PermissionRule[] };
   /** Claude-normalized MCP server name → configured name. */
   mcpServerNames(): Record<string, string>;
-  /** mcp.json `autoApprove` of a configured server. */
-  mcpAutoApprove(server: string): string[];
+  /**
+   * mcp.json `autoApprove` of the server running a call: `server` is its Kiro name, `claudeTool`
+   * the Claude tool name (`mcp__<srv>__<tool>`), which tells a subagent's own server apart from
+   * a parent server of the same Kiro name.
+   */
+  mcpAutoApprove(server: string, claudeTool?: string): string[];
   isIgnored?(p: string): boolean;
   planMode(): boolean;
   specPhase(): { name: string; allowedWritePaths: string[] } | undefined;
@@ -293,17 +301,25 @@ export class Gate {
 
   // ── PreToolUse ──
 
-  async preToolUse(input: HookInput): Promise<{ call: KiroToolCall; decision: GateDecision; output: HookCallbackOutput }> {
+  /**
+   * `signal`: the hook_callback's cancel signal (Claude withdrew the callback, the turn was
+   * cancelled, the session is closing). It is handed to the Kiro preToolUse hooks, whose
+   * commands are killed when it aborts; a call whose hooks were cancelled is denied
+   * ({@link USER_CANCEL_MESSAGE}), never allowed.
+   */
+  async preToolUse(input: HookInput, signal?: AbortSignal): Promise<{ call: KiroToolCall; decision: GateDecision; output: HookCallbackOutput }> {
     const call = this.callFromHookInput(input);
     const key = inflightKey(call.toolUseId, call.claudeName, call.input);
     const existed = this.snapshotExistence(call);
     let ctx: string | undefined;
     let decision: GateDecision;
     try {
-      const h = await this.runPreHooks(call);
+      const h = await this.runPreHooks(call, signal);
       ctx = h?.additionalContext ? h.additionalContext : undefined;
       if (h?.blocked) {
         decision = { kind: 'deny', reason: hookBlockedMessage(h.blockReason ?? ''), ...(ctx ? { additionalContext: ctx } : {}) };
+      } else if (signal?.aborted) {
+        decision = { kind: 'deny', reason: USER_CANCEL_MESSAGE };
       } else {
         const s = this.evaluateStatic(call);
         if (s.kind === 'deny') {
@@ -346,13 +362,14 @@ export class Gate {
 
   // ── PostToolUse ──
 
-  async postToolUse(input: HookInput, failed = false): Promise<HookCallbackOutput> {
+  /** `signal` cancels the postToolUse and file hooks (their commands are killed), as for preToolUse. */
+  async postToolUse(input: HookInput, failed = false, signal?: AbortSignal): Promise<HookCallbackOutput> {
     const toolName = input.tool_name ?? '';
     const key = inflightKey(input.tool_use_id, toolName, input.tool_input ?? {});
     const inf = this.inflight.get(key);
     this.inflight.delete(key);
     const call = inf?.call ?? this.callFromHookInput(input);
-    const ctx = this.hookCtx();
+    const ctx = this.hookCtx(signal);
     const outcome: ToolOutcome = {
       success: !failed,
       ...(input.tool_response !== undefined ? { response: input.tool_response } : {}),
@@ -510,15 +527,18 @@ export class Gate {
 
   // ── hook callback dispatch ──
 
-  /** Dispatch a `hook_callback` control request by `callback_id`. Unknown ids ⇒ `{}`. */
-  async hookCallback(callbackId: string, input: HookInput): Promise<HookCallbackOutput> {
+  /**
+   * Dispatch a `hook_callback` control request by `callback_id`. Unknown ids ⇒ `{}`. `signal`
+   * (the request's cancel signal, ideally combined with the turn's) reaches the Kiro hooks.
+   */
+  async hookCallback(callbackId: string, input: HookInput, signal?: AbortSignal): Promise<HookCallbackOutput> {
     switch (callbackId) {
       case GATE_CALLBACK_IDS.pre:
-        return (await this.preToolUse(input)).output;
+        return (await this.preToolUse(input, signal)).output;
       case GATE_CALLBACK_IDS.post:
-        return this.postToolUse(input, false);
+        return this.postToolUse(input, false, signal);
       case GATE_CALLBACK_IDS.postFail:
-        return this.postToolUse(input, true);
+        return this.postToolUse(input, true, signal);
       default:
         return {};
     }
@@ -795,7 +815,7 @@ export class Gate {
   private evaluateFor(call: KiroToolCall, agent: KiroAgent): PolicyVerdict {
     const ws = this.deps.ws;
     const trust = this.trustFor(call);
-    const auto = call.mcp ? this.safeAutoApprove(call.mcp.server) : [];
+    const auto = call.mcp ? this.safeAutoApprove(call.mcp.server, call.claudeName) : [];
     if (agent.dialect === 'v2') {
       return evaluateQ(call, agent, trust, ws, call.mcp ? { mcpAutoApprove: auto } : {});
     }
@@ -839,13 +859,16 @@ export class Gate {
     });
   }
 
-  private hookCtx(): HookRunContext {
-    return { ws: this.deps.ws, sessionId: this.deps.sessionId() };
+  private hookCtx(signal?: AbortSignal): HookRunContext {
+    return { ws: this.deps.ws, sessionId: this.deps.sessionId(), ...(signal ? { signal } : {}) };
   }
 
-  private async runPreHooks(call: KiroToolCall): Promise<{ blocked: boolean; blockReason?: string; additionalContext?: string } | undefined> {
+  private async runPreHooks(
+    call: KiroToolCall,
+    signal?: AbortSignal,
+  ): Promise<{ blocked: boolean; blockReason?: string; additionalContext?: string } | undefined> {
     try {
-      const r = await this.deps.hooks().runPreToolUse(this.hookCtx(), call);
+      const r = await this.deps.hooks().runPreToolUse(this.hookCtx(signal), call);
       this.warn(r.warnings);
       return r;
     } catch (e) {
@@ -912,9 +935,9 @@ export class Gate {
     return Object.prototype.hasOwnProperty.call(names, key) ? names : { ...names, [key]: n };
   }
 
-  private safeAutoApprove(server: string): string[] {
+  private safeAutoApprove(server: string, claudeTool?: string): string[] {
     try {
-      return this.deps.mcpAutoApprove(server) ?? [];
+      return this.deps.mcpAutoApprove(server, claudeTool) ?? [];
     } catch {
       return [];
     }

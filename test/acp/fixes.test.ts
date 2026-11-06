@@ -401,17 +401,18 @@ test('_kiro.dev/subagent/list_update lists current subagents: a finished one is 
   await c.initialize();
   const sid = (await c.call('session/new', { cwd: t.work, mcpServers: [] })).sessionId as string;
   await promptReq(c, sid, 'first');
-  const lists = () => c.notifications('_kiro.dev/subagent/list_update').map((f) => (f.params.subagents as Frame[]).map((s) => `${s.id}:${s.status}`));
+  // KiroCrew keys entries on `sessionId` and reads `status` as {type,message} (review C4)
+  const lists = () => c.notifications('_kiro.dev/subagent/list_update').map((f) => (f.params.subagents as Frame[]).map((s) => `${s.sessionId}:${s.status.type}`));
   assert.deepEqual(lists(), [
-    ['t1:running'],
+    ['t1:working'],
     ['t1:completed'],
-    ['t2:running'],
-    ['t2:running', 't3:running'],
-    ['t2:completed', 't3:running'],
+    ['t2:working'],
+    ['t2:working', 't3:working'],
+    ['t2:completed', 't3:working'],
     // the turn ended with t3 never finishing: it is gone from the next (and last) list
     [],
   ]);
   await promptReq(c, sid, 'second');
-  assert.deepEqual(lists().slice(6), [['t4:running'], []]);
+  assert.deepEqual(lists().slice(6), [['t4:working'], []]);
   assert.equal(await c.close(), 0);
 });

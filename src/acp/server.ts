@@ -39,12 +39,23 @@
  * the client.
  *
  * Steering (05 §4.13): steers are held here and written to the session at the next tool
- * boundary — observed on the session's synchronous `'event'` stream, where Claude is still busy
- * and folds the line (priority `next`) into the running turn — so `_session/steer/clear` only
- * ever drops held entries. A steer still held when the turn ends is sent as a continuation
- * inside the same prompt request; steers of a cancelled turn are dropped and reported with
- * `AgentExecutionUserMessageCleared`. Injection is reported as `AgentExecutionSteeringInjected`
- * right after the tool result update, as kiro-cli does.
+ * boundary — observed on the session's synchronous `'event'` stream, where Claude is still busy.
+ * Claude (priority `next`) reads a line written there at the FOLLOWING tool boundary, or, after
+ * the last tool, in a turn of its own right after the prompt's result, which the session keeps
+ * inside the same prompt (VERIFIED 2.1.319, review C3). Injection is therefore reported as
+ * `AgentExecutionSteeringInjected` when Claude starts the line (its `command_lifecycle`
+ * `started`, right after the tool result update of the boundary that read it, as kiro-cli
+ * reports it). Until then a written steer is still pending: `_session/steer/clear` drops the held
+ * entries AND withdraws those from Claude's queue (control `cancel_async_message`), naming all of
+ * them in one `AgentExecutionUserMessageCleared`. A steer still held when the turn ends is sent as
+ * a continuation inside the same prompt request. Steers of a cancelled or failed turn — held, or
+ * written but never started (the session's interrupt drops them from Claude's queue, review C2)
+ * — are reported with `AgentExecutionUserMessageCleared`.
+ *
+ * Subagents (`_kiro.dev/subagent/list_update`, review C4): the current roster, one entry per
+ * running Claude subagent in the shape KiroCrew reads (`sessionId` = the Agent tool use id,
+ * `sessionName`, `agentName`/`role`, `initialQuery` = the task, `status {type,message}` with
+ * `working` / `completed` / `failed`), with the parent's `sessionId` on top.
  *
  * Library rule: only JSON-RPC frames go to `ctx.stdout`; logs go to the log file
  * (`$KIRO_CHAT_LOG_FILE`, util/log) and a few warnings to `ctx.stderr`.
@@ -393,8 +404,55 @@ class TurnCtx {
   readonly cancelGrace = deferred<void>();
   /** Tool boundaries (`tool_end` / `tool_denied` ids) seen on the session's live `'event'` stream. */
   readonly liveBoundaries = new Set<string>();
-  /** Steers written at a live tool boundary, announced once the generator reaches that boundary. */
+  /**
+   * Steers written at a live tool boundary to a session that did not say which Claude line they
+   * became, announced once the generator reaches that boundary.
+   */
   readonly liveInjected = new Map<string, { id: string; text: string }>();
+  /**
+   * Steers written to Claude (by user line uuid) that Claude has not started yet; `withdraw`
+   * takes one back (`_session/steer/clear`), `clearing` while that is in flight.
+   */
+  readonly written = new Map<string, WrittenSteer>();
+  /** The last two characters of answer text sent to the client since the last tool block. */
+  textTail = '';
+  /** The next answer text starts a new paragraph (a held-steer continuation's reply). */
+  breakPending = false;
+
+  /** `text` as sent to the client: a held-steer continuation's reply is its own paragraph. */
+  joinText(text: string): string {
+    if (this.breakPending) {
+      this.breakPending = false;
+      const sep = '\n'.repeat(Math.max(0, 2 - /\n*$/.exec(this.textTail)![0].length));
+      text = sep + text;
+    }
+    this.textTail = (this.textTail + text).slice(-2);
+    return text;
+  }
+
+  /** A tool block was sent: the client renders it as its own block, the text boundary is there. */
+  toolBlock(): void {
+    this.textTail = '';
+    this.breakPending = false;
+  }
+}
+
+/** A steer written to Claude and not read yet (see {@link TurnCtx.written}). */
+interface WrittenSteer {
+  ids: string[];
+  text: string;
+  withdraw: () => Promise<boolean>;
+  clearing?: boolean;
+}
+
+/** One `_kiro.dev/subagent/list_update` roster entry (KiroCrew shape, see module doc). */
+interface SubagentEntry {
+  sessionId: string;
+  sessionName: string;
+  agentName: string;
+  role: string;
+  initialQuery: string;
+  status: { type: 'working' | 'completed' | 'failed'; message: string };
 }
 
 /** One ACP session (see module doc). */
@@ -408,7 +466,7 @@ class AcpSessionState {
   readonly finalized = new Set<string>();
   readonly denied = new Map<string, string>();
   readonly parentOf = new Map<string, string>();
-  readonly subagents = new Map<string, { id: string; name: string; status: string }>();
+  readonly subagents = new Map<string, SubagentEntry>();
   /** Ids for subagent events that carry no tool use id. */
   subagentSeq = 0;
   readonly mcpReported = new Set<string>();
@@ -1296,14 +1354,45 @@ export class AcpServer {
     });
   }
 
-  /** `_session/steer/clear` (05 §4.13). */
+  /**
+   * `_session/steer/clear` (05 §4.13): drops every steer the turn has not read yet — the held ones,
+   * and those written to Claude that it has not started (withdrawn from its queue) — and names
+   * exactly those in ONE `AgentExecutionUserMessageCleared`, as kiro-cli does (KiroCrew resends the
+   * dropped steers it did not mean to take back). A written steer Claude already took in is
+   * reported `AgentExecutionSteeringInjected` first.
+   */
   private steerClear(p: Record<string, unknown>): unknown {
     const st = this.getSession(p.sessionId);
     const dropped = st.steers.map((s) => s.id);
     st.steers = [];
-    if (dropped.length === 0) return { cleared: true };
+    const turn = st.turn;
+    // (a cancelled turn's interrupt already drops them from Claude's queue; its end reports them)
+    const written = turn && !turn.cancelled ? [...turn.written].filter(([, w]) => !w.clearing) : [];
+    if (dropped.length === 0 && written.length === 0) return { cleared: true };
+    for (const [, w] of written) w.clearing = true;
+    const report = (ids: string[]): void => {
+      if (ids.length && !st.closed) this.kiroUpdate(st.id, { sessionUpdate: 'AgentExecutionUserMessageCleared', messageIds: ids });
+    };
     return respondThen({ cleared: true }, () => {
-      this.kiroUpdate(st.id, { sessionUpdate: 'AgentExecutionUserMessageCleared', messageIds: dropped });
+      if (written.length === 0) return report(dropped);
+      type Outcome = [uuid: string, w: WrittenSteer, dropped: boolean | undefined];
+      const withdrawals = written.map(([uuid, w]) => w.withdraw().then((ok): Outcome => [uuid, w, ok], (): Outcome => [uuid, w, undefined]));
+      void Promise.all(withdrawals).then((res) => {
+        const ids = [...dropped];
+        for (const [uuid, w, ok] of res) {
+          if (turn!.written.get(uuid) !== w) continue; // reported meanwhile (started, or the turn ended)
+          if (ok === undefined || (!ok && turn!.cancelled)) {
+            // no answer (the child is gone), or not queued any more because a cancel dropped it:
+            // its `command_lifecycle` or the turn's end reports it
+            w.clearing = false;
+            continue;
+          }
+          turn!.written.delete(uuid);
+          if (ok) ids.push(...w.ids);
+          else if (!st.closed) this.kiroUpdate(st.id, { sessionUpdate: 'AgentExecutionSteeringInjected', messageId: w.ids[w.ids.length - 1]!, content: w.text });
+        }
+        report(ids);
+      });
     });
   }
 
@@ -1311,9 +1400,10 @@ export class AcpServer {
    * The session emits every event as `'event'` synchronously when the Claude frame arrives,
    * while `prompt()` yields them later (the consumer lags behind the child). Held steers are
    * therefore written at the LIVE tool boundary: Claude is still busy there (a model call always
-   * follows a tool result), so the session sends the line with priority `next` and Claude folds
-   * it into the running turn. Written later, the session would find Claude idle and hold the
-   * text for the next prompt instead (05 §4.13, 00 §2.5 steer row).
+   * follows a tool result), so the session sends the line with priority `next` and the running
+   * prompt answers it (at a later boundary or in a turn of its own, module doc). Written later,
+   * the session could find Claude idle and hold the text for the next prompt instead (05 §4.13,
+   * 00 §2.5 steer row).
    */
   private attachLive(st: AcpSessionState): void {
     const l = (ev: SessionEvent): void => {
@@ -1337,14 +1427,17 @@ export class AcpServer {
     const batch = st.steers;
     st.steers = [];
     const text = batch.map((x) => x.text).join('\n\n');
+    let line: ReturnType<KiroSession['steer']>;
     try {
-      st.session.steer(text);
+      line = st.session.steer(text);
     } catch (e) {
       this.log.warn(`acp[${st.id}]: steer failed:`, e);
       st.steers = [...batch, ...st.steers];
       return;
     }
-    turn.liveInjected.set(id, { id: batch[batch.length - 1]!.id, text });
+    // announced when Claude starts the line (onRaw), or at this boundary when its uuid is unknown
+    if (line) turn.written.set(line.uuid, { ids: batch.map((x) => x.id), text, withdraw: line.withdraw });
+    else turn.liveInjected.set(id, { id: batch[batch.length - 1]!.id, text });
   }
 
   /** At a tool boundary reached by the generator: announce a live injection, or inject now. */
@@ -1363,18 +1456,39 @@ export class AcpServer {
 
   /** Write held steers into the running turn (tool boundary); returns whether any were sent. */
   private injectSteers(st: AcpSessionState): boolean {
-    if (st.steers.length === 0 || !st.turn || st.turn.cancelled) return false;
+    const turn = st.turn;
+    if (st.steers.length === 0 || !turn || turn.cancelled) return false;
     const batch = st.steers;
     st.steers = [];
     const text = batch.map((s) => s.text).join('\n\n');
+    let line: ReturnType<KiroSession['steer']>;
     try {
-      st.session.steer(text);
+      line = st.session.steer(text);
     } catch (e) {
       this.log.warn(`acp[${st.id}]: steer failed:`, e);
       return false;
     }
-    this.kiroUpdate(st.id, { sessionUpdate: 'AgentExecutionSteeringInjected', messageId: batch[batch.length - 1]!.id, content: text });
+    if (line) turn.written.set(line.uuid, { ids: batch.map((x) => x.id), text, withdraw: line.withdraw });
+    else this.kiroUpdate(st.id, { sessionUpdate: 'AgentExecutionSteeringInjected', messageId: batch[batch.length - 1]!.id, content: text });
     return true;
+  }
+
+  /**
+   * `command_lifecycle` of a steer written to Claude: `started` ⇒ injected (Claude reads it now);
+   * `cancelled` ⇒ dropped unread (an interrupt with `cancel_queued`).
+   */
+  private onSteerLifecycle(st: AcpSessionState, turn: TurnCtx, frame: Record<string, unknown>): void {
+    const uuid = str(frame.command_uuid);
+    const w = uuid ? turn.written.get(uuid) : undefined;
+    if (!uuid || !w) return;
+    if (frame.state === 'started') {
+      turn.written.delete(uuid);
+      this.kiroUpdate(st.id, { sessionUpdate: 'AgentExecutionSteeringInjected', messageId: w.ids[w.ids.length - 1]!, content: w.text });
+    } else if (frame.state === 'cancelled' && !w.clearing) {
+      // (a clear in flight reports it, with the rest it dropped)
+      turn.written.delete(uuid);
+      this.kiroUpdate(st.id, { sessionUpdate: 'AgentExecutionUserMessageCleared', messageIds: w.ids });
+    }
   }
 
   // ───────────── cancel ─────────────
@@ -1499,19 +1613,19 @@ export class AcpServer {
     if (turn.detached || st.closed) return;
     switch (ev.type) {
       case 'text_delta':
-        if (ev.text) this.update(st.id, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: ev.text } });
-        return;
       case 'text':
-        if (ev.text) this.update(st.id, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: ev.text } });
+        if (ev.text) this.update(st.id, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: turn.joinText(ev.text) } });
         return;
       case 'thinking_delta':
         if (ev.text) this.update(st.id, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: ev.text } });
         return;
       case 'tool_start':
+        turn.toolBlock();
         this.learnMcpCall(st, ev.call);
         this.ensureToolCall(st, ev.call, ev.toolUseId);
         return;
       case 'tool_denied': {
+        turn.toolBlock();
         this.learnMcpCall(st, ev.call);
         const id = ev.toolUseId ?? ev.call.toolUseId;
         if (!id || st.finalized.has(id)) return;
@@ -1522,6 +1636,7 @@ export class AcpServer {
         return;
       }
       case 'tool_end':
+        turn.toolBlock();
         if (ev.call) this.learnMcpCall(st, ev.call);
         this.finishTool(st, ev.toolUseId, ev.call, { isError: ev.isError, output: ev.output, response: ev.response });
         this.afterBoundary(st, turn, ev.toolUseId);
@@ -1544,13 +1659,29 @@ export class AcpServer {
       case 'subagent': {
         // The list is the CURRENT one: KiroCrew reads kiro-cli's as a full snapshot rebuilt on every
         // change, where terminated children vanish from the next update (KC
-        // acp/runtime_frame_accounting.py `_snapshot_subagent_sessions`; 05 §5.3 names the
-        // statuses only). DECISION: a finished subagent is reported once as `completed`, then
-        // dropped; whatever is still listed when the turn ends is dropped by endTurn.
+        // acp/runtime_frame_accounting.py `_snapshot_subagent_sessions`), keyed by each entry's
+        // `sessionId` (dashboard/chat_turn/native_cards.py `_native_subagent_sync`,
+        // acp/session_handle_native_children.py `_note_native_roster`). DECISION: a finished
+        // subagent is reported once as `completed` / `failed`, then dropped; whatever is still
+        // listed when the turn ends is dropped by endTurn.
         let id = ev.toolUseId;
-        if (!id && ev.state !== 'started') id = [...st.subagents.values()].find((x) => x.name === ev.agentType && x.status === 'running')?.id;
+        if (!id && ev.state !== 'started') id = [...st.subagents.values()].find((x) => x.agentName === ev.agentType && x.status.type === 'working')?.sessionId;
         id ??= `${ev.agentType}-${++st.subagentSeq}`;
-        st.subagents.set(id, { id, name: ev.agentType, status: ev.state === 'started' ? 'running' : 'completed' });
+        const known = st.subagents.get(id);
+        const status: SubagentEntry['status'] =
+          ev.state === 'started'
+            ? { type: 'working', message: '' }
+            : ev.isError
+              ? { type: 'failed', message: stripToolUseError(ev.error ?? '').trim().slice(0, 500) }
+              : { type: 'completed', message: '' };
+        st.subagents.set(id, {
+          sessionId: id,
+          sessionName: known?.sessionName ?? (ev.description || ev.agentType),
+          agentName: ev.agentType,
+          role: ev.agentType,
+          initialQuery: known?.initialQuery ?? (ev.prompt || ev.description || ev.agentType),
+          status,
+        });
         this.notifySubagents(st);
         if (ev.state !== 'started') st.subagents.delete(id);
         return;
@@ -1582,6 +1713,9 @@ export class AcpServer {
     switch (frame.type) {
       case 'result':
         turn.rawResult = frame;
+        return;
+      case 'command_lifecycle':
+        this.onSteerLifecycle(st, turn, frame);
         return;
       case 'rate_limit_event': {
         const info = isObj(frame.rate_limit_info) ? frame.rate_limit_info : {};
@@ -1742,6 +1876,10 @@ export class AcpServer {
       if (!st.closed) this.kiroUpdate(st.id, { sessionUpdate: 'AgentExecutionSteeringInjected', messageId: inj.id, content: inj.text });
     }
     turn.liveInjected.clear();
+    // written to Claude but never started (cancelled / failed turn): Claude never read them
+    const unread = [...turn.written.values()].flatMap((w) => w.ids);
+    turn.written.clear();
+    if (unread.length && !st.closed) this.kiroUpdate(st.id, { sessionUpdate: 'AgentExecutionUserMessageCleared', messageIds: unread });
     this.dropSteers(st);
     // subagents cannot outlive the turn (CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1, claude/env): a
     // listed one whose finish was never seen (cancelled / failed turn) is dropped from the list
@@ -1781,6 +1919,8 @@ export class AcpServer {
         st.steers = [];
         const text = batch.map((s) => s.text).join('\n\n');
         this.kiroUpdate(st.id, { sessionUpdate: 'AgentExecutionSteeringInjected', messageId: batch[batch.length - 1]!.id, content: text });
+        // its reply is a new paragraph, not glued onto the answer before it
+        turn.breakPending = turn.textTail !== '';
         r = await this.drain(st, turn, st.session.prompt({ text, skipPromptHooks: true }, { signal: turn.abort.signal }));
       }
       return r;

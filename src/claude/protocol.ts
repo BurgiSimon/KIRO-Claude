@@ -484,6 +484,28 @@ export interface ContextUsageCategory {
   [k: string]: unknown;
 }
 
+/**
+ * Answer to the host `interrupt` control request (VERIFIED 2.1.319): `still_queued` = user lines
+ * the CLI keeps queued (they run after the interrupted result); with `cancel_queued:true` it is
+ * empty and `cancelled` lists the dropped lines (each also reported `command_lifecycle
+ * cancelled`, before this answer).
+ */
+export interface InterruptResponse {
+  still_queued?: string[];
+  cancelled?: string[];
+  [k: string]: unknown;
+}
+
+/**
+ * Answer to the host `cancel_async_message` control request (`{message_uuid}`, VERIFIED 2.1.319):
+ * `cancelled:true` = the user line was still queued and is dropped (reported `command_lifecycle
+ * cancelled` first); `false` = it was no longer queued (already started) or the CLI declined.
+ */
+export interface CancelAsyncMessageResponse {
+  cancelled?: boolean;
+  [k: string]: unknown;
+}
+
 export interface ContextUsage {
   totalTokens: number;
   maxTokens: number;

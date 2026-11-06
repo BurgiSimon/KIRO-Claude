@@ -39,19 +39,25 @@
  * Turn text (00 §6.2): `/name args` / `@name args` prompt files (config/prompts), `/<skill> args`
  * inlined (config/skills), userPromptSubmit hooks, `@` and `#` references (context/refs),
  * conditional steering (context/userTurn SteeringActivator), pending context (first-turn hook
- * prompts, tangent tail/merge, restored history), the plan-mode block, then composeUserTurn.
+ * prompts, restored history; a tangent tail/merge carry queued on the record it returned into,
+ * `SessionRecord.pendingContext`), the plan-mode block, then composeUserTurn.
  *
  * Streaming: `text_delta` / `thinking_delta` from `stream_event`s (top level only); a complete
  * `text` block is emitted only for messages that streamed no deltas (dedupe by message id).
  * Subagent text (frames with `parent_tool_use_id`) is never emitted as assistant text.
  *
  * After each turn ending normally, Stop hooks may request continuation turns (≤ 3, enforced by
- * the hook runner) and `confirm` pickers (`ui.confirmStopHook`). Every turn updates the session
- * index (`turns[]` with the last top-level assistant uuid, for `/rewind`) and appends the
- * KiroCrew journal (`Prompt` / `AssistantMessage` / `ToolResults` / `Compaction`).
+ * the hook runner) and `confirm` pickers (`ui.confirmStopHook`); a continuation's (or redirect's)
+ * answer starts a new paragraph (`\n\n` before its first text when text came last, so no front
+ * end glues two answers together; the journal and TurnResult keep the real text). Every turn
+ * updates the session index (`turns[]` with the last top-level assistant uuid, for `/rewind`)
+ * and appends the KiroCrew journal (`Prompt` / `AssistantMessage` / `ToolResults` / `Compaction`).
  *
  * Diagnostics: configuration, hook and gate messages go to `ui.notice`; `notice` events carry
- * turn-scoped messages from Claude (API-key billing, rate-limit rejection). Every event is
+ * turn-scoped messages from Claude (API-key billing). A rate-limit rejection is the `rate_limit`
+ * event alone (the front ends word it); an `authentication_failed` assistant frame publishes no
+ * text (Claude's `/login` advice is no answer; `TurnResult.authError` makes the front ends print
+ * Kiro's not-logged-in text). Every event is
  * yielded by the running `prompt()` / `compact()` generator AND emitted as `'event'`, except the
  * conversation events (text, tools, todos) of internal local turns (`/effort`, `/clear`, the
  * hidden tangent-summary turn), which are silent (their `session_id` / notices still go out).
@@ -67,6 +73,13 @@
  *  - Rewind cuts the journal before the next turn's `Prompt` (by message id), so steers and
  *    `/clear` markers do not shift it.
  *  - `--trust-all-tools` is per invocation: resuming without it clears `trust.trustAll`.
+ *  - Per-tool trust belongs to the agent it was granted under (Q `Agents`: the active agent's
+ *    allowedTools); `/agent swap` and a resume with another `--agent` park it in
+ *    `trust.byAgent` and restore the target's, so `/tools` and the gate show the active agent's.
+ *    The agent is session state, not part of a tangent: a swap inside one also names the new
+ *    agent on the records the tangent returns to (they share the trust object).
+ *  - A respawn that finishes after `close()` closes its new child and fails ("The session is
+ *    closed"): no child outlives its session (ACP terminate during `session/set_mode`).
  *  - `KIRO_CLAUDE_FORCE_MODEL` also pins Claude subagents (`CLAUDE_CODE_SUBAGENT_MODEL[_FORCE]`);
  *    `toolSearch.*` settings map to `ENABLE_TOOL_SEARCH` (08 KC-FS-05, see {@link toolSearchEnv}).
  *  - After `close()` nothing is written any more (the lock is released).
@@ -126,6 +139,7 @@ import { presetRules as capPresetRules } from '../policy/capengine.js';
 import { deniedRulesText, Gate, GATE_CALLBACK_IDS } from '../policy/gate.js';
 import { BUILTIN_CLAUDE_TOOLS, claudeMcpName, isTodoTool, SKILL_CLAUDE_TOOL, toKiroCall } from '../policy/toolmap.js';
 import type {
+  AgentTrust,
   ContextReport,
   GateDecision,
   KiroAgent,
@@ -311,7 +325,7 @@ interface TurnState {
   lastToolBatch?: JournalRecord;
   compactPending: boolean;
   compactSummary?: string;
-  /** Steer prompts sent mid-turn, journaled after the tool results they were injected behind. */
+  /** Steer prompts sent mid-turn, journaled when Claude starts them (see onSteerLifecycle). */
   pendingSteer: JournalRecord[];
 }
 
@@ -350,6 +364,54 @@ export function toolSearchEnv(settings: SettingsStore): string | undefined {
     if (Number.isFinite(n) && n >= 0 && n <= 100) return `auto:${n}`;
   }
   return undefined;
+}
+
+/**
+ * Kiro settings that map onto Claude Code environment variables (names VERIFIED in the claude
+ * 2.1.318/2.1.319 binary): `chat.disableAutoCompaction` ⇒ `DISABLE_AUTO_COMPACT=1` (a manual
+ * `/compact` keeps working, as in Kiro), `mcp.initTimeout` (ms) ⇒ `MCP_TIMEOUT` (ms) and
+ * `api.timeout` (s) ⇒ `API_TIMEOUT_MS`. Only explicitly set values are passed — Kiro's defaults
+ * (5 s MCP start-up) differ from Claude's — and a variable already in the environment wins.
+ */
+export function claudeSettingsEnv(settings: Pick<SettingsStore, 'get'>): Record<string, string> {
+  const out: Record<string, string> = {};
+  const dac = settings.get('chat.disableAutoCompaction');
+  if (dac === true || dac === 'true') out.DISABLE_AUTO_COMPACT = '1';
+  const positive = (key: string): number | undefined => {
+    const v = settings.get(key);
+    const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN;
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+  };
+  const mcp = positive('mcp.initTimeout');
+  if (mcp !== undefined) out.MCP_TIMEOUT = String(Math.round(mcp));
+  const api = positive('api.timeout');
+  if (api !== undefined) out.API_TIMEOUT_MS = String(Math.round(api * 1000));
+  return out;
+}
+
+/**
+ * Make `to` the agent the flat per-tool trust fields belong to (`/agent swap`, a resume with
+ * another `--agent`): park `from`'s allowedTools / rules / revokedTools in `byAgent` and restore
+ * `to`'s entry (empty when it never had one). Q keeps every agent in memory and `t`,
+ * `/tools trust|untrust` and `--trust-tools` change the ACTIVE agent only; trust-all stays
+ * session-wide (06 §1.1, §1.7). Mutates `t` in place: the gate holds a reference to it.
+ */
+export function switchAgentTrust(t: SessionTrust, from: string, to: string): void {
+  if (from === to) return;
+  const saved: Record<string, AgentTrust> = t.byAgent ?? {};
+  const own = (n: string): boolean => Object.prototype.hasOwnProperty.call(saved, n);
+  const cur: AgentTrust = { allowedTools: t.allowedTools, rules: t.rules, ...(t.revokedTools?.length ? { revokedTools: t.revokedTools } : {}) };
+  if (cur.allowedTools.length || cur.rules.length || cur.revokedTools) {
+    Object.defineProperty(saved, from, { value: cur, enumerable: true, writable: true, configurable: true });
+  } else if (own(from)) delete saved[from];
+  const next = own(to) ? saved[to] : undefined;
+  if (own(to)) delete saved[to];
+  t.allowedTools = next ? [...next.allowedTools] : [];
+  t.rules = next ? next.rules.map((r) => ({ ...r })) : [];
+  if (next?.revokedTools?.length) t.revokedTools = [...next.revokedTools];
+  else delete t.revokedTools;
+  if (Object.keys(saved).length) t.byAgent = saved;
+  else delete t.byAgent;
 }
 
 function restoredHistoryBlock(history: string): string {
@@ -460,6 +522,12 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
    */
   private pendingFork: Extract<LaunchMode, { kind: 'fork' }> | undefined;
   private turnBusy = false;
+  /**
+   * Paragraph break between the answers of one `prompt()` (a Stop-hook continuation or redirect
+   * turn): `tail` = the end of the assistant text published since the last tool event, `pending`
+   * = the next text starts a new turn's answer. Set only while `prompt()` runs.
+   */
+  private textJoin: { tail: string; pending: boolean } | undefined;
   private turn: TurnState | undefined;
   private sink: EventSink | undefined;
   private turnAbort: AbortController | undefined;
@@ -532,7 +600,16 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       interactive: this.interactive,
       v3Scopes: () => this.v3,
       mcpServerNames: () => this.launch?.mcpNameMap ?? {},
-      mcpAutoApprove: (server) => this.launch?.allMcpServers.find((s) => s.name === server)?.autoApprove ?? [],
+      mcpAutoApprove: (server, claudeTool) => {
+        // the server that actually runs the call (by its Claude name), else the configured one
+        const own = this.launch?.mcpAutoApprove;
+        if (own && claudeTool?.startsWith('mcp__')) {
+          let best: string | undefined;
+          for (const c of Object.keys(own)) if (claudeTool.startsWith(`mcp__${c}__`) && (best === undefined || c.length > best.length)) best = c;
+          if (best !== undefined) return own[best]!;
+        }
+        return this.launch?.allMcpServers.find((s) => s.name === server)?.autoApprove ?? [];
+      },
       isIgnored: (p) => this.kiroIgnore.isIgnored(p),
       planMode: () => this.rec.planMode,
       specPhase: () => this.opts.specPhase,
@@ -688,6 +765,8 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       throw e;
     }
     if (!created) {
+      // the saved per-tool trust belongs to the saved agent (`--agent` may name another one)
+      switchAgentTrust(rec.trust, rec.agent, agent.name);
       rec.agent = agent.name;
       rec.model = model;
       if (effort) rec.effort = effort;
@@ -906,39 +985,59 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     }
     const ts = toolSearchEnv(this.settings);
     if (ts !== undefined && this.env.ENABLE_TOOL_SEARCH === undefined) extra.ENABLE_TOOL_SEARCH = ts;
+    for (const [k, v] of Object.entries(claudeSettingsEnv(this.settings))) if (this.env[k] === undefined) extra[k] = v;
     return buildChildEnv(this.env, { allowApiKey, extra });
+  }
+
+  /** A signal aborted by `outer` or by the current turn's abort (if a turn is running). */
+  private turnLinkedSignal(outer: AbortSignal): { signal: AbortSignal; dispose(): void } {
+    const ac = new AbortController();
+    const abort = (): void => ac.abort();
+    if (outer.aborted) ac.abort();
+    outer.addEventListener('abort', abort, { once: true });
+    const turnSignal = this.turnAbort?.signal;
+    if (turnSignal?.aborted) ac.abort();
+    turnSignal?.addEventListener('abort', abort, { once: true });
+    return {
+      signal: ac.signal,
+      dispose: () => {
+        outer.removeEventListener('abort', abort);
+        turnSignal?.removeEventListener('abort', abort);
+      },
+    };
   }
 
   private handlers(): ClaudeHandlers {
     return {
-      onHookCallback: async (req) => {
-        const id = req.callback_id;
-        const input = (isObj(req.input) ? req.input : {}) as typeof req.input;
-        if (id === GATE_CALLBACK_IDS.pre) {
-          const r = await this.gate.preToolUse(input);
-          this.onPreDecision(r.call, r.decision);
-          return r.output;
+      // Both callbacks are cancelled by Claude's control_cancel_request (ctx.signal) and by the
+      // turn's own abort (interrupt / ACP session/cancel / close), so a Kiro hook command or an
+      // approval prompt never outlives the turn that asked for it.
+      onHookCallback: async (req, ctx) => {
+        const link = this.turnLinkedSignal(ctx.signal);
+        try {
+          const id = req.callback_id;
+          const input = (isObj(req.input) ? req.input : {}) as typeof req.input;
+          if (id === GATE_CALLBACK_IDS.pre) {
+            const r = await this.gate.preToolUse(input, link.signal);
+            this.onPreDecision(r.call, r.decision);
+            return r.output;
+          }
+          if ((id === GATE_CALLBACK_IDS.post || id === GATE_CALLBACK_IDS.postFail) && typeof input.tool_use_id === 'string' && typeof input.duration_ms === 'number') {
+            this.durations.set(input.tool_use_id, input.duration_ms);
+          }
+          return await this.gate.hookCallback(id, input, link.signal);
+        } finally {
+          link.dispose();
         }
-        if ((id === GATE_CALLBACK_IDS.post || id === GATE_CALLBACK_IDS.postFail) && typeof input.tool_use_id === 'string' && typeof input.duration_ms === 'number') {
-          this.durations.set(input.tool_use_id, input.duration_ms);
-        }
-        return this.gate.hookCallback(id, input);
       },
       onCanUseTool: async (req, ctx) => {
-        const ac = new AbortController();
-        const abort = (): void => ac.abort();
-        if (ctx.signal.aborted) ac.abort();
-        ctx.signal.addEventListener('abort', abort, { once: true });
-        const turnSignal = this.turnAbort?.signal;
-        if (turnSignal?.aborted) ac.abort();
-        turnSignal?.addEventListener('abort', abort, { once: true });
+        const link = this.turnLinkedSignal(ctx.signal);
         try {
-          const r = await this.gate.canUseTool(req, (ar, sig) => this.ui.requestApproval(ar, sig), ac.signal);
+          const r = await this.gate.canUseTool(req, (ar, sig) => this.ui.requestApproval(ar, sig), link.signal);
           if (r.redirectText !== undefined && r.redirectText.trim() !== '') this.redirects.push(r.redirectText);
           return r.result;
         } finally {
-          ctx.signal.removeEventListener('abort', abort);
-          turnSignal?.removeEventListener('abort', abort);
+          link.dispose();
         }
       },
       onOtherControlRequest: () => undefined,
@@ -947,6 +1046,9 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
 
   /** Spawn the child for `mode`, with the start-error fallbacks of the module doc. */
   private async spawn(mode: LaunchMode, attempt = 0): Promise<void> {
+    // a respawn (agent swap / ACP set_mode, /context, /clear, a crashed child) racing close():
+    // no launch files written into a removed runtime dir, no child for a closed session
+    if (this.closed) throw new Error('The session is closed');
     this.reloadConfig();
     const launch = this.buildLaunchFor(mode);
     for (const w of launch.warnings) this.uiNotice('warn', w, true);
@@ -983,6 +1085,12 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         }
       }
       throw e;
+    }
+    if (this.closed) {
+      // close() ran while the child was starting: it found no child to close, so close this one
+      await proc.close().catch(() => undefined);
+      this.cleanupRuntime();
+      throw new Error('The session is closed');
     }
     this.proc = proc;
     this.launch = launch;
@@ -1093,6 +1201,23 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     // Internal local turns (`/effort`, `/clear`, the hidden tangent-summary turn) are silent:
     // only their side effects (new session id, notices, compaction, raw frames) are reported.
     if (this.turn?.kind === 'local' && SILENT_IN_LOCAL_TURNS.has(ev.type)) return;
+    const j = this.textJoin;
+    if (j) {
+      if ((ev.type === 'text_delta' || ev.type === 'text') && ev.text !== '') {
+        if (j.pending) {
+          // a continuation turn's answer is a new paragraph, not glued onto the last one; done
+          // here so the generator and the live 'event' stream (ACP) carry the same text
+          j.pending = false;
+          const sep = '\n'.repeat(Math.max(0, 2 - /\n*$/.exec(j.tail)![0].length));
+          if (sep) ev = { ...ev, text: sep + ev.text };
+        }
+        j.tail = (j.tail + ev.text).slice(-2);
+      } else if (ev.type === 'tool_start' || ev.type === 'tool_denied' || ev.type === 'tool_end') {
+        // front ends render a tool as its own block: that is the boundary already
+        j.tail = '';
+        j.pending = false;
+      }
+    }
     try {
       this.emit('event', ev);
     } catch (e) {
@@ -1157,12 +1282,36 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         case 'rate_limit_event':
           this.onRateLimit(frame as RateLimitFrame);
           break;
+        case 'command_lifecycle':
+          this.onSteerLifecycle(f, t);
+          break;
         default:
           break;
       }
     } catch (e) {
       log.warn(`failed to process a Claude frame: ${errText(e)}`);
     }
+  }
+
+  /**
+   * A steer is journaled where Claude reads it: on its `command_lifecycle` `started` (right after
+   * the tool results of the boundary it is folded in at, or after the prompt's own result when it
+   * runs as a turn of its own — VERIFIED 2.1.319). A steer Claude drops (`cancelled`, e.g. by the
+   * cancel_queued interrupt of an aborted turn) never reached the model and is not journaled.
+   */
+  private onSteerLifecycle(f: Record<string, unknown>, t: TurnState | undefined): void {
+    if (!t || typeof f.command_uuid !== 'string' || (f.state !== 'started' && f.state !== 'cancelled')) return;
+    const i = t.pendingSteer.findIndex((r) => r.data.message_id === f.command_uuid);
+    if (i < 0) return;
+    const [rec] = t.pendingSteer.splice(i, 1);
+    if (f.state !== 'started') return;
+    // read after the prompt's result, in a turn of its own: its answer is a new paragraph, not
+    // glued onto the one before (folded in at a boundary, the tool already broke the text)
+    if (this.textJoin) this.textJoin.pending = this.textJoin.tail !== '';
+    this.flushAssistant(t);
+    rec!.timestamp = new Date().toISOString();
+    t.journal.push(rec!);
+    t.lastToolBatch = undefined;
   }
 
   private onSystem(f: Record<string, unknown>, t: TurnState | undefined): void {
@@ -1251,7 +1400,12 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       return;
     }
     if (typeof f.uuid === 'string') t.assistantUuid = f.uuid;
-    if (f.error === 'authentication_failed') t.authError = true;
+    if (f.error === 'authentication_failed') {
+      // Claude's synthetic "Not logged in · Please run /login" is no answer (and names a command
+      // kiro-claude does not have): the front ends print Kiro's not-logged-in text for authError
+      t.authError = true;
+      return;
+    }
     const msgId = typeof f.message?.id === 'string' ? f.message.id : f.uuid ?? randomUUID();
     if (t.lastMsgId !== msgId) {
       t.lastMsgId = msgId;
@@ -1312,7 +1466,8 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     if (call.claudeName === 'Agent' || call.claudeName === 'Task') {
       const type = typeof call.input.subagent_type === 'string' && call.input.subagent_type ? call.input.subagent_type : 'general-purpose';
       const desc = typeof call.input.description === 'string' ? call.input.description : undefined;
-      this.publish({ type: 'subagent', state: 'started', agentType: type, ...(desc ? { description: desc } : {}), ...(id ? { toolUseId: id } : {}) });
+      const task = typeof call.input.prompt === 'string' && call.input.prompt.trim() ? call.input.prompt : undefined;
+      this.publish({ type: 'subagent', state: 'started', agentType: type, ...(desc ? { description: desc } : {}), ...(id ? { toolUseId: id } : {}), ...(task ? { prompt: task } : {}) });
     }
   }
 
@@ -1362,7 +1517,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       if (!isError) this.trackTodos(call, response, text);
       if (call.claudeName === 'Agent' || call.claudeName === 'Task') {
         const type = typeof call.input.subagent_type === 'string' && call.input.subagent_type ? call.input.subagent_type : 'general-purpose';
-        this.publish({ type: 'subagent', state: 'finished', agentType: type, toolUseId: id });
+        this.publish({ type: 'subagent', state: 'finished', agentType: type, toolUseId: id, isError, ...(isError ? { error: truncateChars(text, 500) } : {}) });
       }
     }
     if (t && batch.length) {
@@ -1375,11 +1530,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         t.journal.push(rec);
         t.lastToolBatch = rec;
       }
-      // a steer is injected at the tool boundary: after these results (00 §8 C13, R6)
-      if (t.pendingSteer.length) {
-        t.journal.push(...t.pendingSteer.splice(0));
-        t.lastToolBatch = undefined;
-      }
+      // steers are journaled when Claude starts them (onSteerLifecycle), not at this boundary
     }
   }
 
@@ -1454,11 +1605,10 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     }
     const resetsAt = typeof info.resetsAt === 'number' ? info.resetsAt : undefined;
     this.lastRateLimit = { status, ...(resetsAt !== undefined ? { resetsAt } : {}), ...(utilization !== undefined ? { utilization } : {}), ...(window ? { window } : {}) };
+    // one message per rejection (00 §3.9 rate_limit_event row): the front ends render a
+    // `rate_limit` with status 'rejected' themselves (REPL, headless; ACP maps it to its error),
+    // so no extra `notice` here
     this.publish({ type: 'rate_limit', status, ...(resetsAt !== undefined ? { resetsAt } : {}), ...(utilization !== undefined ? { utilization } : {}) });
-    if (status === 'rejected') {
-      const when = resetsAt ? ` It resets at ${new Date(resetsAt * 1000).toISOString()}.` : '';
-      this.publish({ type: 'notice', level: 'error', message: `Claude usage limit reached${window ? ` (${window})` : ''}.${when}` });
-    }
   }
 
   private postToolSteering(call: KiroToolCall): string | undefined {
@@ -1547,17 +1697,19 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     if (this.finalized) return;
     if (t.kind !== 'local') this.pendingFork = undefined;
     if (t.kind === 'prompt' && tr.stopReason !== 'local_command') {
+      // an auth failure's text is Claude's "Please run /login", not an answer (session lists, tail)
+      const answer = tr.authError ? '' : tr.text;
       try {
         this.store.appendTurn(
           this.rec,
           { userUuid: t.userUuid, ...(t.assistantUuid ? { assistantUuid: t.assistantUuid } : {}), preview: t.userText, at: new Date().toISOString() },
-          tr.text || t.userText,
+          answer || t.userText,
         );
       } catch (e) {
         this.uiNotice('warn', `Failed to save the session index: ${errText(e)}`, true);
       }
       this.historyKnown = true;
-      this.lastExchange = { user: t.userText, assistant: tr.text };
+      this.lastExchange = { user: t.userText, assistant: answer };
     } else {
       this.persist();
     }
@@ -1628,7 +1780,10 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         await pump;
       }
       this.flushAssistant(t);
-      if (t.pendingSteer.length) t.journal.push(...t.pendingSteer.splice(0));
+      // steers whose `started` was never seen: journaled when the result answers them (a CLI
+      // without lifecycle frames), dropped otherwise (cancelled / never read by the model)
+      const answered = new Set(result ? [...(result.user_message_uuids ?? []), ...(result.user_message_uuid ? [result.user_message_uuid] : [])] : []);
+      for (const rec of t.pendingSteer.splice(0)) if (answered.has(String(rec.data.message_id))) t.journal.push(rec);
       this.turn = undefined;
       this.sink = undefined;
       tr = this.toTurnResult(t, result, failure, signal?.aborted === true);
@@ -1736,9 +1891,12 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       ...this.activator.forNames(hash.steeringNames),
       ...(verbatim ? [] : this.activator.forPrompt(text)),
     ];
+    const carried = this.rec.pendingContext ?? [];
+    delete this.rec.pendingContext; // written with the turn record
     const extraContext: string[] = [
       ...this.firstTurnPrompts.splice(0),
       ...this.pendingContext.splice(0),
+      ...carried,
       ...(this.rec.planMode ? [PLAN_MODE_BLOCK] : []),
       ...(input.extraContext ?? []),
     ];
@@ -1766,6 +1924,8 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     opts.signal?.addEventListener('abort', onAbort, { once: true });
     this.turnAbort = abort;
     this.redirects = [];
+    const join = { tail: '', pending: false };
+    this.textJoin = join;
     try {
       let composed = await this.composeTurn(input, abort.signal);
       let res = yield* this.runTurn(composed.content, 'prompt', composed.userText, composed.images);
@@ -1775,6 +1935,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         const redirect = this.redirects.shift();
         if (redirect !== undefined) {
           composed = await this.composeTurn({ text: redirect }, abort.signal);
+          join.pending = join.tail !== '';
           res = yield* this.runTurn(composed.content, 'prompt', composed.userText, composed.images);
           continuations = 0;
           continue;
@@ -1784,10 +1945,12 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         if (cont === undefined || abort.signal.aborted) break;
         continuations++;
         composed = await this.composeTurn({ text: cont, skipPromptHooks: true }, abort.signal);
+        join.pending = join.tail !== '';
         res = yield* this.runTurn(composed.content, 'prompt', composed.userText, composed.images);
       }
       return res;
     } finally {
+      if (this.textJoin === join) this.textJoin = undefined;
       opts.signal?.removeEventListener('abort', onAbort);
       if (this.turnAbort === abort) this.turnAbort = undefined;
       this.turnBusy = false;
@@ -1828,14 +1991,16 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     return text.trim() === '' ? undefined : text;
   }
 
-  steer(text: string): void {
+  steer(text: string): { uuid: string; withdraw(): Promise<boolean> } | void {
     if (text.trim() === '') return;
     const proc = this.proc;
     if (this.turn && this.turn.kind === 'prompt' && proc?.running && proc.busy) {
       try {
+        // ClaudeProcess keeps the running turn open until Claude has answered this line
         const uuid = proc.sendUserMessage(text, { priority: 'next' });
         this.turn.pendingSteer.push(promptRecord(text, { messageId: uuid }));
-        return;
+        // until Claude reads it, it can be taken back (its `cancelled` drops the journal record)
+        return { uuid, withdraw: () => proc.cancelQueuedMessage(uuid) };
       } catch (e) {
         log.debug(`steer failed, queueing: ${errText(e)}`);
       }
@@ -1868,8 +2033,14 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     const target = r.agents.get(name);
     if (!target) throw new AgentNotFoundError(name, r.failed.get(name)?.message);
     this.agents = r.agents;
+    // per-tool trust is the active agent's (Q Agents::trust_tools); trust-all stays session-wide
+    switchAgentTrust(this.trustState, this.currentAgent.name, target.name);
     this.currentAgent = target;
     this.rec.agent = target.name;
+    // the agent is session state, not part of a tangent's checkpoint (Q, 06 §6.4): the
+    // conversations a tangent returns to run on it too, and their records (which share this
+    // trust, whose per-tool part is the active agent's) must name it
+    for (const f of this.tangentStack) f.rec.agent = target.name;
     for (const w of target.warnings) this.uiNotice('warn', w.message, true);
     if (target.model && target.model.trim() !== '') {
       const m = kiroToClaudeModel(target.model, this.liveModels);
@@ -2009,6 +2180,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       this.turnBusy = false;
     }
     this.rec.turns = [];
+    delete this.rec.pendingContext; // a tangent carry for the conversation just cleared
     this.todoMap.clear();
     this.activator.reset();
     this.lastExchange = undefined;
@@ -2116,6 +2288,10 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     if (mode === 'merge') {
       if (ownTurns <= 0) throw new Error('Nothing to merge yet — this conversation has no findings of its own');
       this.turnBusy = true;
+      // the hidden summary turn is interruptible like any turn (Ctrl+C / ACP cancel during
+      // `/tangent merge`), also before Claude has started working on it
+      const abort = new AbortController();
+      this.turnAbort = abort;
       let summary: TurnResult;
       try {
         const gen = this.runTurn(TANGENT_SUMMARY_PROMPT, 'local', TANGENT_SUMMARY_PROMPT);
@@ -2127,6 +2303,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
           }
         }
       } finally {
+        if (this.turnAbort === abort) this.turnAbort = undefined;
         this.turnBusy = false;
       }
       if (summary!.isError || !summary!.text.trim()) throw new Error(`Merge cancelled — ${summary!.error ?? 'the tangent produced no summary'}`);
@@ -2142,7 +2319,12 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     this.rec.trust = this.trustState;
     lock?.release();
     this.lastExchange = undefined;
-    if (carry) this.pendingContext.push(carry);
+    if (carry) {
+      // the parent's own queue, saved with its record: it reaches THIS conversation even after a
+      // quit or another tangent opened first (never the next tangent, never lost in memory)
+      (this.rec.pendingContext ??= []).push(carry);
+      this.persist();
+    }
     this.historyKnown = this.rec.turns.length > 0;
     this.pendingFork = top.pendingFork;
     await this.restart({ mode: top.pendingFork ?? (this.rec.turns.length > 0 ? { kind: 'resume' } : { kind: 'new' }) });
@@ -2337,10 +2519,9 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     const r = await this.hookRunner.runManual({ ws: this.ws, sessionId: this.rec.sessionId }, name);
     for (const w of r.warnings) this.uiNotice('warn', w.message);
     if (!r.found) throw new Error(`No manual hook named ${name}`);
-    if (r.agentPrompt !== undefined) {
-      this.pendingContext.push(r.agentPrompt);
-      return r.agentPrompt;
-    }
+    // an agent action's prompt is sent by the caller as its own user turn (03 §2.5); queuing it
+    // here would hide it in front of whatever unrelated message comes next
+    if (r.agentPrompt !== undefined) return r.agentPrompt;
     return r.output ?? '';
   }
 

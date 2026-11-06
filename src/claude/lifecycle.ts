@@ -1,7 +1,8 @@
 /**
  * Lifecycle of every `claude` child kiro-claude spawns (capability/auth probes in binary.ts and
- * auth.ts, the headless session child in process.ts). Interactive `claude auth login|logout`
- * (stdio inherited, needs the terminal) is deliberately NOT covered.
+ * auth.ts, the headless session child in process.ts), and of Kiro hook commands (util/process.ts
+ * `runShell`, tracked so they cannot outlive kiro-claude either). Interactive
+ * `claude auth login|logout` (stdio inherited, needs the terminal) is deliberately NOT covered.
  *
  * Process groups (POSIX only, {@link PROCESS_GROUPS}): children are spawned `detached` — Node
  * makes them leaders of a new process group (and session) — and are NOT unref'd. A terminal

@@ -31,7 +31,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import type { SessionRecord, SessionTurnRecord, WorkspaceContext } from '../types.js';
+import type { AgentTrust, SessionRecord, SessionTurnRecord, WorkspaceContext } from '../types.js';
 import { mkdirp, writeJsonAtomic } from '../util/fsx.js';
 import { expandTilde, realpathSafe } from '../util/paths.js';
 
@@ -70,6 +70,43 @@ export function previewText(s: string, max = PREVIEW_MAX_CHARS): string {
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const str = (v: unknown, d: string): string => (typeof v === 'string' ? v : d);
 const strArr = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
+
+/** Own-property assignment (agent names come from files: never touch the prototype). */
+function setOwn<T>(o: Record<string, T>, k: string, v: T): void {
+  Object.defineProperty(o, k, { value: v, enumerable: true, writable: true, configurable: true });
+}
+
+/** One validated per-agent trust entry (SessionTrust.byAgent value). */
+function agentTrustFrom(v: unknown): AgentTrust | undefined {
+  if (!isObj(v)) return undefined;
+  const out: AgentTrust = {
+    allowedTools: strArr(v.allowedTools),
+    rules: Array.isArray(v.rules) ? (v.rules.filter(isObj) as unknown as AgentTrust['rules']) : [],
+  };
+  if (Array.isArray(v.revokedTools)) out.revokedTools = strArr(v.revokedTools);
+  return out;
+}
+
+/** `trust.byAgent` from disk (absent in older records ⇒ undefined). */
+function byAgentFrom(v: unknown): Record<string, AgentTrust> | undefined {
+  if (!isObj(v)) return undefined;
+  const out: Record<string, AgentTrust> = {};
+  for (const [name, entry] of Object.entries(v)) {
+    const t = agentTrustFrom(entry);
+    if (t && name !== '') setOwn(out, name, t);
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+/** Deep copy of `trust.byAgent` for a new record. */
+function copyByAgent(v: Record<string, AgentTrust> | undefined): Record<string, AgentTrust> | undefined {
+  if (!v) return undefined;
+  const out: Record<string, AgentTrust> = {};
+  for (const [name, t] of Object.entries(v)) {
+    setOwn(out, name, { allowedTools: [...t.allowedTools], rules: t.rules.map((r) => ({ ...r })), ...(t.revokedTools ? { revokedTools: [...t.revokedTools] } : {}) });
+  }
+  return Object.keys(out).length ? out : undefined;
+}
 
 const ORIGINS: readonly SessionRecord['origin'][] = ['repl', 'acp', 'headless', 'spec'];
 const FORK_KINDS: readonly SessionRecord['forkKind'][] = ['main', 'tangent', 'rewind', 'spawn', 'compact'];
@@ -138,6 +175,10 @@ export function fromDiskJson(raw: unknown, id: string): SessionRecord | undefine
     },
     planMode: raw.planMode === true,
   };
+  const byAgent = byAgentFrom(trustRaw.byAgent);
+  if (byAgent) rec.trust.byAgent = byAgent;
+  const pending = strArr(raw.pendingContext).filter((s) => s.trim() !== '');
+  if (pending.length) rec.pendingContext = pending;
   const effort = typeof raw.effort === 'string' ? raw.effort : typeof kc.effort === 'string' ? kc.effort : undefined;
   if (effort !== undefined) rec.effort = effort;
   return rec;
@@ -324,6 +365,9 @@ export class SessionStore {
       },
       planMode: init.planMode ?? false,
     };
+    const byAgent = copyByAgent(init.trust?.byAgent);
+    if (byAgent) rec.trust.byAgent = byAgent;
+    if (init.pendingContext?.length) rec.pendingContext = [...init.pendingContext];
     if (init.effort !== undefined) rec.effort = init.effort;
     this.persist(rec);
     return rec;

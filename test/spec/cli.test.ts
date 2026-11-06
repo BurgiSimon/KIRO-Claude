@@ -352,6 +352,68 @@ test('interactive TTY: tool approval prompt maps y/n/t/other; non-interactive de
   }
 });
 
+/** Counts `[y/n/t]` prompts; throws past a bound (a microtask-only loop starves every timer). */
+class BoundedOut extends Writable {
+  data = '';
+  isTTY = true;
+  writes = 0;
+  prompts = 0;
+  override _write(chunk: Buffer | string, _enc: BufferEncoding, cb: () => void): void {
+    this.data += chunk.toString();
+    cb();
+  }
+  override write(chunk: unknown, ...rest: unknown[]): boolean {
+    this.writes++;
+    if (String(chunk).includes('[y/n/t]')) this.prompts++;
+    if (this.writes > 200) throw new Error(`RUNAWAY: ${this.prompts} approval prompts on a closed stdin`);
+    return (super.write as (...a: unknown[]) => boolean)(chunk, ...rest);
+  }
+}
+
+test('interactive TTY: a tool approval after stdin EOF (Ctrl+D) is cancelled, never re-asked forever (C13)', async () => {
+  const w = makeWs();
+  try {
+    const stdin = new PassThrough();
+    stdin.end(); // Ctrl+D / a closed pipe before the approval
+    await new Promise((r) => setImmediate(r));
+    const out = new BoundedOut();
+    const err = new Capture();
+    const ctx: CliContext = {
+      ws: w.ctx,
+      settings: mockSettings(),
+      stdin: stdin as unknown as NodeJS.ReadStream,
+      stdout: out as unknown as NodeJS.WriteStream,
+      stderr: err as unknown as NodeJS.WriteStream,
+      progName: 'kiro-claude',
+      verbosity: 0,
+    };
+    const answers: unknown[] = [];
+    let failure: unknown;
+    const req = { call: { displayName: 'shell', summary: 'echo hi' }, requestId: 'r1', reasons: [], agentName: 'kiro_default' } as unknown as ApprovalRequest;
+    const deps: SpecCliDeps = {
+      isTTY: true,
+      createSession: async (o) => {
+        try {
+          // two approvals: the second one starts with the input already closed
+          answers.push(await o.ui.requestApproval(req, new AbortController().signal));
+          answers.push(await o.ui.requestApproval(req, new AbortController().signal));
+        } catch (e) {
+          failure = e;
+        }
+        throw new Error('stop after the approvals');
+      },
+    };
+    const code = await runSpecCommandWith(['new', 'my-feature', '--type', 'quick', '--description', 'do it'], ctx, deps);
+    assert.equal(failure, undefined, `${(failure as Error | undefined)?.message}`);
+    assert.ok(answers.length >= 2, `${answers.length} approvals`);
+    assert.deepEqual(answers, answers.map(() => ({ kind: 'cancelled' })));
+    assert.equal(out.prompts, answers.length, 'the question is asked once per approval');
+    assert.equal(code, 1);
+  } finally {
+    w.cleanup();
+  }
+});
+
 // ───────────────────────────── e2e: real KiroSession + fake-claude ─────────────────────────────
 
 const here = path.dirname(fileURLToPath(import.meta.url));

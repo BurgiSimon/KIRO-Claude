@@ -41,7 +41,9 @@
  * JSON file passed with `--agents <file>` (the real CLI accepts a file path with `--print`,
  * which keeps large prompts out of argv). `prompt` = the agent's own `file://` resources as
  * Q context entries (≤ 64 KiB) + `Follow this instruction: <prompt>`; `tools` = its `--tools`
- * expansion without `Agent` (omitted for `*`, which inherits); `model` = mapped or `inherit`.
+ * expansion without `Agent` plus its selected MCP servers / tools (omitted for `*`, which
+ * inherits); `mcpServers` = its own selected servers the parent does not run, inline;
+ * `disallowedTools` = its excluded / disabled MCP tools; `model` = mapped or `inherit`.
  *
  * Skills: config/skills `buildSkillsPluginDir` creates `<runtimeDir>/kiro` and
  * `initialize.skills` lists `kiro:<name>` for each (an empty list hides Claude's bundled
@@ -56,14 +58,14 @@ import * as path from 'node:path';
 import type { ClaudeBinary, ClaudeCapabilities } from '../claude/binary.js';
 import type { InitializeRequest, ModelInfo } from '../claude/protocol.js';
 import { discoverSkills, buildSkillsPluginDir, pluginSkillDirNames } from '../config/skills.js';
-import { claudeMcpNameMap, resolveMcpServers, toClaudeMcpConfig } from '../config/mcp.js';
+import { claudeMcpNameMap, claudeServerName, resolveMcpServers, toClaudeMcpConfig } from '../config/mcp.js';
 import { expandFileSpec, resolveResources } from '../config/resources.js';
 import { expandFileRefs, findAgentsMd, loadSteering, loadSteeringPaths } from '../config/steering.js';
 import { loadKiroIgnore } from '../config/kiroignore.js';
 import { buildSystemPrompt, formatContextEntries, AGENT_PROMPT_PREFIX } from '../context/systemPrompt.js';
 import { kiroToClaudeModel } from '../models/models.js';
 import { buildInitializeHooks } from '../policy/gate.js';
-import { expandToolSelectors, type ToolSelection } from '../policy/toolmap.js';
+import { claudeMcpName, expandToolSelectors, type ToolSelection } from '../policy/toolmap.js';
 import type { KiroAgent, McpServerConfig, SettingsStore, SkillInfo, SteeringFile, WorkspaceContext } from '../types.js';
 import { mkdirp, writeFileAtomic } from '../util/fsx.js';
 import { shlexSplit } from '../util/shlex.js';
@@ -135,8 +137,10 @@ export interface LaunchResult {
   mcpServers: McpServerConfig[];
   /** Every configured server incl. disabled / unselected ones (for /mcp). */
   allMcpServers: McpServerConfig[];
-  /** Claude-normalized server name ⇒ Kiro server name. */
+  /** Claude-normalized server name ⇒ Kiro server name (also for subagents' inline servers). */
   mcpNameMap: Record<string, string>;
+  /** Claude-normalized server name ⇒ that server's own `autoApprove` (parent and subagent servers). */
+  mcpAutoApprove?: Record<string, string[]>;
   toolSelection: ToolSelection;
   skills: SkillInfo[];
   conditionalSteering: SteeringFile[];
@@ -259,17 +263,71 @@ function readSmall(p: string, max: number): string | undefined {
   }
 }
 
+/** One `--agents` entry (claude AgentDefinition subset, 04 §13). */
+export interface SubagentDefinition {
+  description: string;
+  prompt: string;
+  tools?: string[];
+  disallowedTools?: string[];
+  /** Inline MCP servers (`{<claude name>: <--mcp-config entry>}`) the parent does not run. */
+  mcpServers?: Record<string, Record<string, unknown>>[];
+  model: string;
+}
+
+/**
+ * Claude MCP server names of one launch, shared by the parent's `--mcp-config` and every
+ * subagent's inline servers: Claude name ⇒ Kiro server name, config (JSON of the Claude entry)
+ * and whether the parent runs it. Mutated by {@link subagentDefinition}.
+ */
+export type McpNameRegistry = Map<string, { kiro: string; key: string; parent: boolean; autoApprove?: string[] }>;
+
+function claudeEntryOf(s: McpServerConfig): Record<string, unknown> {
+  return Object.values(toClaudeMcpConfig([{ ...s, disabled: false }]).mcpServers)[0] ?? {};
+}
+
+/**
+ * The Claude name a subagent's server `s` is reached under: the parent's name when the parent
+ * runs the same server (same Kiro name and Claude config: nothing to add), else a name no other
+ * server of this launch uses, with the server defined inline in the subagent (`inline`).
+ */
+function subagentServerName(s: McpServerConfig, names: McpNameRegistry): { claudeName: string; inline: boolean } {
+  const key = JSON.stringify(claudeEntryOf(s));
+  const base = claudeServerName(s.name);
+  for (let i = 1; ; i++) {
+    const n = i === 1 ? base : `${base}_${i}`;
+    const used = names.get(n);
+    if (!used) {
+      names.set(n, { kiro: s.name, key, parent: false, ...(s.autoApprove ? { autoApprove: [...s.autoApprove] } : {}) });
+      return { claudeName: n, inline: true };
+    }
+    if (used.kiro === s.name && used.key === key) return { claudeName: n, inline: !used.parent };
+  }
+}
+
 /**
  * `--agents` entry for one Kiro agent (see module doc). `opts.inheritModel` (set while
  * `KIRO_CLAUDE_FORCE_MODEL` is in effect) makes every subagent `inherit` the forced model, so a
  * pinned subagent model cannot escape the cost bound (08 KC-ENV-04: every child runs the forced model).
+ *
+ * MCP (Kiro runs a subagent with its own agent config, MCP servers included): the subagent's
+ * servers are resolved like the parent's (`resolveMcpServers`, client servers merged over them,
+ * disabled ones dropped) and its `@srv` / `@srv/tool` selectors expand against them. A selected
+ * server the parent already runs is referenced by its Claude name; any other one is defined
+ * inline (`mcpServers`; VERIFIED with claude 2.1.318 that a name-only reference to a server the
+ * parent does not run is not enough, and with 2.1.319 that an inline server's tools reach both a
+ * subagent with explicit `tools` and a `*` one that inherits). Claude limits a subagent with an
+ * explicit `tools` list to exactly those tools, so a whole server becomes `mcp__<srv>` (a server
+ * prefix, VERIFIED), `@srv/tool` becomes `mcp__<srv>__<tool>` and a tool glob the server prefix
+ * (the gate enforces the glob, as for the parent). Excluded and `disabledTools` MCP tools go to
+ * `disallowedTools`.
+ * `opts.mcp.names` (the launch's {@link McpNameRegistry}) keeps the Claude names unique.
  */
 export function subagentDefinition(
   ws: WorkspaceContext,
   sub: KiroAgent,
   liveModels: ModelInfo[] | undefined,
-  opts: { inheritModel?: boolean } = {},
-): { description: string; prompt: string; tools?: string[]; model: string } {
+  opts: { inheritModel?: boolean; mcp?: { names: McpNameRegistry; extraMcpServers?: readonly McpServerConfig[] } } = {},
+): SubagentDefinition {
   const entries: { path: string; content: string }[] = [];
   let budget = SUBAGENT_RESOURCE_MAX_BYTES;
   try {
@@ -293,15 +351,44 @@ export function subagentDefinition(
     ? `${AGENT_PROMPT_PREFIX}${sub.prompt}`
     : `You are the Kiro agent "${sub.name}".${sub.description ? ` ${sub.description}` : ''}`;
   parts.push(prompt);
-  const def: { description: string; prompt: string; tools?: string[]; model: string } = {
+  const def: SubagentDefinition = {
     description: sub.description?.trim() || `Kiro agent ${sub.name}`,
     prompt: parts.join('\n\n'),
     model: 'inherit',
   };
-  if (!sub.tools.includes('*')) {
-    const sel = expandToolSelectors({ tools: sub.tools, excludedTools: sub.excludedTools, skillsLoaded: false, mcpServers: [], agentNames: [] });
-    def.tools = sel.claudeTools.filter((t) => t !== 'Agent');
+  // MCP servers of the subagent's own config (see above)
+  const names: McpNameRegistry = opts.mcp?.names ?? new Map();
+  let servers: McpServerConfig[] = [];
+  try {
+    servers = mergeMcpServers(resolveMcpServers(ws, sub).servers, opts.mcp?.extraMcpServers).filter((s) => !s.disabled);
+  } catch {
+    servers = []; // best effort, like the resources
   }
+  const selFor = (list: McpServerConfig[], nameOf: (s: McpServerConfig) => string): ToolSelection =>
+    expandToolSelectors({
+      tools: sub.tools,
+      excludedTools: sub.excludedTools,
+      skillsLoaded: false,
+      mcpServers: list.map((s) => ({ name: s.name, claudeName: nameOf(s), disabledTools: s.disabledTools })),
+      agentNames: [],
+    });
+  // which servers are selected, then their Claude names (only selected ones take a name)
+  const chosen = servers.filter((s) => selFor(servers, (x) => claudeServerName(x.name)).mcpServers.includes(s.name));
+  const placed = new Map(chosen.map((s) => [s.name, subagentServerName(s, names)]));
+  const sel = selFor(chosen, (s) => placed.get(s.name)!.claudeName);
+  const mcpTools: string[] = [];
+  const inline: Record<string, Record<string, unknown>>[] = [];
+  for (const s of chosen) {
+    if (!sel.mcpServers.includes(s.name)) continue;
+    const { claudeName: c, inline: own } = placed.get(s.name)!;
+    if (own) inline.push({ [c]: claudeEntryOf(s) });
+    const partial = Object.prototype.hasOwnProperty.call(sel.partialMcp, s.name) ? sel.partialMcp[s.name]! : undefined;
+    if (!partial) mcpTools.push(`mcp__${c}`);
+    else for (const t of partial) mcpTools.push(t.includes('*') || t.includes('?') ? `mcp__${c}` : `mcp__${c}__${claudeMcpName(t)}`);
+  }
+  if (!sub.tools.includes('*')) def.tools = [...new Set([...sel.claudeTools.filter((t) => t !== 'Agent'), ...mcpTools])];
+  if (sel.disallowedTools.length) def.disallowedTools = [...sel.disallowedTools];
+  if (inline.length) def.mcpServers = inline;
   if (!opts.inheritModel && sub.model && sub.model.trim() !== '' && sub.model !== 'auto') {
     const m = kiroToClaudeModel(sub.model, liveModels);
     if (m.value) def.model = m.value;
@@ -370,6 +457,15 @@ export function buildLaunch(input: LaunchInput): LaunchResult {
   const sel2 = expandToolSelectors(selInput(mcpServers));
   const toolSelection: ToolSelection = { ...sel1, disallowedTools: sel2.disallowedTools };
   const mcpNameMap = claudeMcpNameMap(mcpServers);
+  // Claude server names of this launch: the parent's, then the subagents' inline servers
+  const mcpNames: McpNameRegistry = new Map();
+  {
+    const entries = toClaudeMcpConfig(mcpServers).mcpServers;
+    for (const [c, k] of Object.entries(mcpNameMap)) {
+      const auto = mcpServers.find((s) => s.name === k)?.autoApprove;
+      mcpNames.set(c, { kiro: k, key: JSON.stringify(entries[c] ?? {}), parent: true, ...(auto ? { autoApprove: [...auto] } : {}) });
+    }
+  }
 
   const files: LaunchResult['files'] = { systemPrompt: path.join(input.runtimeDir, 'context.md') };
   if (mcpServers.length) {
@@ -413,8 +509,19 @@ export function buildLaunch(input: LaunchInput): LaunchResult {
   }
   const agentsPath = path.join(input.runtimeDir, 'agents.json');
   if (subagents.length && has('--agents')) {
-    const defs: Record<string, ReturnType<typeof subagentDefinition>> = {};
-    for (const n of subagents) defs[n] = subagentDefinition(ws, input.allAgents.get(n)!, input.liveModels, { inheritModel: !!forced });
+    const defs: Record<string, SubagentDefinition> = {};
+    for (const n of subagents) {
+      defs[n] = subagentDefinition(ws, input.allAgents.get(n)!, input.liveModels, {
+        inheritModel: !!forced,
+        mcp: { names: mcpNames, ...(input.extraMcpServers ? { extraMcpServers: input.extraMcpServers } : {}) },
+      });
+    }
+    // tool calls of a subagent's inline server map back to its Kiro server (gate, tool events)
+    for (const [c, u] of mcpNames) {
+      if (!u.parent && !Object.prototype.hasOwnProperty.call(mcpNameMap, c)) {
+        Object.defineProperty(mcpNameMap, c, { value: u.kiro, enumerable: true, writable: true, configurable: true });
+      }
+    }
     files.agents = agentsPath;
     writeFileAtomic(agentsPath, JSON.stringify(defs, null, 2) + '\n', { mode: 0o600 });
   } else {
@@ -426,6 +533,11 @@ export function buildLaunch(input: LaunchInput): LaunchResult {
       /* ignore */
     }
   }
+
+  // each Claude server's own `autoApprove` (a subagent's inline server has its own config, which
+  // may differ from a parent server of the same Kiro name)
+  const mcpAutoApprove: Record<string, string[]> = Object.create(null) as Record<string, string[]>;
+  for (const [c, u] of mcpNames) mcpAutoApprove[c] = u.autoApprove ?? [];
 
   // ── skills ──
   let skillNames: string[] = [];
@@ -514,6 +626,7 @@ export function buildLaunch(input: LaunchInput): LaunchResult {
     mcpServers,
     allMcpServers,
     mcpNameMap,
+    mcpAutoApprove,
     toolSelection,
     skills,
     conditionalSteering: systemPrompt.conditionalSteering,

@@ -348,8 +348,11 @@ export interface HookRunnerLike {
     trigger: 'PreTaskExec' | 'PostTaskExec',
     task: { specName: string; taskId: string; title: string },
   ): Promise<{ blocked: boolean; blockReason?: string; agentPrompts: string[]; warnings: HookWarning[] }>;
-  /** Run a Manual hook by name (/hooks run <name>). */
-  runManual(ctx: HookRunContext, name: string): Promise<{ found: boolean; output?: string; warnings: HookWarning[] }>;
+  /**
+   * Run a Manual hook by name (/hooks run <name>). A command action yields `output`; an agent
+   * action yields `agentPrompt`, which the caller sends as a user turn (03 §2.5).
+   */
+  runManual(ctx: HookRunContext, name: string): Promise<{ found: boolean; output?: string; agentPrompt?: string; warnings: HookWarning[] }>;
 }
 
 // ───────────────────────────── Gate / approvals ─────────────────────────────
@@ -366,6 +369,22 @@ export interface SessionTrust {
    * names / `@srv[/tool]`). Q edits the agent's in-memory allowedTools (06 §1.1); this models
    * that without touching the agent. Cleared by `/tools reset`; a later trust removes an entry.
    */
+  revokedTools?: string[];
+  /**
+   * Per-tool trust of the agents that are not active, by agent name. In Q every agent stays in
+   * memory and `t`, `/tools trust`, `--trust-tools` and `/tools untrust` change only the ACTIVE
+   * agent's allowedTools; only trust-all is session-wide (06 §1.1, §1.7). The flat
+   * `allowedTools` / `rules` / `revokedTools` above always belong to the active agent
+   * (`SessionRecord.agent`); `/agent swap` (ACP `session/set_mode`) parks them here and restores
+   * the target agent's entry. Absent in records written before this field existed.
+   */
+  byAgent?: Record<string, AgentTrust>;
+}
+
+/** The per-agent part of {@link SessionTrust} (see `byAgent`). */
+export interface AgentTrust {
+  allowedTools: string[];
+  rules: PermissionRule[];
   revokedTools?: string[];
 }
 
@@ -437,6 +456,13 @@ export interface SessionRecord {
   contextRules: { rule: string; origin: 'session' }[];
   trust: SessionTrust;
   planMode: boolean;
+  /**
+   * Context for this conversation's next user turn: the summary (`/tangent merge`) or last
+   * exchange (`/tangent tail`) of a tangent that returned into it (01 §5.11, 06 §6.4). Kept on
+   * the record so it reaches THIS conversation even after a quit or another tangent; consumed by
+   * its next prompt.
+   */
+  pendingContext?: string[];
 }
 
 // ───────────────────────────── Models ─────────────────────────────
@@ -477,7 +503,19 @@ export type SessionEvent =
   | { type: 'todo_update'; todos: TodoItem[] }
   | { type: 'compaction'; state: 'started' | 'finished'; preTokens?: number; postTokens?: number }
   | { type: 'notice'; level: 'info' | 'warn' | 'error'; message: string }
-  | { type: 'subagent'; state: 'started' | 'finished'; agentType: string; description?: string; toolUseId?: string }
+  | {
+      type: 'subagent';
+      state: 'started' | 'finished';
+      agentType: string;
+      description?: string;
+      toolUseId?: string;
+      /** The task given to the subagent (`Agent` input `prompt`). */
+      prompt?: string;
+      /** `finished` only: the `Agent` tool_result was an error. */
+      isError?: boolean;
+      /** `finished` with `isError`: short text of that error. */
+      error?: string;
+    }
   | { type: 'rate_limit'; status: string; resetsAt?: number; utilization?: number }
   | { type: 'session_id'; claudeSessionId: string }
   /** Any Claude frame, for UIs that want raw access (ACP/debug). */
@@ -590,8 +628,14 @@ export interface KiroSession extends EventEmitter {
   start(): Promise<void>;
   /** Run one user turn (plus Stop-hook continuations). Yields events, returns the final result. */
   prompt(input: PromptInput, opts?: { signal?: AbortSignal }): AsyncGenerator<SessionEvent, TurnResult>;
-  /** Inject text into the running turn at the next tool boundary (priority "next"). */
-  steer(text: string): void;
+  /**
+   * Inject text into the running turn at a tool boundary (priority "next"). Returns the user line
+   * written to Claude: its `uuid` (its `command_lifecycle` `started` marks the injection) and
+   * `withdraw()`, which takes it back while Claude has not read it yet (resolves whether Claude
+   * dropped it; `_session/steer/clear`). Returns nothing when no turn was running and the text is
+   * held for the next prompt.
+   */
+  steer(text: string): { uuid: string; withdraw(): Promise<boolean> } | void;
   /** Interrupt the running turn (control interrupt) and cancel pending approvals. */
   interrupt(): Promise<void>;
 
@@ -627,6 +671,10 @@ export interface KiroSession extends EventEmitter {
   mcpStatus(): Promise<McpStatusEntry[]>;
   todos(): TodoItem[];
   hooks(): readonly KiroHook[];
+  /**
+   * /hooks run: a command hook's output, or an agent-action hook's prompt, which the caller sends
+   * as a user turn (the session does not queue it).
+   */
   runManualHook(name: string): Promise<string>;
 
   /** /chat save; returns the written path. */

@@ -71,9 +71,23 @@ Flags with an effect: `--session-id`, `--resume`, `--fork-session`, `--resume-se
   ends with exactly one `result` (`num_turns`, `usage`, cumulative `total_cost_usd`/`modelUsage`,
   `permission_denials`, `user_message_uuid(s)`, `session_id`, `result_index`).
 * User lines with a `uuid` get `command_lifecycle` `queued` → `started` → `completed` (after the
-  result). `priority:"next"` while a turn runs is folded into that turn (its uuid is listed in the
-  result); `priority:"now"` interrupts the running turn; anything else is queued.
-* Host control requests: `initialize`, `interrupt` (`{"still_queued":[]}`; aborts the running turn),
+  result; `cancelled` instead for a line whose turn was interrupted). `priority:"now"` interrupts
+  the running turn; anything else without `priority:"next"` is queued as its own turn.
+* `priority:"next"` while a turn runs models claude 2.1.319's queue (VERIFIED with haiku): the line
+  waits in the running turn's queue, and the queue is snapshotted **right after a tool boundary's
+  `tool_result` frames, in the same tick** — so a line the host writes after *seeing* those frames
+  waits for the following boundary. At a boundary the waiting lines are folded in (`started` right
+  after the tool_result, uuid added to the turn's result, `completed` just before that result,
+  their text in `{{steerText}}`). Lines that find no further boundary run next, each as its own turn
+  right after the result (own `completed` → steer `started` → `system/init` …). A boundary inside a
+  subagent (`parent_tool_use_id`) or of an interrupted turn folds nothing.
+* Host control requests: `initialize`, `interrupt` (aborts the running turn; the plain interrupt
+  keeps queued lines and answers `{"still_queued":[<uuids>]}` — they run after the interrupted
+  result; `cancel_queued:true` drops them: `command_lifecycle cancelled` for each, then
+  `{"still_queued":[],"cancelled":[<uuids>]}`, both VERIFIED 2.1.319), `cancel_async_message`
+  (`{message_uuid}`: a line still queued — a `next` line not folded in yet, or one waiting for its
+  own turn — is dropped, `command_lifecycle cancelled`, then `{"cancelled":true}`; otherwise
+  `{"cancelled":false}`; VERIFIED 2.1.319),
   `set_model` (`{"model":<resolved>}`, `null`/`"default"` resets), `set_permission_mode`,
   `set_max_thinking_tokens`, `get_context_usage`, `mcp_status`, `get_settings`
   (`applied.model/effort`), `get_session_cost`; anything else →
@@ -156,6 +170,7 @@ closes it; `num_turns` counts messages):
 Template variables, substituted in every string of `text`, `thinking`, tool specs, `frame`,
 `control` and `result`: `{{userText}}`, `{{sessionId}}`, `{{model}}`, `{{effort}}`, `{{cwd}}`,
 `{{lastToolResult}}` (content of the last tool_result, e.g. a denial text the "model saw"),
+`{{steerText}}` (texts of the `priority:"next"` lines folded into this turn so far, ` | `),
 `{{lastHookContext}}` (last `additionalContext` from a hook callback), `{{lastControlResponse}}`,
 `{{turnIndex}}` (user messages processed by this process, local commands included),
 `{{historyCount}}` / `{{historyUserTexts}}` (user messages in the session history — includes resumed
@@ -207,6 +222,11 @@ not leak settings into each other.
   `--setting-sources` are accepted and logged (inspect `argv` in the log) but have no effect.
 * Results always carry `user_message_uuid(s)` when the host sent a uuid (the real CLI does too for
   model and local-command turns; CLI-initiated background turns are not simulated).
+* A user line WITHOUT `priority` sent while a turn runs is queued as a separate turn; claude 2.1.319
+  was seen folding such a line in at the next tool boundary like `next` (kiro-claude never sends
+  one mid-turn).
+* `queued_turn_count` is the length of the fake's own queue (the real CLI reported 0 with a `next`
+  line still waiting).
 
 ## `test/e2e/` — opt-in suite against the REAL Claude Code CLI
 

@@ -34,13 +34,26 @@
  *
  * Turn bookkeeping: each user line's uuid is "pending" until a `result` lists it in
  * `user_message_uuids`/`user_message_uuid` (a result without uuid info settles the oldest
- * pending line) or a `command_lifecycle` frame reports it `completed`/`cancelled`. `busy` is
- * true while anything is pending. `turn()` ends at the first result that lists its uuid (or that
- * carries no uuid info at all), or with a synthetic error result when its line is `cancelled`
- * before it ever `started` (no result can follow). Aborting a turn whose line is still queued
- * interrupts again once the line reports `started` (the default `interrupt` keeps queued sends,
- * 04 §8). Known limitation: a CLI-initiated background turn whose result has no uuid info,
- * arriving while our line is still queued, is taken as ours.
+ * pending line), a `command_lifecycle` frame reports it `completed`/`cancelled`, or an
+ * `interrupt` answer lists it as `cancelled`. `busy` is true while anything is pending.
+ * `turn()` ends at the first result that lists its uuid (or that carries no uuid info at all),
+ * or with a synthetic error result when its line is `cancelled` before it ever `started` (no
+ * result can follow) — unless a `priority:"next"` line sent while it runs (a steer) is still
+ * open: Claude snapshots its queue right after a tool boundary's results, so a line written
+ * after the host saw them is folded in at the FOLLOWING boundary, or, when the model's next step
+ * is final text, answered in a turn of its own right after the result (VERIFIED 2.1.319, review
+ * C3). The turn then continues through that turn and ends at the result that answers the last
+ * open steer (or once it reports `completed` / `cancelled`), returning that result with `usage`,
+ * `num_turns`, `duration_ms`, `permission_denials` and `user_message_uuids` summed over the results.
+ * An aborted turn ends at its own result.
+ *
+ * Interrupts ({@link ClaudeProcess.interrupt}, also sent when a turn is aborted) carry
+ * `cancel_queued:true` (capability `interrupt_cancel_queued_v1`): the plain interrupt keeps
+ * queued sends, so a steer already written would run after the cancelled turn, re-running the
+ * cancelled work in a turn nobody sees (VERIFIED 2.1.319, review C2). Aborting a turn whose line
+ * is still queued also interrupts again once the line reports `started` (a CLI that keeps it).
+ * Known limitation: a CLI-initiated background turn whose result has no uuid info, arriving
+ * while our line is still queued, is taken as ours.
  *
  * Shutdown ({@link ClaudeProcess.close}): end stdin → wait `graceMs` (default 2000) → SIGTERM →
  * 2 s → SIGKILL. Idempotent.
@@ -61,6 +74,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { resolveSpawn, type ClaudeBinary } from './binary.js';
 import { PROCESS_GROUPS, groupSpawnOptions, signalChild, trackChild } from './lifecycle.js';
 import type {
+  CancelAsyncMessageResponse,
   CanUseToolRequest,
   ClaudeFrame,
   ContextUsage,
@@ -68,6 +82,7 @@ import type {
   HookCallbackRequest,
   InitializeRequest,
   InitializeResponse,
+  InterruptResponse,
   McpStatus,
   PermissionResult,
   ResultFrame,
@@ -181,6 +196,39 @@ export function resultUserUuids(frame: Record<string, unknown>): string[] {
 export function resultMatchesUuid(result: Record<string, unknown>, uuid: string): boolean {
   const list = resultUserUuids(result);
   return list.length === 0 || list.includes(uuid);
+}
+
+/**
+ * One result for a turn that continued through steer turns (module doc): the last result, with
+ * `usage` (numeric fields), `num_turns`, `duration_ms`, `duration_api_ms` and
+ * `permission_denials` summed / concatenated and `user_message_uuids` united over all of them.
+ * Cumulative fields (`total_cost_usd`, `modelUsage`) are the last result's.
+ */
+export function mergeResults(results: readonly ResultFrame[]): ResultFrame {
+  const last = results[results.length - 1]!;
+  const out: ResultFrame = { ...last };
+  const sum = (k: 'num_turns' | 'duration_ms' | 'duration_api_ms'): void => {
+    const vals = results.map((r) => (r as Record<string, unknown>)[k]).filter((v): v is number => typeof v === 'number');
+    if (vals.length) (out as Record<string, unknown>)[k] = vals.reduce((a, b) => a + b, 0);
+  };
+  sum('num_turns');
+  sum('duration_ms');
+  sum('duration_api_ms');
+  const usage: Record<string, unknown> = {};
+  for (const r of results) {
+    if (!isObj(r.usage)) continue;
+    for (const [k, v] of Object.entries(r.usage)) {
+      if (typeof v === 'number') usage[k] = (typeof usage[k] === 'number' ? (usage[k] as number) : 0) + v;
+      else if (!(k in usage)) usage[k] = v;
+    }
+  }
+  if (Object.keys(usage).length) out.usage = usage as ResultFrame['usage'];
+  const denials = results.flatMap((r) => (Array.isArray(r.permission_denials) ? r.permission_denials : []));
+  if (denials.length) out.permission_denials = denials;
+  const uuids: string[] = [];
+  for (const r of results) for (const u of resultUserUuids(r)) if (!uuids.includes(u)) uuids.push(u);
+  if (uuids.length) out.user_message_uuids = uuids;
+  return out;
 }
 
 /** Session id implied by argv: `--session-id X`, or `--resume X` without `--fork-session`. */
@@ -310,6 +358,10 @@ interface TurnState {
   /** The caller aborted while the line was not yet running: interrupt again once it starts. */
   abortOnStart?: boolean;
   aborted?: boolean;
+  /** `priority:"next"` lines sent while this turn runs, not yet answered by a result nor cancelled. */
+  follow: Set<string>;
+  /** Results seen so far (own first) while follow-up lines kept the turn open. */
+  results: ResultFrame[];
 }
 
 /** Events emitted by {@link ClaudeProcess}. */
@@ -543,7 +595,8 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
 
   /**
    * Writes one user line (00 §3.4) and returns its uuid. `priority` is only meaningful while a
-   * turn runs (`next` = inject at the next tool boundary, `later` = own turn after the result).
+   * turn runs (`next` = inject at a later tool boundary, `later` = own turn after the result); a
+   * `next` line sent while {@link turn} runs keeps that turn open until it is answered (module doc).
    */
   sendUserMessage(
     content: string | UserContentBlock[],
@@ -570,12 +623,15 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
       this.pendingUuids = this.pendingUuids.filter((u) => u !== uuid);
       throw e;
     }
+    const turn = this.activeTurn;
+    if (opts.priority === 'next' && turn && uuid !== turn.uuid && !turn.result && !turn.error) turn.follow.add(uuid);
     return uuid;
   }
 
   /**
    * Sends `content` and yields every non-control frame until (and including) the `result` that
-   * answers it; returns that result. Throws synchronously if a turn is already running.
+   * answers it — or, while a steer sent during the turn is still open, the result that answers
+   * that one (module doc) — and returns it. Throws synchronously if a turn is already running.
    * Aborting `signal` sends a control `interrupt` (and another one when a line that was still
    * queued starts); the turn then still ends with the CLI's (`error_during_execution`) result, or
    * a synthetic one if the CLI cancels the queued line. If the child exits mid-turn the generator throws
@@ -592,7 +648,7 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
       const reason: unknown = signal.reason;
       throw reason instanceof Error ? reason : new Error('The turn was aborted before it started');
     }
-    const state: TurnState = { uuid: opts.uuid ?? randomUUID(), queue: [] };
+    const state: TurnState = { uuid: opts.uuid ?? randomUUID(), queue: [], follow: new Set(), results: [] };
     this.activeTurn = state;
     try {
       this.sendUserMessage(content, { uuid: state.uuid });
@@ -624,6 +680,9 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
           continue;
         }
         if (state.error) throw state.error;
+        // ended without a new frame (a steer dropped by the interrupt answer): its result was
+        // already yielded while the steer kept the turn open
+        if (state.result) return state.result;
         await new Promise<void>((resolve) => (state.wake = resolve));
         state.wake = undefined;
       }
@@ -662,9 +721,32 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
     });
   }
 
-  /** Control `interrupt` (VERIFIED: running tools are stopped, turn ends `error_during_execution`). */
-  async interrupt(): Promise<void> {
-    await this.request('interrupt');
+  /**
+   * Control `interrupt` (VERIFIED: running tools are stopped, turn ends `error_during_execution`).
+   * `cancelQueued` (default true) also drops queued user lines (module doc); the lines the answer
+   * lists as `cancelled` are settled.
+   */
+  async interrupt(opts: { cancelQueued?: boolean } = {}): Promise<InterruptResponse> {
+    const cancelQueued = opts.cancelQueued ?? true;
+    const resp = await this.request<InterruptResponse>('interrupt', cancelQueued ? { cancel_queued: true } : {});
+    const answer: InterruptResponse = isObj(resp) ? resp : {};
+    if (Array.isArray(answer.cancelled)) {
+      for (const u of answer.cancelled) if (typeof u === 'string') this.onLineCancelled(u);
+    }
+    return answer;
+  }
+
+  /**
+   * Control `cancel_async_message` (VERIFIED 2.1.319): withdraws a user line still waiting in
+   * Claude's queue, e.g. a steer not read yet. Resolves `true` when Claude dropped it (it reports
+   * `command_lifecycle cancelled` first; the line is settled like one an interrupt cancels),
+   * `false` when it was no longer queued (already started).
+   */
+  async cancelQueuedMessage(uuid: string): Promise<boolean> {
+    const resp = await this.request<CancelAsyncMessageResponse>('cancel_async_message', { message_uuid: uuid });
+    const dropped = isObj(resp) && resp.cancelled === true;
+    if (dropped) this.onLineCancelled(uuid);
+    return dropped;
   }
 
   private interruptInBackground(): void {
@@ -932,15 +1014,71 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
     const turn = this.activeTurn;
     if (turn && !turn.result && !turn.error) {
       turn.queue.push(frame);
-      if (f.type === 'result' && resultMatchesUuid(f, turn.uuid)) {
-        turn.result = frame as ResultFrame;
-        turn.cleanup?.();
-      } else if (f.type === 'command_lifecycle' && f.command_uuid === turn.uuid && typeof f.state === 'string') {
-        this.onTurnLifecycle(turn, f.state);
+      if (f.type === 'result') {
+        this.onTurnResult(turn, frame as ResultFrame);
+      } else if (f.type === 'command_lifecycle' && typeof f.command_uuid === 'string' && typeof f.state === 'string') {
+        if (f.command_uuid === turn.uuid) this.onTurnLifecycle(turn, f.state);
+        // a steer is settled by `cancelled`, and by `completed` too: a folded one completes just
+        // before the result it is folded into (which a CLI may not list it in), one run as a turn
+        // of its own just after its result
+        else if (f.state === 'cancelled' || f.state === 'completed') this.closeFollow(turn, f.command_uuid);
       }
       turn.wake?.();
     }
     this.emit('frame', frame);
+  }
+
+  /**
+   * A `result` while `turn` runs: its own (lists its uuid or carries no uuid info) ends it unless
+   * steers sent during it are still open; later ones close the steers they list (one without
+   * uuid info closes the oldest) and end the turn once none is open.
+   */
+  private onTurnResult(turn: TurnState, result: ResultFrame): void {
+    const listed = resultUserUuids(result);
+    const own = turn.results.length === 0;
+    if (own && !resultMatchesUuid(result, turn.uuid)) return; // somebody else's turn
+    for (const u of listed) turn.follow.delete(u);
+    if (!own && listed.length === 0) {
+      const oldest = turn.follow.values().next();
+      if (!oldest.done) turn.follow.delete(oldest.value);
+    }
+    turn.results.push(result);
+    this.maybeEndTurn(turn);
+  }
+
+  /** A steer of `turn` is settled (`completed` / `cancelled`): it no longer keeps the turn open. */
+  private closeFollow(turn: TurnState, uuid: string): void {
+    if (!turn.follow.delete(uuid)) return;
+    this.maybeEndTurn(turn);
+  }
+
+  /** Ends `turn` once its own result was seen and no steer is open (or the caller aborted). */
+  private maybeEndTurn(turn: TurnState): void {
+    if (turn.result || turn.error || turn.results.length === 0) return;
+    if (turn.follow.size > 0 && !turn.aborted) return;
+    const last = turn.results[turn.results.length - 1]!;
+    turn.result = turn.results.length === 1 ? last : mergeResults(turn.results);
+    if (turn.result !== last) {
+      // the merged result replaces the last raw one in the yielded stream
+      const i = turn.queue.lastIndexOf(last);
+      if (i >= 0) turn.queue[i] = turn.result;
+      else turn.queue.push(turn.result);
+    }
+    turn.cleanup?.();
+    turn.wake?.();
+  }
+
+  /** A line the CLI dropped (`interrupt` answer `cancelled`): settle it like `command_lifecycle cancelled`. */
+  private onLineCancelled(uuid: string): void {
+    this.settleUuid(uuid);
+    const turn = this.activeTurn;
+    if (!turn || turn.result || turn.error) return;
+    if (uuid === turn.uuid) {
+      if (turn.lifecycle !== 'cancelled') this.onTurnLifecycle(turn, 'cancelled');
+      turn.wake?.();
+    } else {
+      this.closeFollow(turn, uuid);
+    }
   }
 
   /**
@@ -956,7 +1094,7 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
     if (state === 'started' && turn.abortOnStart) {
       turn.abortOnStart = false;
       this.interruptInBackground();
-    } else if (state === 'cancelled' && before !== 'started') {
+    } else if (state === 'cancelled' && before !== 'started' && turn.results.length === 0) {
       const synthetic: ResultFrame = {
         type: 'result',
         subtype: 'error_during_execution',

@@ -2,6 +2,7 @@ import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { buildModelList } from '../../src/models/models.js';
 import { SessionStore } from '../../src/session/store.js';
 import type { KiroSession } from '../../src/types.js';
 import { compactInstructions } from '../../src/repl/commands/conversation.js';
@@ -135,6 +136,27 @@ test('/model picker, by id, unknown id, set-current-as-default, fallback', async
   assert.ok(r.out.includes("This session's credentials cannot configure model fallbacks."));
   // the last bare /model got EOF: cancelled without change
   assert.equal(r.s.called('setModel').length, 2);
+});
+
+test('/model <display name> resolves the whole name, never just its first word (C8)', async () => {
+  // claude 2.1.318 initialize.models: the newest model of a family carries the bare alias
+  // ('haiku', 'sonnet') as its value, so the first word alone would match a different model
+  const live = [
+    { value: 'default', resolvedModel: 'claude-opus-5-5', displayName: 'Default (recommended)', description: 'Opus 5.5' },
+    { value: 'sonnet', resolvedModel: 'claude-sonnet-5-5', displayName: 'Sonnet 5.5', description: 'x' },
+    { value: 'haiku', resolvedModel: 'claude-haiku-5-5', displayName: 'Haiku 5.5', description: 'x' },
+    { value: 'claude-haiku-4-5-20251001', resolvedModel: 'claude-haiku-4-5-20251001', displayName: 'Haiku 4.5', description: 'x' },
+    { value: 'claude-sonnet-4-6', resolvedModel: 'claude-sonnet-4-6', displayName: 'Sonnet 4.6', description: 'x' },
+  ];
+  const s = new MockSession();
+  s.models = buildModelList(live);
+  const r = await cmd(['/model Haiku 4.5', '/model Sonnet 4.6', '/model Haiku 9.9', '/model "Haiku 4.5"', '/model haiku'], { session: s });
+  assert.deepEqual(s.called('setModel'), [['claude-haiku-4.5'], ['claude-sonnet-4.6'], ['claude-haiku-4.5'], ['claude-haiku-5.5']], r.out);
+  assert.ok(r.out.includes('\n Using Haiku 4.5\n'), r.out);
+  assert.ok(r.out.includes('\n Using Sonnet 4.6\n'), r.out);
+  assert.ok(r.out.includes("Model 'Haiku 9.9' does not exist. Available models: "), r.out);
+  assert.equal(count(r.out, ' Using Haiku 5.5'), 1, 'only the bare alias selects Haiku 5.5');
+  assert.equal(count(r.out, ' Using Sonnet 5.5'), 0, r.out);
 });
 
 test('/effort levels, per-model support, picker, set-current-as-default', async () => {
@@ -370,6 +392,17 @@ test('/hooks list and run', async () => {
   assert.ok(r.out.includes('/hooks add is not supported in kiro-claude'));
   assert.deepEqual(s2.called('runManualHook'), [['lint']]);
   assert.equal(formatHooks([]).includes('No hooks are configured.'), true);
+});
+
+test('/hooks run with an agent action sends its prompt as a user turn (C17)', async () => {
+  const s = new MockSession();
+  s.hookList = [
+    { dialect: 'v3', source: 'workspace-file', name: 'review', trigger: 'Manual', rawTrigger: 'Manual', action: { type: 'agent', prompt: 'Review the diff' }, timeoutMs: 60000, maxOutputBytes: 10240, cacheTtlSec: 0, enabled: true },
+  ];
+  s.runManualHook = async (): Promise<string> => 'Review the diff';
+  const r = await cmd(['/hooks run review'], { session: s });
+  assert.deepEqual(s.prompts.map((p) => p.text), ['Review the diff'], 'the prompt reached the model');
+  assert.ok(!r.out.includes('\nReview the diff\n\n'), 'the prompt is not just printed');
 });
 
 test('/mcp status', async () => {

@@ -23,7 +23,7 @@ import { validateAgentFileText } from '../../src/cli/commands/agent.js';
 import { openInEditor } from '../../src/cli/io.js';
 import { runHeadless } from '../../src/headless/run.js';
 import { SessionStore, sessionsDir } from '../../src/session/store.js';
-import type { CliContext, KiroSession } from '../../src/types.js';
+import type { CliContext, KiroSession, SessionEvent } from '../../src/types.js';
 import { MockSession, mockFactory, type MockScript } from '../headless/mockSession.js';
 import { makeCtx, makeEnv, run, type TestEnv } from './helpers.js';
 
@@ -398,10 +398,10 @@ test('review: whoami with an email (plain + leading-JSON object, no accountType)
 
 // ───────────────────────────── headless ─────────────────────────────
 
-async function headless(input: string, script: MockScript, opts: { outputFormat?: 'text' | 'stream-json'; stdout?: NodeJS.WriteStream; create?: (s: KiroSession) => KiroSession } = {}) {
+async function headless(input: string, script: MockScript, opts: { outputFormat?: 'text' | 'stream-json'; stdout?: NodeJS.WriteStream; stderr?: NodeJS.WriteStream; create?: (s: KiroSession) => KiroSession } = {}) {
   const { ctx, stdout, stderr } = makeCtx(t);
   const f = mockFactory(script);
-  const c: CliContext = opts.stdout ? { ...ctx, stdout: opts.stdout } : ctx;
+  const c: CliContext = { ...ctx, ...(opts.stdout ? { stdout: opts.stdout } : {}), ...(opts.stderr ? { stderr: opts.stderr } : {}) };
   const code = await runHeadless({
     ctx: c,
     sessionOptions: { env: t.env },
@@ -452,6 +452,28 @@ test('review: a failing local session command ⇒ exit 1, session still closed',
   assert.match(r.stderr, /^error: \/context: no child\n$/);
   assert.equal(r.calls.closed, 1);
   assert.equal(r.calls.prompts.length, 0);
+});
+
+test('review: stderr closed during a turn ⇒ no unhandled error; the answer still reaches stdout, exit 0, session closed (C10)', async () => {
+  class Broken extends Writable {
+    isTTY = false;
+    override _write(_c: Buffer | string, _e: BufferEncoding, cb: (e?: Error | null) => void): void {
+      cb(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+    }
+  }
+  // no listener of its own: an embedder's stream (cli/main guards process.stderr separately)
+  const broken = new Broken() as unknown as NodeJS.WriteStream;
+  const tool = { type: 'tool_start', toolUseId: 't1', trusted: true, call: { displayName: 'read', summary: 'Reading x', input: {}, mcp: undefined } } as unknown as SessionEvent;
+  const r = await headless(
+    'hi',
+    { events: [{ type: 'text_delta', text: 'a' }, tool, { type: 'notice', level: 'warn', message: 'w' } as SessionEvent, { type: 'text_delta', text: 'b' }], eventDelayMs: 5, result: { text: 'ab' } },
+    { stderr: broken },
+  );
+  assert.equal(r.code, 0);
+  assert.equal(r.stdout, 'a\nb\n');
+  assert.equal(r.calls.interrupts, 0);
+  assert.equal(r.calls.closed, 1);
+  assert.equal(broken.listenerCount('error'), 0, 'the listener is removed again');
 });
 
 test('review: stdout closed during a turn ⇒ interrupt, exit 1, session closed', async () => {
