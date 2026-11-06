@@ -15,3 +15,4 @@ export * from './hooks.js';
 export * from './permissionsYaml.js';
 export * from './kiroignore.js';
 export * from './uri.js';
+export * from './diag.js';

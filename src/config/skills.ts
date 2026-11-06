@@ -11,7 +11,9 @@
  *       set); a match that is a directory means `<dir>/SKILL.md`;
  *  3. global defaults `<kiroHome>/skills/<dir>/SKILL.md` (when `includeDefaults`).
  * A skill directory reached twice is listed once. `name` / `description` come from the
- * SKILL.md front matter (name defaults to the directory name).
+ * SKILL.md front matter (name defaults to the directory name). `scope` is `workspace` /
+ * `global` for directories directly inside `.kiro/skills` / `<kiroHome>/skills` (also when
+ * reached through a `skill://` URI), else `resource`.
  *
  * Claude exposure ({@link buildSkillsPluginDir}): a plugin directory
  * `<targetDir>/kiro/.claude-plugin/plugin.json` = `{"name":"kiro","version":"0.0.0"}` plus
@@ -109,9 +111,15 @@ export function discoverSkills(ws: WorkspaceContext, skillUris: string[], opts: 
   const out: SkillInfo[] = [];
   const names = new Set<string>();
   const dirs = new Set<string>();
-  const add = (dir: string, scope: SkillInfo['scope']): void => {
+  const wk = workspaceKiroDir(ws);
+  const wsSkills = wk ? realpathSafe(path.join(wk, 'skills')) : undefined;
+  const globalSkills = realpathSafe(path.join(ws.kiroHome, 'skills'));
+  const add = (dir: string, fallback: SkillInfo['scope']): void => {
     const real = realpathSafe(dir);
     if (dirs.has(real)) return;
+    // A resource URI that points into a default skills root keeps that root's scope.
+    const parent = path.dirname(real);
+    const scope: SkillInfo['scope'] = parent === wsSkills ? 'workspace' : parent === globalSkills ? 'global' : fallback;
     const s = readSkill(dir, scope);
     if (!s) return;
     dirs.add(real);
@@ -119,7 +127,6 @@ export function discoverSkills(ws: WorkspaceContext, skillUris: string[], opts: 
     names.add(s.name);
     out.push(s);
   };
-  const wk = workspaceKiroDir(ws);
   if (opts.includeDefaults && wk) for (const d of skillDirsIn(path.join(wk, 'skills'))) add(d, 'workspace');
   for (const uri of skillUris) for (const d of resolveSkillUri(ws, uri)) add(d, 'resource');
   if (opts.includeDefaults) for (const d of skillDirsIn(path.join(ws.kiroHome, 'skills'))) add(d, 'global');
@@ -134,6 +141,21 @@ export function pluginSkillName(name: string): string {
     .replace(/^-+|-+$/g, '')
     .slice(0, 64);
   return s === '' ? 'skill' : s;
+}
+
+/**
+ * Directory names {@link buildSkillsPluginDir} gives `skills` (same order): {@link pluginSkillName}
+ * with `-2`, `-3`, … on collisions. Claude lists them as `kiro:<name>` (for `initialize.skills`).
+ */
+export function pluginSkillDirNames(skills: readonly SkillInfo[]): string[] {
+  const used = new Set<string>();
+  return skills.map((s) => {
+    const base = pluginSkillName(s.name);
+    let n = base;
+    for (let i = 2; used.has(n); i++) n = `${base}-${i}`;
+    used.add(n);
+    return n;
+  });
 }
 
 function copyDir(src: string, dst: string, depth = 0): void {
@@ -166,15 +188,11 @@ export function buildSkillsPluginDir(skills: SkillInfo[], targetDir: string): st
   writeJsonAtomic(path.join(pluginDir, '.claude-plugin', 'plugin.json'), { name: 'kiro', version: '0.0.0' });
   fs.rmSync(skillsDir, { recursive: true, force: true });
   mkdirp(skillsDir);
-  const used = new Set<string>();
-  for (const s of skills) {
-    const base = pluginSkillName(s.name);
-    let n = base;
-    for (let i = 2; used.has(n); i++) n = `${base}-${i}`;
-    used.add(n);
-    const link = path.join(skillsDir, n);
+  const names = pluginSkillDirNames(skills);
+  skills.forEach((s, i) => {
+    const link = path.join(skillsDir, names[i]!);
     try {
-      fs.symlinkSync(s.dir, link, process.platform === 'win32' ? 'junction' : 'dir');
+      fs.symlinkSync(path.resolve(s.dir), link, process.platform === 'win32' ? 'junction' : 'dir');
     } catch (e) {
       const code = (e as { code?: string }).code;
       if (code === 'EPERM' || code === 'EACCES' || code === 'ENOTSUP' || code === 'EINVAL' || process.platform === 'win32') {
@@ -183,7 +201,7 @@ export function buildSkillsPluginDir(skills: SkillInfo[], targetDir: string): st
         throw e;
       }
     }
-  }
+  });
   return pluginDir;
 }
 

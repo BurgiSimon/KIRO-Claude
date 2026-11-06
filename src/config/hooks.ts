@@ -26,6 +26,10 @@
  *    ({@link LoadedKiroHook}) for runners that want exact list semantics.
  *    A v1 file entry written with `when`/`then` (a docs variant, 03 §2.1) is converted the same way.
  *
+ * A hook whose `matcher` is present but not a string (e.g. a list) is dropped with a
+ * `hook-invalid` warning rather than treated as match-all (Q rejects the whole agent;
+ * running a preToolUse hook for every tool would be the worse failure). `null` = no matcher.
+ *
  * Trigger aliases are matched case-insensitively ignoring `_`/`-` (`agentSpawn`,
  * `AgentSpawn`, `sessionStart`, `promptSubmit`, `agentStop`, `fileEdited`, `userTriggered`,
  * legacy profile `conversation_start` / `per_prompt`, …).
@@ -37,7 +41,8 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { ConfigWarning, HookConfirmOption, HookTrigger, KiroAgent, KiroHook, WorkspaceContext } from '../types.js';
-import { JsonFileError, parseJsonText } from '../util/fsx.js';
+import { parseJsonText } from '../util/fsx.js';
+import { jsonErrorMessage, ownValue } from './diag.js';
 import { workspaceKiroDir } from './workspace.js';
 
 /** A loaded hook plus the original legacy matcher lists (see module doc). */
@@ -86,7 +91,7 @@ const TRIGGER_ALIASES: Record<string, HookTrigger> = {
 
 /** Canonical trigger for a configured trigger string (aliases, any case), else undefined. */
 export function normalizeHookTrigger(raw: string): HookTrigger | undefined {
-  return TRIGGER_ALIASES[raw.toLowerCase().replace(/[^a-z]/g, '')];
+  return ownValue(TRIGGER_ALIASES, raw.toLowerCase().replace(/[^a-z]/g, ''));
 }
 
 /** Triggers allowed in the V2 object form (Q `hooks` keys). */
@@ -137,8 +142,15 @@ function normalizeV2(raw: Record<string, unknown>, agentName: string, sourcePath
           path: sourcePath,
         });
       }
-      if (h.matcher !== undefined && typeof h.matcher !== 'string') {
-        warnings.push({ code: 'hook-invalid', message: `Agent '${agentName}': hooks.${key}[${i}].matcher must be a string`, path: sourcePath });
+      if (h.matcher !== undefined && h.matcher !== null && typeof h.matcher !== 'string') {
+        // Dropping the hook is safer than running it for every tool (Q rejects the whole
+        // agent: `matcher` is an Option<String>).
+        warnings.push({
+          code: 'hook-invalid',
+          message: `Agent '${agentName}': hooks.${key}[${i}].matcher must be a string (hook ignored)`,
+          path: sourcePath,
+        });
+        return;
       }
       const hook: LoadedKiroHook = {
         dialect: 'v2',
@@ -253,10 +265,12 @@ function normalizeV3Entry(
     cacheTtlSec: 0,
     enabled: h.enabled !== false,
   };
-  if (typeof h.matcher === 'string' && h.matcher !== '') hook.matcher = h.matcher;
-  else if (h.matcher !== undefined && typeof h.matcher !== 'string') {
-    warnings.push({ code: 'hook-invalid', message: `${label}[${index}]: "matcher" must be a string (ignored)`, path: sourcePath });
+  if (h.matcher !== undefined && h.matcher !== null && typeof h.matcher !== 'string') {
+    // A hook whose matcher cannot be understood is dropped rather than run for every tool.
+    warnings.push({ code: 'hook-invalid', message: `${label}[${index}]: "matcher" must be a string (hook ignored)`, path: sourcePath });
+    return undefined;
   }
+  if (typeof h.matcher === 'string' && h.matcher !== '') hook.matcher = h.matcher;
   if (typeof h.description === 'string') hook.description = h.description;
   if (h.confirm !== undefined) {
     if (trigger === 'Stop' && action.type === 'command') {
@@ -340,9 +354,10 @@ export function toolTypesToMatcher(toolTypes: readonly string[]): string | undef
   const parts: string[] = [];
   for (const t of list) {
     const lower = t.toLowerCase();
+    const tagIds = ownValue(TAG_IDS, lower);
     if (t === '*') parts.push('.*');
-    else if (TAG_IDS[lower]) {
-      parts.push(`^(?:${TAG_IDS[lower]!.map(escapeRegex).join('|')})$`);
+    else if (tagIds) {
+      parts.push(`^(?:${tagIds.map(escapeRegex).join('|')})$`);
       if (lower === 'subagent') parts.push('^subagent/');
     } else if (lower === '@builtin') parts.push('^(?!mcp_)');
     else if (lower === '@mcp') parts.push('^mcp_');
@@ -454,7 +469,7 @@ export function convertLegacyHook(raw: unknown, label: string, sourcePath: strin
   const when = isPlainObject(raw.when) ? raw.when : undefined;
   const then = isPlainObject(raw.then) ? raw.then : isPlainObject(raw.action) ? raw.action : undefined;
   const whenType = when && typeof when.type === 'string' ? when.type : undefined;
-  const trigger = whenType ? (LEGACY_WHEN[whenType.toLowerCase().replace(/[^a-z]/g, '')] ?? normalizeHookTrigger(whenType)) : undefined;
+  const trigger = whenType ? (ownValue(LEGACY_WHEN, whenType.toLowerCase().replace(/[^a-z]/g, '')) ?? normalizeHookTrigger(whenType)) : undefined;
   if (!trigger) {
     warnings.push({
       code: 'hook-trigger',
@@ -548,7 +563,7 @@ function readJson(p: string, warnings: ConfigWarning[]): unknown {
   try {
     return parseJsonText(text, p);
   } catch (e) {
-    warnings.push({ code: 'invalid-json', message: e instanceof JsonFileError ? e.message : String(e), path: p });
+    warnings.push({ code: 'invalid-json', message: jsonErrorMessage(e, p), path: p });
     return undefined;
   }
 }

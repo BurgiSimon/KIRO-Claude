@@ -19,22 +19,35 @@
  *    Glob/Grep (whose subject is a search root directory) `dir/` is tried as well so that
  *    `./**` covers a search of the workspace root itself (DECISION).
  *  - everything else: util/glob `wildcard` (`*` = any sequence incl. spaces and `/`). Shell
- *    subjects are the call's sub-commands; each is matched in its raw form, its
- *    util/shlex.normalizeCommand form (quotes removed, so `"rm" -rf /` is `rm -rf /`) and that
- *    form without leading `NAME=value` assignments — a pattern matches if any form matches.
- *    MCP subjects are `server/tool`, subagent the agent name, web_fetch the URL, web_search the
- *    query, skill the skill name.
+ *    subjects are the call's sub-commands; each is matched in its raw form and its
+ *    util/shlex.normalizeCommand form (quotes removed, so `"rm" -rf /` is `rm -rf /`). Deny and
+ *    ask rules (and the `exclude` lists of allow rules) also see that form without leading
+ *    `NAME=value` assignments, so `X=1 rm -rf /` still hits `rm *`; allow rules do NOT (an
+ *    environment prefix such as `GIT_PAGER=… git log` can change what a command runs —
+ *    DECISION, safety). MCP subjects are `server/tool`, subagent the agent name, web_fetch the
+ *    URL, web_search the query, skill the skill name.
  *
  * Evaluation (per subject; the call's verdict is the most severe over all subjects, so every
  * shell sub-command must pass): matching rules ⇒ most severe effect (`evaluate` alone ⇒ ask,
  * no Kiro trust classifier); no matching rule ⇒ {@link V3_DEFAULT_RULES}; still nothing ⇒ ask.
- * Shell commands that util/shlex.splitCompoundCommand cannot parse are denied with
- * {@link SHELL_PARSE_DENY}. The adapter's todo tools (`TaskCreate`…) are always allowed.
+ * The adapter's todo tools (`TaskCreate`…) are always allowed.
+ *
+ * Shell commands that util/shlex.splitCompoundCommand cannot parse (unbalanced quotes, and —
+ * stricter than Kiro's own parser — any command/process substitution) are denied with
+ * {@link SHELL_PARSE_DENY}, unless an UNCONDITIONAL allow rule applies to shell (no `match`,
+ * no `exclude`: `--trust-all-tools`, the `allow-all` preset, `t` on the shell tool, a
+ * capability-wide `shell: allow`). Then the whole command is judged as one subject by every
+ * applicable rule (deny > ask > allow), so deny rules still win (DECISION: otherwise
+ * `echo "$(date)"` would be refused even under trust-all, a regression vs Kiro whose parser
+ * understands substitutions). Because a substitution can hide a command the whole-command
+ * match cannot see (`echo $(rm -rf /)` vs a `rm *` deny rule), any CONDITIONAL deny rule for
+ * shell still turns such a command into {@link SHELL_PARSE_DENY}, and a conditional ask /
+ * evaluate rule into ask.
  */
 
 import type { KiroToolCall, PermissionRule, PolicyVerdict, RuleEffect, WorkspaceContext } from '../types.js';
 import { globMatch, wildcardMatch } from '../util/glob.js';
-import { normalizeCommand } from '../util/shlex.js';
+import { normalizeCommand, shlexSplit } from '../util/shlex.js';
 import { canonicalizePath, canonicalizePattern } from './pathmatch.js';
 import { isTodoTool } from './toolmap.js';
 
@@ -74,10 +87,28 @@ export const DEFAULT_READONLY_SHELL_EXCLUDE: readonly string[] = Object.freeze([
   '*--output*', '*--ext-diff*', '*--textconv*', '* -d*', '* -D*', '*--delete*', '* -m*', '* -M*', '*--move*',
   '* -c*', '* -C*', '*--copy*', '* -u*', '*--set-upstream*', '*--unset-upstream*', '* -f*', '*--force*',
   '*--edit-description*',
+  // combined short flags of `git branch` (`git branch -vD x` deletes a branch)
+  'git branch -*d*', 'git branch -*D*', 'git branch -*m*', 'git branch -*M*', 'git branch -*c*',
+  'git branch -*C*', 'git branch -*f*', 'git branch -*u*',
+  // output redirection turns any read-only command into a file writer (`git diff > f`)
+  '*>*',
 ]);
 
-/** V3 default policy (00 §5.3): fs_read in the workspace, read-only shell, utility tools. */
-export const V3_DEFAULT_RULES: readonly PermissionRule[] = Object.freeze([
+function deepFreezeRules(rules: PermissionRule[]): PermissionRule[] {
+  for (const r of rules) {
+    if (r.match) Object.freeze(r.match);
+    if (r.exclude) Object.freeze(r.exclude);
+    Object.freeze(r);
+  }
+  return Object.freeze(rules) as PermissionRule[];
+}
+
+/**
+ * V3 default policy (00 §5.3), consulted only when no configured rule matches a subject:
+ * fs_read in the workspace (`./**`), read-only git / system-info shell commands (minus
+ * {@link DEFAULT_READONLY_SHELL_EXCLUDE}), utility tools. Everything else asks. Deeply frozen.
+ */
+export const V3_DEFAULT_RULES: PermissionRule[] = deepFreezeRules([
   { capability: 'fs_read', match: ['./**'], effect: 'allow', scope: 'kiro' },
   {
     capability: 'shell',
@@ -87,7 +118,7 @@ export const V3_DEFAULT_RULES: readonly PermissionRule[] = Object.freeze([
     scope: 'kiro',
   },
   { capability: 'utility', effect: 'allow', scope: 'kiro' },
-] satisfies PermissionRule[]);
+]);
 
 /** `read-only-shell` preset command list (UNVERIFIED upstream list; DECISION). */
 export const READ_ONLY_SHELL_PRESET: readonly string[] = Object.freeze([
@@ -162,7 +193,11 @@ export function ruleAppliesTo(rule: PermissionRule, call: Pick<KiroToolCall, 'ca
 
 /** Matcher for one subject; caches canonicalized forms. */
 class SubjectMatcher {
+  /** Forms equivalent to the subject (raw, canonical / quote-normalized). */
   private readonly forms: string[];
+  /** `forms` plus forms only used where matching more is SAFER (deny/ask match, allow exclude). */
+  private readonly broadForms: string[];
+
   constructor(
     private readonly call: KiroToolCall,
     subject: string,
@@ -173,29 +208,46 @@ class SubjectMatcher {
       const c = canonicalizePath(subject, call.cwd || ws.cwd, ws.env);
       this.forms = [c];
       if ((call.claudeName === 'Glob' || call.claudeName === 'Grep') && !c.endsWith('/')) this.forms.push(`${c}/`);
+      this.broadForms = this.forms;
     } else if (cap === 'shell') {
-      const set = new Set<string>([subject]);
+      const strict = new Set<string>([subject]);
+      const broad = new Set<string>([subject]);
       const n = normalizeCommand(subject);
       if (n !== null) {
-        set.add(n);
+        strict.add(n);
+        broad.add(n);
         const stripped = n.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S* +)+/, '');
-        if (stripped) set.add(stripped);
+        if (stripped) broad.add(stripped);
       }
-      this.forms = [...set];
-    } else this.forms = [subject];
+      // Strip leading assignments word-wise too: in the joined form `X="a b" rm` is
+      // `X=a b rm`, whose regex-stripped form `b rm` would dodge a `rm *` deny rule.
+      const words = shlexSplit(subject);
+      if (words !== null) {
+        let k = 0;
+        while (k < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[k]!)) k++;
+        if (k > 0 && k < words.length) broad.add(words.slice(k).join(' '));
+      }
+      this.forms = [...strict];
+      this.broadForms = [...broad];
+    } else {
+      this.forms = [subject];
+      this.broadForms = this.forms;
+    }
   }
 
-  matches(pattern: string): boolean {
+  /** `broad`: also try the assignment-stripped shell form (see module doc). */
+  matches(pattern: string, broad = false): boolean {
     const cap = this.call.capability;
+    const forms = broad ? this.broadForms : this.forms;
     if (cap === 'fs_read' || cap === 'fs_write') {
       const cp = canonicalizePattern(pattern, this.ws.workspaceRoot, this.ws.env, this.ws.home, 'v3path');
       // An escaped literal prefix may contain `[x]` classes, which would defeat the dialect's
       // implicit-children rule; add `p/**` explicitly for wildcard-free user patterns.
       const pats = [cp.pattern];
       if (!hasWildcardChars(pattern)) pats.push(`${cp.pattern.replace(/\/+$/, '')}/**`);
-      return pats.some((p) => this.forms.some((f) => globMatch(p, f, 'v3path')));
+      return pats.some((p) => forms.some((f) => globMatch(p, f, 'v3path')));
     }
-    return this.forms.some((f) => wildcardMatch(pattern, f));
+    return forms.some((f) => wildcardMatch(pattern, f));
   }
 }
 
@@ -212,10 +264,20 @@ function hasWildcardChars(p: string): boolean {
   return false;
 }
 
+/**
+ * Whether `rule` covers the subject. Allow rules match strictly and exclude broadly; deny / ask /
+ * evaluate rules match broadly and exclude strictly (both directions err towards asking).
+ */
 function ruleMatches(rule: PermissionRule, m: SubjectMatcher): boolean {
-  const inc = !rule.match || rule.match.length === 0 || rule.match.some((p) => m.matches(p));
+  const widening = rule.effect === 'allow';
+  const inc = !rule.match || rule.match.length === 0 || rule.match.some((p) => m.matches(p, !widening));
   if (!inc) return false;
-  return !(rule.exclude ?? []).some((p) => m.matches(p));
+  return !(rule.exclude ?? []).some((p) => m.matches(p, widening));
+}
+
+/** A rule without `match` and `exclude` lists: it covers every subject of its capability. */
+export function isUnconditional(rule: PermissionRule): boolean {
+  return !rule.match?.length && !rule.exclude?.length;
 }
 
 /** Short human description of a rule, used as a denial / approval reason. */
@@ -244,16 +306,37 @@ function evaluateSubject(rules: PermissionRule[], call: KiroToolCall, subject: s
   return { effect: eff === 'evaluate' ? 'ask' : eff, rules: winners, subject };
 }
 
+/**
+ * A well-formed rule (string capability, known effect, string-only match/exclude), else
+ * `undefined`. Loaders validate already; this keeps a malformed rule from poisoning the
+ * severity ordering (it is ignored).
+ */
+function sanitizeRule(r: unknown): PermissionRule | undefined {
+  if (typeof r !== 'object' || r === null) return undefined;
+  const x = r as Partial<PermissionRule>;
+  if (typeof x.capability !== 'string' || typeof x.effect !== 'string') return undefined;
+  if (!Object.prototype.hasOwnProperty.call(SEVERITY, x.effect)) return undefined;
+  const strs = (v: unknown): string[] | undefined | null =>
+    v === undefined ? undefined : Array.isArray(v) && v.every((p) => typeof p === 'string') ? (v as string[]) : null;
+  const match = strs(x.match);
+  const exclude = strs(x.exclude);
+  if (match === null || exclude === null) return undefined;
+  return x as PermissionRule;
+}
+
 /** All rules in force for a call, in scope order (agent, user, workspace, preset, session, trust-all). */
 export function collectRules(scopes: CapScopes): PermissionRule[] {
-  const tag = (rs: PermissionRule[], scope: PermissionRule['scope']): PermissionRule[] =>
-    rs.map((r) => (r.scope ? r : { ...r, scope }));
+  const tag = (rs: PermissionRule[] | undefined, scope: PermissionRule['scope']): PermissionRule[] =>
+    (Array.isArray(rs) ? rs : []).flatMap((raw) => {
+      const r = sanitizeRule(raw);
+      return r ? [r.scope ? r : { ...r, scope }] : [];
+    });
   return [
-    ...tag(scopes.agentRules ?? [], 'agent'),
-    ...tag(scopes.userRules ?? [], 'user'),
-    ...tag(scopes.workspaceRules ?? [], 'workspace'),
-    ...tag(scopes.presetRules ?? [], 'preset'),
-    ...tag(scopes.sessionRules ?? [], 'session'),
+    ...tag(scopes.agentRules, 'agent'),
+    ...tag(scopes.userRules, 'user'),
+    ...tag(scopes.workspaceRules, 'workspace'),
+    ...tag(scopes.presetRules, 'preset'),
+    ...tag(scopes.sessionRules, 'session'),
     ...(scopes.trustAll ? [{ capability: 'all', effect: 'allow', scope: 'session' } as PermissionRule] : []),
   ];
 }
@@ -261,8 +344,25 @@ export function collectRules(scopes: CapScopes): PermissionRule[] {
 /** Capability-engine decision for one call (see module doc). */
 export function evaluateCap(call: KiroToolCall, scopes: CapScopes, ws: WorkspaceContext): PolicyVerdict {
   if (isTodoTool(call.claudeName)) return { kind: 'allow', reasons: ['utility tools are always allowed'] };
-  if (call.capability === 'shell' && !call.parseable) return { kind: 'deny', reasons: [SHELL_PARSE_DENY] };
   const rules = collectRules(scopes).filter((r) => ruleAppliesTo(r, call));
+  if (call.capability === 'shell' && !call.parseable) {
+    if (!rules.some((r) => r.effect === 'allow' && isUnconditional(r))) return { kind: 'deny', reasons: [SHELL_PARSE_DENY] };
+    const whole = typeof call.input.command === 'string' ? call.input.command : call.subjects.join(' ');
+    const r = evaluateSubject(rules, call, whole, ws);
+    if (r.effect === 'deny') return { kind: 'deny', reasons: [...new Set(r.rules.map(describeRule))] };
+    // Conditional deny / ask rules cannot be checked against commands hidden in a substitution
+    // (`echo $(rm -rf /)` vs `rm *`): refuse / ask instead of letting the allow-all rule win.
+    if (rules.some((x) => x.effect === 'deny' && !isUnconditional(x))) return { kind: 'deny', reasons: [SHELL_PARSE_DENY] };
+    if (r.effect === 'ask') {
+      const reasons = r.rules.length ? r.rules.map(describeRule) : [`no permission rule allows shell: ${whole}`];
+      return { kind: 'ask', reasons: [...new Set(reasons)] };
+    }
+    const conditionalAsk = rules.filter((x) => (x.effect === 'ask' || x.effect === 'evaluate') && !isUnconditional(x));
+    if (conditionalAsk.length) {
+      return { kind: 'ask', reasons: [...new Set([SHELL_PARSE_DENY, ...conditionalAsk.map(describeRule)])] };
+    }
+    return { kind: 'allow', reasons: [...new Set(r.rules.map(describeRule))] };
+  }
   const subjects = call.subjects.length ? call.subjects : [call.v3Id ?? call.claudeName];
   const results = subjects.map((s) => evaluateSubject(rules, call, s, ws));
   const denied = results.filter((r) => r.effect === 'deny');

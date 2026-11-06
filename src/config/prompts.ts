@@ -9,8 +9,8 @@
  * Front matter (V3, UNVERIFIED): a leading `---` block is stripped and its `description`
  * used (02 §6.1 "strip a leading `---` block defensively").
  *
- * Invocation ({@link findPrompt}): name matched case-insensitively (an exact-case match
- * wins). Expansion ({@link expandPrompt}, 00 §8 C4): `${1}`…`${10}` positional arguments,
+ * Invocation ({@link parsePromptInvocation}, {@link findPrompt}): name matched
+ * case-insensitively (an exact-case match wins), arguments shlex-split. Expansion ({@link expandPrompt}, 00 §8 C4): `${1}`…`${10}` positional arguments,
  * `$ARGUMENTS` and `${@}` = all arguments joined by one space; a missing positional is
  * empty. A body without any placeholder is returned unchanged (Q ignores arguments for
  * file prompts).
@@ -21,6 +21,7 @@ import * as path from 'node:path';
 import type { PromptFile, WorkspaceContext } from '../types.js';
 import { parseFrontMatter } from '../util/frontmatter.js';
 import { isDirectory } from '../util/fsx.js';
+import { shlexSplit } from '../util/shlex.js';
 import { normalizeNewlines, stripBom } from '../util/text.js';
 import { legacyGlobalDir, workspaceAmazonqDir, workspaceKiroDir } from './workspace.js';
 
@@ -102,6 +103,27 @@ export function substituteArgs(body: string, args: readonly string[], all?: stri
     if (n !== undefined) return args[Number(n) - 1] ?? '';
     return joined;
   });
+}
+
+/** Result of {@link parsePromptInvocation}. */
+export type PromptInvocation = { name: string; args: string[]; rawArgs: string } | { error: string };
+
+/**
+ * Split a prompt invocation (`@name args…` V2, `/name args…` V3, or a bare `name args…`) the
+ * way Q does (06 §8.1): the text after the sigil is shlex-split (`#` words are kept, see
+ * util/shlex); unbalanced quotes ⇒ `Error splitting prompt command`; no name ⇒ `Prompt name
+ * needs to be specified`. `rawArgs` is the unsplit text after the name (trimmed).
+ */
+export function parsePromptInvocation(input: string): PromptInvocation {
+  let rest = input.trim();
+  if (rest.startsWith('@') || rest.startsWith('/')) rest = rest.slice(1);
+  const words = shlexSplit(rest);
+  if (words === null) return { error: 'Error splitting prompt command' };
+  const name = words[0];
+  if (name === undefined || name === '') return { error: 'Prompt name needs to be specified' };
+  const lead = /^\s*\S+/.exec(rest);
+  const rawArgs = lead ? rest.slice(lead[0].length).trim() : '';
+  return { name, args: words.slice(1), rawArgs };
 }
 
 /** Expand a prompt with (already shlex-split) arguments (see module doc). */

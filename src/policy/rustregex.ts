@@ -12,14 +12,24 @@
  *    an approximation for flags that appear mid-pattern) and scoped `(?i:…)` (→ `(?:…)` + flag);
  *  - `(?P<name>…)` → `(?<name>…)`; `\A` / `\z` → input-boundary look-arounds;
  *  - POSIX classes `[[:alpha:]]` … → explicit ASCII ranges; nested classes `[a[bc]]` are flattened;
+ *    a negated POSIX class that is the only item of its class (`[[:^digit:]]`, `[^[:^digit:]]`)
+ *    becomes the complementary class; `[:name:]` with an unknown name is, as in Rust, a nested
+ *    class of its characters (`[[:nope:]]` = `[:nope]`);
  *  - `\pL` / `\p{…}` / `\x{…}` / `\u{…}` / `\U…` → compiled with the `u` flag;
  *  - escaped punctuation that JS `u` mode rejects (`\-`, `\#`, `\ ` …) → the plain character;
- *  - `x` mode: unescaped whitespace and `#` comments outside classes are dropped.
+ *  - `x` mode: unescaped whitespace and `#` comments outside classes are dropped;
+ *  - `.` → `[^\n]` (`[\s\S]` with `s`): Rust's dot matches `\r`, U+2028 and U+2029, JS's does
+ *    not (otherwise `deniedCommands: ["git .*"]` would miss `git status\r…`);
+ *  - patterns are compiled with the JS `u` flag whenever JS accepts it, so that `.`, negated
+ *    classes and case folding work on code points like Rust (not UTF-16 code units).
  *
  * Constructs Rust's regex engine does NOT support make the pattern invalid (return `null`):
  * look-around `(?=`, `(?!`, `(?<=`, `(?<!`, back-references `\1`–`\9`, `\k<…>`, `(?P=name)`,
- * as well as class set operations (`&&`, `--`, `~~`), negated POSIX classes, unknown letter
- * escapes, a `{` that does not start a counted repetition, and the swap-greed flag `U`.
+ * unknown letter escapes, and a `{` that does not start a counted repetition. Valid Rust
+ * syntax this translator cannot express without the JS `v` flag (Node ≥ 20) is ALSO reported
+ * as invalid: class set operations (`&&`, `--`, `~~`), negated nested classes (`[a[^b]]`), a
+ * negated POSIX class mixed with other class items, and the swap-greed flag `U`. "Invalid"
+ * errs on the safe side: a deny rule then denies everything, an allow rule is ignored.
  * Rust `\d`, `\w`, `\s` are Unicode-aware while JS (without `u`) is ASCII — accepted
  * difference (06 §1.4.1, impact UNVERIFIED).
  */
@@ -144,6 +154,8 @@ function parseClass(src: string, i: number): ClassParse | null {
     j++;
   }
   let body = '';
+  /** Negated POSIX items (`[:^digit:]`) as positive ranges. */
+  const negPosix: string[] = [];
   let first = true;
   for (;;) {
     if (j >= src.length) return null;
@@ -160,11 +172,13 @@ function parseClass(src: string, i: number): ClassParse | null {
     }
     first = false;
     if (c === '[') {
-      const posix = /^\[:(\^?)([a-z]+):\]/.exec(src.slice(j));
-      if (posix) {
-        const cls = POSIX_CLASSES[posix[2]!];
-        if (posix[1] || cls === undefined) return null;
-        body += cls;
+      // Rust: `[:` [`^`] name `:]` with a KNOWN name is an ASCII class; anything else is parsed
+      // as a nested class (regex-syntax `maybe_parse_ascii_class`).
+      const posix = /^\[:(\^?)([^:\]]*):\]/.exec(src.slice(j));
+      const cls = posix && Object.prototype.hasOwnProperty.call(POSIX_CLASSES, posix[2]!) ? POSIX_CLASSES[posix[2]!] : undefined;
+      if (posix && cls !== undefined) {
+        if (posix[1]) negPosix.push(cls);
+        else body += cls;
         j += posix[0].length;
         continue;
       }
@@ -198,6 +212,11 @@ function parseClass(src: string, i: number): ClassParse | null {
     body += c === '/' ? '\\/' : c;
     j++;
   }
+  if (negPosix.length) {
+    // `[[:^digit:]]` = `[^0-9]`; `[^[:^digit:]]` = `[0-9]`. Mixed with other items: unsupported.
+    if (negPosix.length !== 1 || body !== '') return null;
+    return { body: negPosix[0]!, negated: !negated, next: j, unicode };
+  }
   return { body, negated, next: j, unicode };
 }
 
@@ -207,6 +226,8 @@ export function translateRustRegex(src: string): TranslatedRegex | null {
   let extended = false;
   let unicode = false;
   let out = '';
+  /** Offsets in `out` where an unescaped `.` (outside classes) stands. */
+  const dots: number[] = [];
   let i = 0;
   const n = src.length;
   while (i < n) {
@@ -296,14 +317,43 @@ export function translateRustRegex(src: string): TranslatedRegex | null {
       i++;
       continue;
     }
+    if (c === '.') {
+      // Rust `.` = any character except `\n` (with `s`: any). JS `.` also excludes `\r`,
+      // U+2028 and U+2029, so `git .*` would miss `git status\r…` — a deny-rule bypass.
+      dots.push(out.length);
+      i++;
+      continue;
+    }
     out += c;
     i++;
+  }
+  if (dots.length) {
+    const any = flags.has('s') ? '[\\s\\S]' : '[^\\n]';
+    let s = '';
+    let prev = 0;
+    for (const at of dots) {
+      s += out.slice(prev, at) + any;
+      prev = at;
+    }
+    out = s + out.slice(prev);
   }
   const f = [...flags].sort().join('') + (unicode ? 'u' : '');
   return { source: out, flags: f };
 }
 
+/**
+ * Compile with the `u` flag when JS accepts it (Rust matches Unicode scalar values, so `.`,
+ * `[^x]` and case folding must see whole code points: `rm .` matches `rm 😀` in Rust), else
+ * without it. Adding `u` never turns a translatable pattern invalid: it is only a preference.
+ */
 function tryCompile(source: string, flags: string): RegExp | null {
+  if (!flags.includes('u')) {
+    try {
+      return new RegExp(source, `${flags}u`);
+    } catch {
+      /* fall back to non-unicode mode below */
+    }
+  }
   try {
     return new RegExp(source, flags);
   } catch {

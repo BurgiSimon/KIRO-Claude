@@ -12,6 +12,9 @@
  *  - legacy dirs are read like Q (non-recursive, JSON only); Kiro dirs recursively
  *    (depth ≤ 8, dot-directories and `node_modules` skipped); `._*` sidecars, `*.bak*`,
  *    `*.example` never match; files are visited in sorted relative-path order.
+ *  - a `.md` file that a JSON agent of any scanned dir uses as its `file://` prompt (e.g.
+ *    `agents/prompts/dev.md`) is not loaded as a Markdown agent (DECISION: the recursive V3
+ *    scan would otherwise turn every prompt file into a bogus agent);
  *  - name = `name` field ?? path relative to the agents dir without extension, `/`-separated
  *    (`team/planner`); duplicate names in one scope keep the first with Q's
  *    `WARNING: Duplicate agent with name <n> was found in the <scope> directory.`;
@@ -33,8 +36,10 @@
  *    <path>)`, …); a prompt that cannot be resolved makes the agent fail to load (Q `thaw`);
  *  - `tools` absent ⇒ `[]` plus a `tools-missing` warning (Q schema default; UNVERIFIED for
  *    V3); the string `"*"` is accepted as `["*"]`;
- *  - `includeMcpJson` defaults to false for custom agents, `useLegacyMcpJson` to false
- *    (00 §9 item 12 DECISION);
+ *  - `includeMcpJson` absent ⇒ **true** (kiro-cli "reads an absent `includeMcpJson` as
+ *    true", recorded from KiroCrew's source in 08a §4.1 — this supersedes the provisional
+ *    00 §9 item 12 DECISION of false); an explicit `false` is honored (KiroCrew KC-SPEC-01).
+ *    `useLegacyMcpJson` defaults to false (Q schema);
  *  - `inheritDefaultResources` = !`chat.disableInheritingDefaultResources` (custom agents),
  *    always true for built-ins (00 §8 C5).
  *
@@ -54,9 +59,10 @@ import type {
   WorkspaceContext,
 } from '../types.js';
 import { parseFrontMatter } from '../util/frontmatter.js';
-import { JsonFileError, parseJsonText } from '../util/fsx.js';
-import { expandTilde } from '../util/paths.js';
+import { parseJsonText } from '../util/fsx.js';
+import { expandTilde, realpathSafe } from '../util/paths.js';
 import { stripBom } from '../util/text.js';
+import { jsonErrorReason, setOwn } from './diag.js';
 import { normalizeAgentHooks } from './hooks.js';
 import { normalizeMcpServer } from './mcp.js';
 import { parsePermissionRule } from './permissionsYaml.js';
@@ -283,9 +289,9 @@ export const AGENT_SCHEMA: Record<string, unknown> = {
       default: false,
     },
     includeMcpJson: {
-      description: 'Whether to include ~/.kiro/settings/mcp.json and the workspace .kiro/settings/mcp.json',
+      description: 'Whether to include ~/.kiro/settings/mcp.json and the workspace .kiro/settings/mcp.json (absent: true)',
       type: 'boolean',
-      default: false,
+      default: true,
     },
     includePowers: { description: 'Whether to include installed powers (not supported by kiro-claude)', type: 'boolean' },
     permissions: {
@@ -491,9 +497,7 @@ export function parseAgent(raw: unknown, meta: ParseAgentMeta): { agent?: KiroAg
       try {
         obj = parseJsonText(raw, where ?? '<inline>');
       } catch (e) {
-        const reason =
-          e instanceof JsonFileError ? `${e.reason}${e.line !== undefined ? ` at line ${e.line} column ${e.column ?? 1}` : ''}` : String(e);
-        w('invalid-json', `Json supplied at ${where ?? '<inline>'} is invalid: ${reason}`);
+        w('invalid-json', `Json supplied at ${where ?? '<inline>'} is invalid: ${jsonErrorReason(e)}`);
         return { warnings };
       }
     }
@@ -547,7 +551,7 @@ export function parseAgent(raw: unknown, meta: ParseAgentMeta): { agent?: KiroAg
       if (!isPlainObject(sv)) continue; // already reported by validateAgentObject
       const r = normalizeMcpServer(sn, sv, 'agent', meta.ws.env, where);
       warnings.push(...r.warnings);
-      if (r.server) mcpServers[sn] = r.server;
+      if (r.server) setOwn(mcpServers, sn, r.server);
     }
   }
 
@@ -594,7 +598,7 @@ export function parseAgent(raw: unknown, meta: ParseAgentMeta): { agent?: KiroAg
     tools,
     excludedTools: isStringArray(o.excludedTools) ? [...o.excludedTools] : [],
     mcpServers,
-    includeMcpJson: o.includeMcpJson === true,
+    includeMcpJson: typeof o.includeMcpJson === 'boolean' ? o.includeMcpJson : true,
     useLegacyMcpJson: o.useLegacyMcpJson === true,
     resources: parseResources(o.resources),
     hooks: hr.hooks,
@@ -748,15 +752,44 @@ export interface LoadAgentsResult {
   failed: Map<string, ConfigWarning>;
 }
 
+/**
+ * Real path of the file a JSON agent's `file://` prompt points at, if any (best effort: the
+ * file is parsed leniently and errors are ignored; the real parse reports them).
+ */
+function jsonPromptFile(file: string, env: NodeJS.ProcessEnv): string | undefined {
+  let data: unknown;
+  try {
+    data = JSON.parse(stripBom(fs.readFileSync(file, 'utf8')));
+  } catch {
+    return undefined;
+  }
+  if (!isPlainObject(data) || typeof data.prompt !== 'string' || !/^file:\/\//i.test(data.prompt)) return undefined;
+  const rest = data.prompt.slice('file://'.length);
+  if (rest.trim() === '') return undefined;
+  return realpathSafe(path.resolve(path.dirname(file), expandTilde(rest, env)));
+}
+
 /** Discover and load every agent (see module doc). */
 export function loadAgents(ws: WorkspaceContext, opts: { settings?: SettingsStore } = {}): LoadAgentsResult {
   const warnings: ConfigWarning[] = [];
   const failed = new Map<string, ConfigWarning>();
   const sd = agentSearchDirs(ws);
   warnings.push(...sd.warnings);
+  const listed = sd.dirs.map((d) => ({ d, files: listAgentFiles(d.dir, d.legacy) }));
+  // Markdown files used as `file://` prompts of JSON agents (`prompts/dev.md`) are not agents
+  // themselves, although the recursive V3 scan would otherwise pick them up (DECISION).
+  const promptFiles = new Set<string>();
+  for (const { files } of listed) {
+    for (const [file] of files) {
+      if (!file.toLowerCase().endsWith('.json')) continue;
+      const pf = jsonPromptFile(file, ws.env);
+      if (pf) promptFiles.add(pf);
+    }
+  }
   const byScope: Record<'workspace' | 'global', KiroAgent[]> = { workspace: [], global: [] };
-  for (const d of sd.dirs) {
-    for (const [file, stem] of listAgentFiles(d.dir, d.legacy)) {
+  for (const { d, files } of listed) {
+    for (const [file, stem] of files) {
+      if (file.toLowerCase().endsWith('.md') && promptFiles.has(realpathSafe(file))) continue;
       const meta: Omit<ParseAgentMeta, 'path' | 'format'> = { scope: d.scope, ws, defaultName: stem };
       if (opts.settings) meta.settings = opts.settings;
       const r = loadAgentFile(file, meta);

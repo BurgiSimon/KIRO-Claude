@@ -27,6 +27,10 @@
  *  - Unresolvable ⇒ `[missing: p]`; `.kiroignore`d ⇒ `[ignored: p]`; contents over
  *    {@link FILE_REF_MAX_BYTES} are truncated with a note. Not recursive.
  *
+ * fileMatch activation helper: {@link fileMatchMatches}. Steering files reached through an
+ * agent's own `file://` resources (custom agents with default-resource inheritance off) are
+ * parsed with {@link loadSteeringPaths} so their inclusion modes still apply.
+ *
  * AGENTS.md (02 §4): `<kiroHome>/steering/AGENTS.md`, the workspace root `AGENTS.md`, then
  * nested `AGENTS.md` files in subdirectories (bounded breadth-first walk: depth ≤
  * {@link AGENTS_MD_MAX_DEPTH}, ≤ {@link AGENTS_MD_MAX_DIRS} directories, skipping `.git`,
@@ -37,10 +41,11 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { ConfigWarning, SteeringFile, SteeringInclusion, WorkspaceContext } from '../types.js';
 import { parseFrontMatter } from '../util/frontmatter.js';
-import { walkGlob } from '../util/glob.js';
+import { globMatch, walkGlob } from '../util/glob.js';
 import { expandTilde, realpathSafe, toPosixPath } from '../util/paths.js';
 import { normalizeNewlines, stripBom, truncateBytes } from '../util/text.js';
-import { loadKiroIgnore, type KiroIgnore } from './kiroignore.js';
+import { ownValue } from './diag.js';
+import { isInsideRel, loadKiroIgnore, type KiroIgnore } from './kiroignore.js';
 import { samePath, workspaceAmazonqDir, workspaceKiroDir } from './workspace.js';
 
 /** Maximum bytes inlined per `#[[file:…]]` reference. */
@@ -59,7 +64,7 @@ const INCLUSION_ALIASES: Record<string, SteeringInclusion> = {
 /** Parse an `inclusion` value; `undefined` for unknown values. */
 export function parseInclusion(v: unknown): SteeringInclusion | undefined {
   if (typeof v !== 'string') return undefined;
-  return INCLUSION_ALIASES[v.trim().toLowerCase().replace(/[_\-\s]/g, '')];
+  return ownValue(INCLUSION_ALIASES, v.trim().toLowerCase().replace(/[_\-\s]/g, ''));
 }
 
 function patternList(v: unknown): string[] {
@@ -147,6 +152,70 @@ export function loadSteering(ws: WorkspaceContext): { files: SteeringFile[]; war
   return { files, warnings };
 }
 
+/**
+ * Steering scope of `absPath` when it is a `.md` file inside one of {@link steeringDirs}
+ * (used to give steering files matched by agent `file://` resources their inclusion
+ * semantics, 02 §2.11 "Steering inclusion modes apply to the steering globs"), else undefined.
+ */
+export function steeringScopeOf(ws: WorkspaceContext, absPath: string): SteeringFile['scope'] | undefined {
+  if (!absPath.toLowerCase().endsWith('.md')) return undefined;
+  const real = realpathSafe(absPath);
+  for (const { dir, scope } of steeringDirs(ws)) {
+    const rel = path.relative(realpathSafe(dir), real);
+    if (rel !== '' && isInsideRel(rel)) return scope;
+  }
+  return undefined;
+}
+
+/**
+ * Parse specific steering files (e.g. {@link steeringScopeOf} matches of an agent's resources
+ * when default resources are not inherited). Paths outside the steering dirs get scope
+ * `workspace`. Unreadable files are skipped with a warning.
+ */
+export function loadSteeringPaths(ws: WorkspaceContext, paths: readonly string[]): { files: SteeringFile[]; warnings: ConfigWarning[] } {
+  const files: SteeringFile[] = [];
+  const warnings: ConfigWarning[] = [];
+  const seen = new Set<string>();
+  for (const p of paths) {
+    const real = realpathSafe(p);
+    if (seen.has(real)) continue;
+    seen.add(real);
+    let text: string;
+    try {
+      text = fs.readFileSync(p, 'utf8');
+    } catch (e) {
+      warnings.push({ code: 'steering-read', message: `Failed to read ${p}: ${e instanceof Error ? e.message : String(e)}`, path: p });
+      continue;
+    }
+    const r = parseSteeringText(text, { path: p, scope: steeringScopeOf(ws, p) ?? 'workspace' });
+    files.push(r.file);
+    warnings.push(...r.warnings);
+  }
+  return { files, warnings };
+}
+
+/**
+ * Whether a workspace-relative path matches `fileMatchPattern` globs (03 §3, UNVERIFIED CLI
+ * semantics; DECISION after KiroCrew): each pattern is matched in the V3 path dialect
+ * (`*` within a component, `**` = any directories, `{a,b}`); a pattern without `/` (after
+ * dropping a leading `**​/`) also matches the basename anywhere (`*.tsx` ⇒ any `.tsx` file).
+ * A leading `./` or `/` in either side is ignored; `\` separators are normalized. An empty
+ * list never matches.
+ */
+export function fileMatchMatches(patterns: readonly string[], relPath: string): boolean {
+  const subject = toPosixPath(relPath).replace(/^(?:\.\/)+/, '').replace(/^\/+/, '');
+  if (subject === '') return false;
+  const base = subject.slice(subject.lastIndexOf('/') + 1);
+  for (const raw of patterns) {
+    let p = raw.trim().replace(/\\/g, '/').replace(/^(?:\.\/)+/, '').replace(/^\/+/, '');
+    if (p === '') continue;
+    if (globMatch(p, subject, 'v3path', { windows: false })) return true;
+    while (p.startsWith('**/')) p = p.slice(3);
+    if (p !== '' && !p.includes('/') && globMatch(p, base, 'v3path', { windows: false })) return true;
+  }
+  return false;
+}
+
 /** Base directory for `#[[file:…]]` refs in a steering file (02 §4). */
 export function steeringRefBase(ws: WorkspaceContext, file: Pick<SteeringFile, 'scope' | 'path'>): string {
   if (file.scope === 'global') return path.join(ws.kiroHome, 'steering');
@@ -218,8 +287,9 @@ export function expandFileRefs(body: string, baseDir: string, ws: WorkspaceConte
     if (ref.start !== undefined) {
       const lines = text.split('\n');
       if (lines.length > 0 && lines[lines.length - 1] === '' && text.endsWith('\n')) lines.pop();
-      const a = Math.max(1, Math.min(ref.start, ref.end ?? ref.start));
-      const b = Math.max(ref.start, ref.end ?? ref.start);
+      const end = ref.end ?? ref.start;
+      const a = Math.max(1, Math.min(ref.start, end));
+      const b = Math.max(a, ref.start, end);
       text = lines.slice(a - 1, b).join('\n');
       label = a === b ? `${ref.path}:${a}` : `${ref.path}:${a}-${b}`;
     } else {

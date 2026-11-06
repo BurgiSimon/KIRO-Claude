@@ -29,7 +29,7 @@ describe('anchoredRustRegex — faithful concatenated anchoring', () => {
 });
 
 describe('unsupported Rust constructs are invalid (null)', () => {
-  for (const p of ['^(?!ls$).*', '(?=a)a', '(?<=a)b', '(?<!a)b', '(a)\\1', '\\k<x>', '(?P<x>a)(?P=x)', '[a&&b]', '[a--b]', '[a~~b]', '[[:^alpha:]]', '\\q', 'a{', '{', '(?U)a+', '[abc', '(a', '\\0']) {
+  for (const p of ['^(?!ls$).*', '(?=a)a', '(?<=a)b', '(?<!a)b', '(a)\\1', '\\k<x>', '(?P<x>a)(?P=x)', '[a&&b]', '[a--b]', '[a~~b]', '[a[:^alpha:]]', '[a[^b]]', '\\q', 'a{', '{', '(?U)a+', '[abc', '(a', '\\0']) {
     it(p, () => assert.equal(compileRustRegex(p), null));
   }
 });
@@ -59,6 +59,19 @@ describe('Rust syntax translated', () => {
     assert.equal(m('[[:alpha:][:digit:]_]+', 'ab_12'), true);
     assert.equal(m('[a[bc]]+', 'abcab'), true);
     assert.equal(m('[]a]+', ']a]'), true);
+  });
+  it('unknown POSIX names (incl. Object.prototype keys) are nested classes, as in Rust', () => {
+    assert.equal(m('[[:nope:]]+', ':nope'), true);
+    assert.equal(m('[[:nope:]]', 'x'), false);
+    assert.equal(m('[[:constructor:]]+', 'construct'), true);
+    assert.equal(m('[[:constructor:]]', '{'), false, 'no Object.prototype function text leaks in');
+    assert.equal(m('[[:toString:]]+', 'String'), true);
+  });
+  it('negated POSIX classes', () => {
+    assert.equal(m('[[:^digit:]]+', 'abc'), true);
+    assert.equal(m('[[:^digit:]]+', 'ab1'), false);
+    assert.equal(m('[^[:^digit:]]+', '123'), true);
+    assert.equal(m('[^[:^digit:]]+', '12a'), false);
   });
   it('unicode escapes and properties', () => {
     assert.equal(m('\\pL+', 'héllo'), true);

@@ -73,6 +73,7 @@ import { isToolInAllowlist, matchesAnyPattern } from './qmatch.js';
 import {
   FILE_WRITE_TOOLS,
   NEVER_EXPOSE_TOOLS,
+  claudeMcpName,
   isMcpToolSelected,
   isSubagentSelected,
   isTodoTool,
@@ -450,7 +451,7 @@ export class Gate {
         ...(typeof req.agent_type === 'string' && req.agent_type
           ? { subagent: { ...(req.agent_id ? { id: req.agent_id } : {}), type: req.agent_type } }
           : {}),
-        mcpServerNames: this.safeMcpNames(),
+        mcpServerNames: this.mcpNamesFor(req.mcp_server),
       });
     let s: StaticEval;
     try {
@@ -707,13 +708,25 @@ export class Gate {
     });
   }
 
-  /** P1 enforcement of the agent's `tools` selection for MCP tools and subagents. */
+  /**
+   * P1 enforcement of the agent's `tools` selection for MCP tools and subagents. Inside a
+   * subagent the child Kiro agent's selection applies; a Claude built-in subagent type
+   * (`general-purpose`, `Explore`, …) that is no Kiro agent inherits the parent's tools, so the
+   * parent's selection applies to it.
+   */
   private selectionDenial(call: KiroToolCall): string | undefined {
     let agent: KiroAgent | undefined;
     try {
-      agent = call.subagent ? this.deps.resolveAgent(call.subagent.type) : this.deps.agent();
+      agent = call.subagent ? this.deps.resolveAgent(call.subagent.type) : undefined;
     } catch {
       agent = undefined;
+    }
+    if (!agent) {
+      try {
+        agent = this.deps.agent();
+      } catch {
+        agent = undefined;
+      }
     }
     if (!agent) return undefined;
     if (call.mcp && !isMcpToolSelected(agent.tools, agent.excludedTools, call.mcp.server, call.mcp.tool)) {
@@ -797,7 +810,7 @@ export class Gate {
       cwd: input.cwd || this.deps.ws.cwd,
       ...(input.tool_use_id !== undefined ? { toolUseId: input.tool_use_id } : {}),
       ...(sub ? { subagent: { ...(input.agent_id ? { id: input.agent_id } : {}), type: sub } } : {}),
-      mcpServerNames: this.safeMcpNames(),
+      mcpServerNames: this.mcpNamesFor(input.mcp_server),
     });
   }
 
@@ -860,6 +873,18 @@ export class Gate {
     } catch {
       return {};
     }
+  }
+
+  /**
+   * deps.mcpServerNames(), plus the server named by Claude's `mcp_server.name` (hook /
+   * can_use_tool input) when the map has no entry for its normalized form.
+   */
+  private mcpNamesFor(server: unknown): Record<string, string> {
+    const names = this.safeMcpNames();
+    const n = typeof server === 'object' && server !== null ? (server as { name?: unknown }).name : undefined;
+    if (typeof n !== 'string' || n === '') return names;
+    const key = claudeMcpName(n);
+    return Object.prototype.hasOwnProperty.call(names, key) ? names : { ...names, [key]: n };
   }
 
   private safeAutoApprove(server: string): string[] {

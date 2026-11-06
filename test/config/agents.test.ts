@@ -90,7 +90,8 @@ describe('config/agents parseAgent', () => {
     assert.deepEqual(a.toolsSettings, V2_AGENT.toolsSettings);
     assert.deepEqual(a.toolAliases, { '@git/status': 'gstatus' });
     assert.deepEqual(a.permissions, []);
-    assert.equal(a.includeMcpJson, false);
+    // includeMcpJson absent ⇒ true (kiro-cli, 08a §4.1)
+    assert.equal(a.includeMcpJson, true);
     assert.equal(a.useLegacyMcpJson, true);
     assert.equal(a.inheritDefaultResources, true);
     assert.deepEqual(a.resources, [
@@ -323,6 +324,22 @@ describe('config/agents loadAgents', () => {
     assert.equal(r.failed.size, 0);
   });
 
+  it('Markdown prompt files of JSON agents are not loaded as agents themselves', () => {
+    fx = makeFixture();
+    fx.write('home/.kiro/agents/resources/MY_PROMPT.md', 'You are my agent.\n');
+    fx.write('home/.kiro/agents/my-agent.json', { tools: [], prompt: 'file://resources/MY_PROMPT.md' });
+    fx.write('home/.kiro/agents/other/real.md', '---\ntools: ["read"]\n---\nA real markdown agent');
+    fx.write('home/shared/p.md', 'shared prompt');
+    fx.write('proj/.kiro/agents/ws.json', { tools: [], prompt: 'file://~/shared/p.md' });
+    fx.write('home/.kiro/agents/tilde.md', 'not referenced ⇒ agent');
+    const r = loadAgents(fx.ctx());
+    assert.deepEqual(r.warnings.filter((w) => w.code !== 'tools-missing'), []);
+    const names = [...r.agents.keys()].filter((k) => !k.startsWith('kiro_'));
+    assert.deepEqual(names, ['ws', 'my-agent', 'other/real', 'tilde']);
+    assert.equal(r.agents.get('my-agent')!.prompt, 'You are my agent.\n');
+    assert.equal(r.agents.get('ws')!.prompt, 'shared prompt');
+  });
+
   it('duplicate names within one scope keep the first (Q text)', () => {
     fx = makeFixture();
     fx.write('home/.kiro/agents/a.json', { name: 'dup', tools: [], description: 'first' });
@@ -450,6 +467,24 @@ describe('config/agents built-ins and selection', () => {
     ]);
     // a map without kiro_default still yields the built-in
     assert.equal(selectAgent(ws, new Map(), settings).agent.name, 'kiro_default');
+  });
+
+  it('workspace chat.defaultAgent overrides the global one; empty values are ignored', () => {
+    fx = makeFixture();
+    fx.write('home/.kiro/agents/g.json', { tools: [] });
+    fx.write('proj/.kiro/agents/w.json', { tools: [] });
+    fx.write('home/.kiro/settings/cli.json', { 'chat.defaultAgent': 'g' });
+    const ws = fx.ctx();
+    const { agents } = loadAgents(ws);
+    const settings = openSettings(ws);
+    assert.equal(selectAgent(ws, agents, settings).agent.name, 'g');
+    settings.set('chat.defaultAgent', 'w', 'workspace');
+    assert.equal(selectAgent(ws, agents, settings).agent.name, 'w');
+    assert.equal(selectAgent(ws, agents, settings, '').agent.name, 'w');
+    settings.set('chat.defaultAgent', '""', 'workspace');
+    const r = selectAgent(ws, agents, settings);
+    assert.equal(r.agent.name, 'kiro_default');
+    assert.deepEqual(r.warnings, []);
   });
 
   it('create template follows Q key order (Kiro-adapted)', () => {

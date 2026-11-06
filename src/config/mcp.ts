@@ -5,11 +5,15 @@
  * Entry normalization (02 §5.2):
  *  - `type`: `stdio` | `http` | `sse` (`streamable-http`/`streamableHttp` ⇒ `http`); when
  *    absent it is inferred: `url` present ⇒ `http`, else `stdio` (UNVERIFIED inference,
- *    02 §5.2). stdio requires a non-empty `command`, remote requires `url`.
- *  - Environment substitution (02 §5.3, adapter DECISION): `${env:VAR}` (Q source) and
+ *    02 §5.2). stdio requires a non-empty `command`, remote requires `url` — except for a
+ *    `disabled: true` entry, which may be just `{"disabled": true}` (a higher-priority file
+ *    switching off a server defined elsewhere, 02 §5.1); unset-variable warnings are not
+ *    reported for disabled entries.
+ *  - Environment substitution (02 §5.3, {@link substituteEnv}): `${env:VAR}` (Q source) and
  *    `${VAR}` (Kiro docs) in `env` values, `headers` values and `url`; `command` additionally
- *    gets `~` and `$VAR` expansion (Q `shellexpand::full`). Unknown variables are left as
- *    written and reported with a `mcp-env-unset` warning. `args` are passed verbatim.
+ *    gets `~` and `$VAR` expansion (Q `shellexpand::full`). An unset variable stays the
+ *    literal `${VAR}` (kiro-cli drops the `env:` prefix) and is reported with a
+ *    `mcp-env-unset` warning. `args` are passed verbatim.
  *  - `timeout` ⇒ `timeoutMs`; `disabled`; `autoApprove`; `disabledTools`; `cwd` (accepted,
  *    `~` expanded; not forwarded to Claude, which has no per-server cwd). Unknown fields
  *    (oauth, oauthScopes, requestTimeout, description, …) are accepted silently.
@@ -33,7 +37,8 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { ConfigWarning, KiroAgent, McpOrigin, McpServerConfig, WorkspaceContext } from '../types.js';
-import { JsonFileError, parseJsonText, readTextIfExists, writeJsonAtomic } from '../util/fsx.js';
+import { parseJsonText, readTextIfExists, writeJsonAtomic } from '../util/fsx.js';
+import { jsonErrorMessage, setOwn } from './diag.js';
 import { expandTilde } from '../util/paths.js';
 import { legacyGlobalDir, workspaceAmazonqDir, workspaceKiroDir } from './workspace.js';
 
@@ -49,20 +54,22 @@ export interface EnvSubstitution {
 }
 
 /**
- * Replace `${env:VAR}` and `${VAR}` with values from `env` (02 §5.3). With `opts.dollar`
- * also bare `$VAR` (shellexpand, used for `command`). Unset variables stay as written.
+ * Replace `${env:VAR}` and `${VAR}` with values from `env` (02 §5.3), byte-for-byte like
+ * kiro-cli's expander (regex `\$\{(?:env:)?([^}]+)\}`, recorded by KiroCrew's port of it, 08a
+ * §4.1 / KC-SPEC-04): an unset variable is left as the literal `${VAR}` — for `${env:VAR}`
+ * the `env:` prefix is dropped, as in Q (`format!("${{{}}}", name)`, 02 App. B). Values are
+ * not expanded again. With `opts.dollar` also bare `$VAR` (shellexpand, used for `command`;
+ * an unset `$VAR` stays as written).
  */
 export function substituteEnv(input: string, env: NodeJS.ProcessEnv, opts: { dollar?: boolean } = {}): EnvSubstitution {
   const missing: string[] = [];
-  const re = opts.dollar
-    ? /\$\{env:([^}]+)\}|\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g
-    : /\$\{env:([^}]+)\}|\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
-  const value = input.replace(re, (whole, a: string | undefined, b: string | undefined, c: string | undefined) => {
-    const name = a ?? b ?? c ?? '';
-    const v = env[name];
+  const re = opts.dollar ? /\$\{(?:env:)?([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g : /\$\{(?:env:)?([^}]+)\}/g;
+  const value = input.replace(re, (whole: string, braced: string | undefined, bare: string | undefined) => {
+    const name = braced ?? bare ?? '';
+    const v = Object.prototype.hasOwnProperty.call(env, name) ? env[name] : undefined;
     if (v === undefined) {
       if (!missing.includes(name)) missing.push(name);
-      return whole;
+      return braced !== undefined ? `\${${name}}` : whole;
     }
     return v;
   });
@@ -98,7 +105,7 @@ function stringRecord(
         path: sourcePath,
       });
     }
-    out[k] = sub.value;
+    setOwn(out, k, sub.value);
   }
   return out;
 }
@@ -165,30 +172,38 @@ export function normalizeMcpServer(
 
   if (type === 'stdio') {
     if (commandRaw === undefined || commandRaw.trim() === '') {
-      warnings.push({ code: 'mcp-invalid', message: `MCP server '${name}': stdio servers need a "command"`, path: sourcePath });
-      return { warnings };
+      // A disabled entry only needs its name: `{"disabled": true}` in a higher-priority file
+      // suppresses a server configured elsewhere (02 §5.1).
+      if (!server.disabled) {
+        warnings.push({ code: 'mcp-invalid', message: `MCP server '${name}': stdio servers need a "command"`, path: sourcePath });
+        return { warnings };
+      }
+    } else {
+      const sub = substituteEnv(expandTilde(commandRaw.trim(), env), env, { dollar: true });
+      for (const m of sub.missing) {
+        warnings.push({
+          code: 'mcp-env-unset',
+          message: `MCP server '${name}': environment variable ${m} referenced in command is not set`,
+          path: sourcePath,
+        });
+      }
+      server.command = sub.value;
     }
-    const sub = substituteEnv(expandTilde(commandRaw.trim(), env), env, { dollar: true });
-    for (const m of sub.missing) {
-      warnings.push({
-        code: 'mcp-env-unset',
-        message: `MCP server '${name}': environment variable ${m} referenced in command is not set`,
-        path: sourcePath,
-      });
-    }
-    server.command = sub.value;
     server.args = stringList(raw.args, 'args', name, warnings, sourcePath);
     server.env = stringRecord(raw.env, 'env', name, env, warnings, sourcePath);
   } else {
     if (url === undefined) {
-      warnings.push({ code: 'mcp-invalid', message: `MCP server '${name}': ${type} servers need a "url"`, path: sourcePath });
-      return { warnings };
+      if (!server.disabled) {
+        warnings.push({ code: 'mcp-invalid', message: `MCP server '${name}': ${type} servers need a "url"`, path: sourcePath });
+        return { warnings };
+      }
+    } else {
+      const sub = substituteEnv(url, env);
+      for (const m of sub.missing) {
+        warnings.push({ code: 'mcp-env-unset', message: `MCP server '${name}': environment variable ${m} referenced in url is not set`, path: sourcePath });
+      }
+      server.url = sub.value;
     }
-    const sub = substituteEnv(url, env);
-    for (const m of sub.missing) {
-      warnings.push({ code: 'mcp-env-unset', message: `MCP server '${name}': environment variable ${m} referenced in url is not set`, path: sourcePath });
-    }
-    server.url = sub.value;
     // Kiro docs list `env` for remote servers too; keep it (unused by Claude for remote).
     server.env = stringRecord(raw.env, 'env', name, env, warnings, sourcePath);
   }
@@ -199,6 +214,8 @@ export function normalizeMcpServer(
     warnings.push({ code: 'mcp-invalid', message: `MCP server '${name}': "timeout" must be a non-negative number (ms)`, path: sourcePath });
   }
   if (typeof raw.cwd === 'string' && raw.cwd.trim() !== '') server.cwd = expandTilde(raw.cwd.trim(), env);
+  // A disabled server is never launched: unset variables in it are not worth a warning.
+  if (server.disabled) return { server, warnings: warnings.filter((w) => w.code !== 'mcp-env-unset') };
   return { server, warnings };
 }
 
@@ -225,7 +242,7 @@ export function loadMcpFile(
   try {
     data = parseJsonText(text, filePath);
   } catch (e) {
-    warnings.push({ code: 'invalid-json', message: e instanceof JsonFileError ? e.message : String(e), path: filePath });
+    warnings.push({ code: 'invalid-json', message: jsonErrorMessage(e, filePath), path: filePath });
     return { servers, warnings };
   }
   if (!isPlainObject(data) || !isPlainObject(data.mcpServers)) {
@@ -235,7 +252,7 @@ export function loadMcpFile(
   for (const [name, raw] of Object.entries(data.mcpServers)) {
     const r = normalizeMcpServer(name, raw, origin, env, filePath);
     warnings.push(...r.warnings);
-    if (r.server) servers[name] = r.server;
+    if (r.server) setOwn(servers, name, r.server);
   }
   return { servers, warnings };
 }
@@ -318,14 +335,20 @@ function assignClaudeNames(servers: readonly McpServerConfig[]): Array<[string, 
   return out;
 }
 
+function copyStrings(r: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(r)) setOwn(out, k, v);
+  return out;
+}
+
 /** Build the JSON for Claude `--mcp-config` (disabled servers skipped). */
 export function toClaudeMcpConfig(servers: readonly McpServerConfig[]): { mcpServers: Record<string, Record<string, unknown>> } {
   const mcpServers: Record<string, Record<string, unknown>> = {};
   for (const [n, s] of assignClaudeNames(servers)) {
     if (s.type === 'stdio') {
-      mcpServers[n] = { type: 'stdio', command: s.command ?? '', args: [...s.args], env: { ...s.env } };
+      setOwn(mcpServers, n, { type: 'stdio', command: s.command ?? '', args: [...s.args], env: copyStrings(s.env) });
     } else {
-      mcpServers[n] = { type: s.type, url: s.url ?? '', headers: { ...s.headers } };
+      setOwn(mcpServers, n, { type: s.type, url: s.url ?? '', headers: copyStrings(s.headers) });
     }
   }
   return { mcpServers };
@@ -334,7 +357,7 @@ export function toClaudeMcpConfig(servers: readonly McpServerConfig[]): { mcpSer
 /** Claude server name ⇒ Kiro server name, consistent with {@link toClaudeMcpConfig}. */
 export function claudeMcpNameMap(servers: readonly McpServerConfig[]): Record<string, string> {
   const out: Record<string, string> = {};
-  for (const [n, s] of assignClaudeNames(servers)) out[n] = s.name;
+  for (const [n, s] of assignClaudeNames(servers)) setOwn(out, n, s.name);
   return out;
 }
 
@@ -342,7 +365,7 @@ export function claudeMcpNameMap(servers: readonly McpServerConfig[]): Record<st
 
 /**
  * Read an mcp.json file as raw JSON for editing. Missing ⇒ `{ mcpServers: {} }`. Throws
- * {@link JsonFileError} on invalid JSON and an Error when the root is not an object.
+ * util/fsx `JsonFileError` on invalid JSON and an Error when the root is not an object.
  */
 export function readMcpFileRaw(filePath: string): { mcpServers: Record<string, unknown>; [k: string]: unknown } {
   const text = readTextIfExists(filePath);
@@ -351,7 +374,9 @@ export function readMcpFileRaw(filePath: string): { mcpServers: Record<string, u
   if (!isPlainObject(data)) throw new Error(`${filePath}: expected a JSON object`);
   const servers = data.mcpServers;
   if (servers !== undefined && !isPlainObject(servers)) throw new Error(`${filePath}: "mcpServers" must be an object`);
-  return { ...data, mcpServers: { ...(servers ?? {}) } };
+  const copy: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(servers ?? {})) setOwn(copy, k, v);
+  return { ...data, mcpServers: copy };
 }
 
 /**
@@ -364,7 +389,7 @@ export function addMcpServer(filePath: string, name: string, entry: Record<strin
   if (Object.prototype.hasOwnProperty.call(raw.mcpServers, name) && !opts.force) {
     throw new Error(`MCP server '${name}' already exists in ${filePath}. Use --force to overwrite.`);
   }
-  raw.mcpServers[name] = entry;
+  setOwn(raw.mcpServers, name, entry);
   writeJsonAtomic(filePath, raw);
 }
 

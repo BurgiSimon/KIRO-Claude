@@ -8,7 +8,7 @@
  * | Claude | V3 id | tags | capability / subject | 2.x name | Q name | display |
  * |---|---|---|---|---|---|---|
  * | Read | read_file | read | fs_read / abs file_path | read | fs_read | read |
- * | Glob | file_search | read | fs_read / path ?? cwd | glob | glob | glob |
+ * | Glob | file_search | read | fs_read / path ?? cwd (+ pattern root) | glob | glob | glob |
  * | Grep | grep_search | read | fs_read / path ?? cwd | grep | grep | grep |
  * | Write | fs_write | write | fs_write / abs file_path | write | fs_write | write |
  * | Edit, MultiEdit | str_replace | write | fs_write / abs file_path | write | fs_write | write |
@@ -20,6 +20,7 @@
  * | Task* (TaskCreate…) | — | — | utility (always allowed) | todo_list | todo_list | todo_list |
  * | Skill | disclose_context | context | skill / skill name | skill | skill | skill |
  * | mcp__srv__tool | mcp_srv_tool | @mcp, @srv, @srv/tool | mcp / srv/tool | @srv/tool | @srv/tool | tool |
+ * | mcp__… that cannot be split | — | @mcp | mcp / name without `mcp__` | <claude name> | <claude name> | <claude name> |
  * | anything else | — | — | utility | <claude name> | <claude name> | <claude name> |
  *
  * Every non-MCP call also carries the tag `@builtin`. Agent calls carry tag `subagent` (the V2
@@ -192,6 +193,37 @@ function jsonSummary(v: unknown): string {
   return oneLine(s);
 }
 
+const GLOB_META = /[*?[\]{}]/;
+
+/**
+ * Directory a Glob `pattern` actually searches when that differs from the search root: the
+ * literal leading components of `pattern` resolved against `searchRoot` (an absolute
+ * `/etc/**`, a `~/…` or `../…` pattern escapes the root; `private/**` narrows it). It becomes
+ * an extra fs_read subject (DECISION; 00 §4.1 lists only `path ?? cwd`), so that
+ * `Glob {pattern: "/etc/**"}` is not judged as a search of the cwd and deny rules /
+ * `.kiroignore` entries for a subdirectory apply to patterns that point into it. Extra
+ * subjects only make the verdict stricter (every subject must pass).
+ */
+export function globPatternRoot(pattern: string, searchRoot: string): string | undefined {
+  if (pattern === '') return undefined;
+  const expanded = expandTilde(pattern);
+  // Only the PATTERN's own components are glob syntax: the search root is literal (a workspace
+  // under `proj [old]/` must not look like a pattern that escapes to its parent).
+  const comps = expanded.split('/');
+  const lit: string[] = [];
+  for (const c of comps) {
+    if (GLOB_META.test(c)) break;
+    lit.push(c);
+  }
+  const root = path.resolve(searchRoot);
+  const litPath = lit.join('/');
+  const base = path.isAbsolute(expanded) && litPath === '' ? '/' : path.resolve(root, litPath || '.');
+  // a fully literal pattern names a file (its directory is what is searched) unless it ends
+  // with `/`, which names the directory itself
+  const prefix = lit.length === comps.length && !expanded.endsWith('/') ? path.dirname(base) : base;
+  return prefix === root ? undefined : prefix;
+}
+
 /** Split `mcp__<srv>__<tool>` (first `__` after the prefix; known server names win). */
 export function splitMcpName(
   claudeName: string,
@@ -222,7 +254,10 @@ export function toKiroCall(claudeName: string, input: Record<string, unknown>, c
 
   const mcp = splitMcpName(claudeName, ctx.mcpServerNames);
   if (mcp) {
-    const server = ctx.mcpServerNames?.[mcp.claudeServer] ?? mcp.claudeServer;
+    const names = ctx.mcpServerNames;
+    // own properties only: a server called `constructor` must not resolve to Object.prototype's
+    const mapped = names && Object.prototype.hasOwnProperty.call(names, mcp.claudeServer) ? names[mcp.claudeServer] : undefined;
+    const server = typeof mapped === 'string' && mapped !== '' ? mapped : mcp.claudeServer;
     const tool = mcp.tool;
     return {
       ...base,
@@ -253,6 +288,23 @@ export function toKiroCall(claudeName: string, input: Record<string, unknown>, c
       mutating: false,
       displayName: TODO_ROW.display,
       summary: oneLine(subject),
+    };
+  }
+
+  if (claudeName.startsWith('mcp__')) {
+    // An MCP-shaped name that cannot be split (`mcp__srv`, `mcp____x`): never a harmless utility
+    // tool — treat it as an unidentified MCP call (asks by default, denied in plan mode).
+    return {
+      ...base,
+      v2Name: claudeName,
+      kiro2Name: claudeName,
+      tags: ['@mcp'],
+      capability: 'mcp',
+      subjects: [claudeName.slice('mcp__'.length)],
+      parseable: true,
+      mutating: true,
+      displayName: claudeName,
+      summary: jsonSummary(input),
     };
   }
 
@@ -296,6 +348,10 @@ export function toKiroCall(claudeName: string, input: Record<string, unknown>, c
       const p = absPath(str(input.path) ?? cwd, cwd);
       subjects = [p];
       const pat = str(input.pattern) ?? '';
+      if (claudeName === 'Glob') {
+        const escape = globPatternRoot(pat, p);
+        if (escape !== undefined) subjects.push(escape);
+      }
       summary = oneLine(str(input.path) ? `${pat} in ${p}` : pat);
       break;
     }
@@ -356,12 +412,15 @@ export function toKiroCall(claudeName: string, input: Record<string, unknown>, c
 }
 
 /**
- * Classic display label without the ` (trusted)` marker (06 §5.4, 01 §4.7):
- * `<displayName>` for built-ins, `<tool> from mcp server <server>` for MCP tools.
+ * Classic display label (06 §5.4, 01 §4.7): `<displayName>` for built-ins,
+ * `<tool> from mcp server <server>` for MCP tools. With `trusted`, the ` (trusted)` marker is
+ * placed where Classic prints it — BEFORE the server part:
+ * `<displayName>[ (trusted)][ from mcp server <server>]` (uncoloured; UIs colour the parts).
  */
-export function toolDisplay(call: KiroToolCall): string {
-  if (call.mcp) return `${call.mcp.tool} from mcp server ${call.mcp.server}`;
-  return call.displayName;
+export function toolDisplay(call: KiroToolCall, trusted = false): string {
+  const mark = trusted ? ' (trusted)' : '';
+  if (call.mcp) return `${call.mcp.tool}${mark} from mcp server ${call.mcp.server}`;
+  return `${call.displayName}${mark}`;
 }
 
 // ───────────────────────────── selector expansion (00 §4.2) ─────────────────────────────
@@ -530,9 +589,14 @@ function expandSelectors(
     }
     if (sel.startsWith('subagent/')) {
       const name = sel.slice('subagent/'.length);
-      st.builtins.add('Agent');
-      if (name === '*' || name === '') st.subagentsAll = true;
-      else st.subagentNames.add(name);
+      if (name === '*' || name === '') {
+        st.subagentsAll = true;
+        st.builtins.add('Agent');
+      } else {
+        st.subagentNames.add(name);
+        // Excluding one agent must not hide the Agent tool for the others.
+        if (what === 'tools') st.builtins.add('Agent');
+      }
       return;
     }
     const group = Object.prototype.hasOwnProperty.call(BUILTIN_SELECTORS, sel) ? BUILTIN_SELECTORS[sel] : undefined;

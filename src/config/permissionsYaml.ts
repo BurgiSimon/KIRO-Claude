@@ -31,6 +31,7 @@ import type { ConfigWarning, PermissionRule, RuleEffect, WorkspaceContext } from
 import { readTextIfExists, writeFileAtomic } from '../util/fsx.js';
 import { realpathSafe } from '../util/paths.js';
 import { parseYaml, YamlError } from '../util/yaml.js';
+import { ownValue } from './diag.js';
 
 const EFFECTS: ReadonlySet<string> = new Set(['allow', 'ask', 'deny', 'evaluate']);
 
@@ -304,7 +305,7 @@ export function loadPermissionScopes(ws: WorkspaceContext): {
 export function presetRules(ids: readonly string[]): PermissionRule[] {
   const out: PermissionRule[] = [];
   for (const id of ids) {
-    const rules = PRESETS[id];
+    const rules = ownValue(PRESETS, id);
     if (rules) out.push(...rules.map((r) => ({ ...r, ...(r.match ? { match: [...r.match] } : {}) })));
   }
   return out;

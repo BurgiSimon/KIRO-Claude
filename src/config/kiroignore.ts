@@ -108,6 +108,16 @@ function compileBody(p: string): string {
   return out;
 }
 
+/**
+ * True when `rel` (a `path.relative(parent, child)` result) names `parent` itself or a path
+ * below it. A child whose name merely starts with `..` (`..foo`) is inside; `..`, `../x` and
+ * (Windows, other drive) absolute results are outside.
+ */
+export function isInsideRel(rel: string): boolean {
+  if (path.isAbsolute(rel)) return false;
+  return rel !== '..' && !rel.startsWith(`..${path.sep}`) && !rel.startsWith('../');
+}
+
 /** Parse one line into a rule; `undefined` for blanks, comments and invalid patterns. */
 export function parseIgnoreLine(line: string): { rule: Rule; text: string } | undefined {
   let l = line.replace(/\r$/, '');
@@ -172,7 +182,7 @@ export function compileKiroIgnore(text: string, root: string): KiroIgnore {
       if (rules.length === 0) return false;
       const abs = path.resolve(absPath);
       const relNative = path.relative(rootAbs, abs);
-      if (relNative === '' || relNative.startsWith('..') || path.isAbsolute(relNative)) return false;
+      if (relNative === '' || !isInsideRel(relNative)) return false;
       const parts = toPosixPath(relNative).split('/').filter((s) => s !== '');
       for (let i = 1; i < parts.length; i++) {
         if (verdict(parts.slice(0, i).join('/'), true) === true) return true;

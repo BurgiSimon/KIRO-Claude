@@ -15,9 +15,10 @@
  *    deniedPaths ⇒ Deny (reasons = the original strings, repeated per matching glob); else
  *    Allow when allowlisted, `allowReadOnly`, or inside an allowedPath (gitignore-style,
  *    06 §1.5, globset dialect so `*` crosses `/`).
- *  - `glob` / `grep` (Claude Glob/Grep; 00 §4.3 DECISION): the fs_read evaluator on
- *    `path ?? cwd` with `toolsSettings.glob|grep` when present, else `toolsSettings.fs_read`;
- *    allowlisted when the allowlist matches the Q name or `fs_read`.
+ *  - `glob` / `grep` (Claude Glob/Grep; 00 §4.3 DECISION): the fs_read evaluator on the call
+ *    subjects (`path ?? cwd`, plus the literal root of a Glob pattern such as `/etc/**`, see
+ *    toolmap.globPatternRoot) with `toolsSettings.glob|grep` when present, else
+ *    `toolsSettings.fs_read`; allowlisted when the allowlist matches the Q name or `fs_read`.
  *  - `fs_write` (06 §1.4.3): no settings ⇒ allowlisted ? Allow : Ask; else deniedPaths ⇒ Deny,
  *    allowlisted or allowedPaths ⇒ Allow, else Ask (no cwd auto-allow).
  *  - `web_fetch` (02 §2.7, Kiro 2.x): `blocked` regexes first (invalid ⇒ deny all), then
@@ -65,7 +66,8 @@ const SETTINGS_KEYS: Record<string, string[]> = {
 /** Raw `toolsSettings` value for a Q tool name (alias keys accepted), or undefined. */
 export function toolSettings(agent: Pick<KiroAgent, 'toolsSettings'>, qName: string): unknown {
   const ts = agent.toolsSettings ?? {};
-  for (const k of SETTINGS_KEYS[qName] ?? [qName]) {
+  const keys = Object.prototype.hasOwnProperty.call(SETTINGS_KEYS, qName) ? SETTINGS_KEYS[qName]! : [qName];
+  for (const k of keys) {
     if (Object.prototype.hasOwnProperty.call(ts, k)) return ts[k];
   }
   return undefined;

@@ -24,7 +24,7 @@ describe('config/mcp substituteEnv (02 §5.3)', () => {
   const table: [string, boolean, string, string[]][] = [
     ['${env:TOKEN}', false, 'tok', []],
     ['Bearer ${TOKEN}', false, 'Bearer tok', []],
-    ['${env:NOPE}', false, '${env:NOPE}', ['NOPE']],
+    ['${env:NOPE}', false, '${NOPE}', ['NOPE']], // kiro-cli drops `env:` on a miss
     ['${NOPE}-${NOPE}', false, '${NOPE}-${NOPE}', ['NOPE']],
     ['$TOKEN', false, '$TOKEN', []],
     ['$TOKEN/bin', true, 'tok/bin', []],

@@ -26,6 +26,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { ConfigWarning, SettingsScope, SettingsStore, WorkspaceContext } from '../types.js';
 import { JsonFileError, parseJsonText, writeJsonAtomic } from '../util/fsx.js';
+import { errorText, jsonErrorMessage, ownValue, setOwn } from './diag.js';
 import { globMatch, hasGlobMeta } from '../util/glob.js';
 import { workspaceKiroDir } from './workspace.js';
 
@@ -153,18 +154,32 @@ export const GLOBAL_ONLY_KEYS: ReadonlySet<string> = new Set(
     .map(([k]) => k),
 );
 
-/** Parse a CLI-supplied value: JSON when it parses, else the raw string (Kiro semantics). */
+/**
+ * Parse a CLI-supplied value: JSON when it parses, else the raw string (Kiro semantics,
+ * `serde_json::from_str(v).unwrap_or(json!(v))`). serde_json rejects numbers outside the f64
+ * range (`1e400`) where `JSON.parse` yields `Infinity` (which would be written as `null`), so
+ * such values stay strings, like in Kiro.
+ */
 export function parseSettingValue(raw: string): unknown {
+  let v: unknown;
   try {
-    return JSON.parse(raw);
+    v = JSON.parse(raw);
   } catch {
     return raw;
   }
+  return containsNonFinite(v) ? raw : v;
+}
+
+function containsNonFinite(v: unknown): boolean {
+  if (typeof v === 'number') return !Number.isFinite(v);
+  if (Array.isArray(v)) return v.some(containsNonFinite);
+  if (typeof v === 'object' && v !== null) return Object.values(v).some(containsNonFinite);
+  return false;
 }
 
 /** Schema default for `key`, if any. */
 export function settingDefault(key: string): unknown {
-  return SETTINGS_SCHEMA[key]?.default;
+  return ownValue(SETTINGS_SCHEMA, key)?.default;
 }
 
 /** True for keys stored in kiro-claude.json. */
@@ -202,7 +217,14 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 
 function sortedRecord(r: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
-  for (const k of Object.keys(r).sort()) out[k] = r[k];
+  for (const k of Object.keys(r).sort()) setOwn(out, k, r[k]);
+  return out;
+}
+
+/** Own-property copy (keeps a literal `__proto__` key as data). */
+function copyRecord(r: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(r)) setOwn(out, k, v);
   return out;
 }
 
@@ -250,7 +272,7 @@ export function openSettings(ws: WorkspaceContext): KiroSettingsStore {
           };
       }
     } catch (e) {
-      const msg = e instanceof JsonFileError ? e.message : `${p}: ${e instanceof Error ? e.message : String(e)}`;
+      const msg = e instanceof JsonFileError ? jsonErrorMessage(e, p) : `${p}: ${errorText(e)}`;
       entry = { mtimeMs: st.mtimeMs, size: st.size, data: {}, invalid: true, warning: { code: 'invalid-settings', message: msg, path: p } };
     }
     cache.set(p, entry);
@@ -273,16 +295,16 @@ export function openSettings(ws: WorkspaceContext): KiroSettingsStore {
     const cli = readFile(f.cli).data;
     const ad = readFile(f.adapter).data;
     const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(cli)) out[k] = v;
-    for (const [k, v] of Object.entries(ad)) if (isAdapterKey(k)) out[k] = v;
+    for (const [k, v] of Object.entries(cli)) setOwn(out, k, v);
+    for (const [k, v] of Object.entries(ad)) if (isAdapterKey(k)) setOwn(out, k, v);
     return out;
   };
 
   const effective = (): Record<string, unknown> => {
     const g = scopeView('global');
     const w = scopeView('workspace');
-    const out: Record<string, unknown> = { ...g };
-    for (const [k, v] of Object.entries(w)) if (!GLOBAL_ONLY_KEYS.has(k)) out[k] = v;
+    const out = copyRecord(g);
+    for (const [k, v] of Object.entries(w)) if (!GLOBAL_ONLY_KEYS.has(k)) setOwn(out, k, v);
     return out;
   };
 
@@ -300,7 +322,7 @@ export function openSettings(ws: WorkspaceContext): KiroSettingsStore {
     if (e.invalid) {
       throw new SettingsError(`Refusing to modify ${p}: ${e.warning?.message ?? 'invalid settings file'}`);
     }
-    return { ...e.data };
+    return copyRecord(e.data);
   };
 
   const write = (p: string, data: Record<string, unknown>): void => {
@@ -346,17 +368,19 @@ export function openSettings(ws: WorkspaceContext): KiroSettingsStore {
       }
       const f = writeFiles(scope);
       const v = typeof value === 'string' ? parseSettingValue(value) : value;
-      if (v === undefined) throw new SettingsError(`Invalid value for '${key}'`);
+      if (v === undefined || typeof v === 'function' || typeof v === 'symbol' || typeof v === 'bigint' || containsNonFinite(v)) {
+        throw new SettingsError(`Invalid value for '${key}'`);
+      }
       const p = isAdapterKey(key) ? f.adapter : f.cli;
       const data = writable(p);
-      data[key] = v;
+      setOwn(data, key, v);
       write(p, data);
       // A kiroClaude.* key hand-written into cli.json would shadow nothing (adapter file wins),
       // but drop it so `list` shows one value.
       if (isAdapterKey(key)) {
         const cliEntry = readFile(f.cli);
         if (!cliEntry.invalid && Object.prototype.hasOwnProperty.call(cliEntry.data, key)) {
-          const d = { ...cliEntry.data };
+          const d = copyRecord(cliEntry.data);
           delete d[key];
           write(f.cli, d);
         }
