@@ -296,3 +296,49 @@ test('e2e: claude ignores the interrupt ⇒ the second Ctrl+C stops it; the next
     r.t.cleanup();
   }
 });
+
+test('e2e: Ctrl+C while the stopped Claude Code is restarted cancels that input; the presses never quit the REPL later (C16)', { timeout: 60_000 }, async () => {
+  const script = {
+    turns: [
+      { match: 'slow thing', steps: [{ text: 'working\n\n' }, { sleepMs: 100_000 }] },
+      { match: '^next', steps: [{ text: 'second answer' }] },
+    ],
+  };
+  // initialize answered late: spawning the replacement takes a while, like the real claude
+  const r = live(script, { extraEnv: { FAKE_CLAUDE_CONTROL_DELAYS: JSON.stringify({ interrupt: 120_000, initialize: 1500 }) } });
+  try {
+    await r.waitFor(/> $/);
+    r.line('run the slow thing');
+    await r.waitFor(/working/);
+    r.ctrlC();
+    await sleepMs(300);
+    r.ctrlC();
+    await r.waitFor(/stopping it\.[\s\S]*> $/, 15_000);
+    const mark = r.o().length;
+    const sessionStarts = (): number => r.log().filter((e) => e.event === 'start' && (e.argv as string[]).includes('--input-format')).length;
+    const before = sessionStarts();
+    r.line('next');
+    const t0 = Date.now();
+    while (sessionStarts() === before && Date.now() - t0 < 10_000) await sleepMs(20);
+    r.ctrlC(); // impatient double tap while the replacement starts
+    await sleepMs(100);
+    r.ctrlC();
+    await r.waitFor(/> $/, 15_000, mark);
+    await sleepMs(500);
+    let after = r.o().slice(mark);
+    assert.equal(r.ended(), undefined, `the REPL quit:\n${after}`);
+    assert.ok(!/To exit the CLI/.test(after), after);
+    assert.ok(!/second answer/.test(after), `the input was cancelled:\n${after}`);
+    r.line('next');
+    await r.waitFor(/second answer[\s\S]*> $/, 15_000, mark);
+    assert.equal(sessionStarts(), before + 1, 'restarted once');
+    r.line('/quit');
+    assert.equal(await r.exit, 0);
+    after = r.o().slice(mark);
+    assert.ok(!/To exit the CLI/.test(after), after);
+  } finally {
+    r.end();
+    await r.exit.catch(() => undefined);
+    r.t.cleanup();
+  }
+});
