@@ -45,6 +45,11 @@
  * Shutdown ({@link ClaudeProcess.close}): end stdin → wait `graceMs` (default 2000) → SIGTERM →
  * 2 s → SIGKILL. Idempotent.
  *
+ * Process group (claude/lifecycle.ts): on POSIX the child is spawned `detached` (its own process
+ * group; not unref'd) so a terminal Ctrl+C reaches only kiro-claude, which interrupts the turn
+ * itself; signals go to the whole group. The child cannot outlive kiro-claude: it exits on stdin
+ * EOF, and lifecycle.ts kills its group on process exit and on SIGTERM/SIGHUP nobody handles.
+ *
  * Library code never writes to stdout; diagnostics go to the optional `logger`.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -54,6 +59,7 @@ import * as fs from 'node:fs';
 import { StringDecoder } from 'node:string_decoder';
 
 import { resolveSpawn, type ClaudeBinary } from './binary.js';
+import { PROCESS_GROUPS, groupSpawnOptions, signalChild, trackChild } from './lifecycle.js';
 import type {
   CanUseToolRequest,
   ClaudeFrame,
@@ -366,7 +372,9 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
       windowsVerbatimArguments: spec.windowsVerbatimArguments,
+      ...groupSpawnOptions(),
     });
+    trackChild(this.child, PROCESS_GROUPS);
 
     this.child.on('error', (err) => {
       if (this.child.pid === undefined && !this.spawnError) {
@@ -709,12 +717,9 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
     return this.closePromise;
   }
 
+  /** Signals the child's process group (POSIX) — tool commands and MCP servers it started too. */
   private kill(signal: NodeJS.Signals): void {
-    try {
-      this.child.kill(signal);
-    } catch {
-      /* already gone */
-    }
+    signalChild(this.child, signal, PROCESS_GROUPS);
   }
 
   private waitExited(ms: number): Promise<boolean> {
@@ -990,6 +995,12 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
     if (!this.stdoutEnded) {
       this.stdoutEnded = true;
       for (const line of this.splitter.end()) this.handleLine(line);
+    }
+    // A grandchild may still hold our pipes after the drain deadline: release them so they do
+    // not keep the event loop alive (their late output is dropped anyway, see module doc).
+    if (this.exitSeen) {
+      this.child.stdout?.destroy();
+      this.child.stderr?.destroy();
     }
     const info: ExitInfo = { code: this.exitCode, signal: this.exitSignal };
     this._exitInfo = info;

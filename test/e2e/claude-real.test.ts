@@ -1,8 +1,11 @@
 /**
- * End-to-end tests against the REAL installed Claude Code CLI (model calls on your account,
- * `--model haiku`). Skipped unless KIRO_CLAUDE_E2E=1.
+ * End-to-end tests against the REAL installed Claude Code CLI (model calls on your account).
+ * Skipped unless KIRO_CLAUDE_E2E=1.
  *
  *   KIRO_CLAUDE_E2E=1 node --test dist/test/e2e/claude-real.test.js
+ *
+ * Model: ${KIRO_CLAUDE_E2E_MODEL:-haiku}. Temp dirs (and the Claude project dirs the real CLI creates
+ * for them) are removed afterwards unless KIRO_CLAUDE_E2E_KEEP=1 (see ./helpers.ts).
  *
  * Covers: findClaudeBinary + probeCapabilities + buildChildEnv + ClaudeProcess
  * (00 §3.1 spawn, §3.3 initialize, §3.4 user turn, §3.5 hook_callback deny — VERIFIED 07).
@@ -27,6 +30,7 @@ import {
   type ResultFrame,
   type UserFrame,
 } from '../../src/claude/protocol.js';
+import { KEEP, MODEL, removeClaudeProjectDir } from './helpers.js';
 
 const E2E = process.env.KIRO_CLAUDE_E2E === '1';
 const TURN_TIMEOUT_MS = 150_000;
@@ -35,7 +39,7 @@ function baseArgs(caps: ClaudeCapabilities, tools: string): string[] {
   return [
     '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
     '--permission-prompt-tool', 'stdio',
-    '--model', 'haiku',
+    '--model', MODEL,
     '--permission-mode', 'default',
     '--setting-sources', '',
     '--strict-mcp-config',
@@ -68,12 +72,18 @@ describe('real Claude Code CLI (KIRO_CLAUDE_E2E=1)', { skip: E2E ? false : 'set 
 
   before(async () => {
     bin = await findClaudeBinary();
-    caps = await probeCapabilities(bin, { cacheDir: fs.mkdtempSync(path.join(os.tmpdir(), 'kc-e2e-cache-')) });
+    const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kc-e2e-cache-'));
+    dirs.push(cacheDir);
+    caps = await probeCapabilities(bin, { cacheDir });
   });
 
   after(async () => {
     await Promise.all(procs.map((p) => p.close().catch(() => undefined)));
-    for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
+    if (KEEP) return;
+    for (const d of dirs) {
+      removeClaudeProjectDir(d);
+      fs.rmSync(d, { recursive: true, force: true });
+    }
   });
 
   it('finds a usable claude and probes the flags the adapter needs', () => {

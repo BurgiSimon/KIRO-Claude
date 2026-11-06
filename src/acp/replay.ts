@@ -21,6 +21,11 @@
  * sidechain / meta / synthetic lines, local-command echoes and interrupt markers (05 §7.12).
  *
  * Every replayed update carries `_meta.kiro.replay = true` (V3 convention, 05 §4.4).
+ *
+ * Tool calls are described by the same {@link describeToolCall} / `toolCallTitle` the live path
+ * uses, with the session's Claude ⇄ Kiro MCP server name map when the caller has one, so a replayed
+ * call carries the title it had live (no file-system probes: a replayed `Write` diff has no
+ * `oldText`, its title does not depend on it).
  */
 
 import * as fs from 'node:fs';
@@ -85,15 +90,22 @@ function jsonText(v: unknown): string {
   }
 }
 
+/** Optional inputs shared by both replay sources. */
+export interface ReplayOptions {
+  /** Claude MCP server name ⇒ Kiro server name (as the live session maps `mcp__<srv>__<tool>`). */
+  mcpServerNames?: Record<string, string>;
+}
+
 interface ReplayState {
   cwd: string;
   tools: Map<string, ToolDescriptor>;
   updates: Record<string, unknown>[];
+  mcpServerNames: Record<string, string>;
 }
 
 function emitToolUse(st: ReplayState, id: string, name: string, input: Record<string, unknown>): void {
   if (!id || st.tools.has(id)) return;
-  const call = toKiroCall(name, input, { cwd: st.cwd, toolUseId: id });
+  const call = toKiroCall(name, input, { cwd: st.cwd, toolUseId: id, mcpServerNames: st.mcpServerNames });
   const d = describeToolCall(call, { cwd: st.cwd, toolCallId: id });
   st.tools.set(id, d);
   st.updates.push(toolCallUpdate(d));
@@ -125,8 +137,8 @@ function emitToolResult(st: ReplayState, id: string, text: string, failed: boole
 }
 
 /** Replay updates from journal records (see module doc). */
-export function replayFromJournal(records: readonly Record<string, unknown>[], cwd: string): Record<string, unknown>[] {
-  const st: ReplayState = { cwd, tools: new Map(), updates: [] };
+export function replayFromJournal(records: readonly Record<string, unknown>[], cwd: string, opts: ReplayOptions = {}): Record<string, unknown>[] {
+  const st: ReplayState = { cwd, tools: new Map(), updates: [], mcpServerNames: opts.mcpServerNames ?? {} };
   let start = 0;
   for (let i = records.length - 1; i >= 0; i--) {
     if (records[i]!.kind === 'Compaction') {
@@ -198,8 +210,8 @@ const LOCAL_ECHO_RE = /^\s*<(local-command-stdout|local-command-stderr|command-n
 const INTERRUPT_RE = /^\s*\[Request interrupted by user/;
 
 /** Replay updates from Claude transcript lines (fallback; see module doc). */
-export function replayFromTranscript(lines: readonly unknown[], cwd: string): Record<string, unknown>[] {
-  const st: ReplayState = { cwd, tools: new Map(), updates: [] };
+export function replayFromTranscript(lines: readonly unknown[], cwd: string, opts: ReplayOptions = {}): Record<string, unknown>[] {
+  const st: ReplayState = { cwd, tools: new Map(), updates: [], mcpServerNames: opts.mcpServerNames ?? {} };
   const userText = (t: string): void => {
     if (t === '' || LOCAL_ECHO_RE.test(t) || INTERRUPT_RE.test(t)) return;
     st.updates.push({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: t } });
@@ -260,16 +272,18 @@ export function buildReplay(opts: {
   claudeSessionId?: string;
   cwd: string;
   env: NodeJS.ProcessEnv;
+  mcpServerNames?: Record<string, string>;
 }): { updates: Record<string, unknown>[]; source: 'journal' | 'transcript' | 'none' } {
+  const ro: ReplayOptions = opts.mcpServerNames ? { mcpServerNames: opts.mcpServerNames } : {};
   const records = readJournalRecords(journalPath(opts.sessionsDir, opts.sessionId));
   if (records.some((r) => r.kind === 'Prompt' || r.kind === 'AssistantMessage' || r.kind === 'ToolResults')) {
-    return { updates: replayFromJournal(records, opts.cwd), source: 'journal' };
+    return { updates: replayFromJournal(records, opts.cwd, ro), source: 'journal' };
   }
   if (opts.claudeSessionId) {
     const file = findTranscript(opts.claudeSessionId, { cwd: opts.cwd, env: opts.env });
     if (file) {
       try {
-        const updates = replayFromTranscript(readTranscript(file), opts.cwd);
+        const updates = replayFromTranscript(readTranscript(file), opts.cwd, ro);
         return { updates, source: 'transcript' };
       } catch {
         // unreadable transcript: no replay

@@ -21,6 +21,8 @@
  * Titles follow the captured kiro-cli wording where one exists (`Running: <cmd>`,
  * `Reading <rel>:<line>`, `Creating <rel>`, `Searching for '<pattern>'`,
  * `Running: @<srv>/<tool>`); the others are UNVERIFIED (05 §11 item 6) and follow 05 §7.3.
+ * One function ({@link toolCallTitle}) computes them from the call alone, for live frames and
+ * `session/load` replay alike.
  */
 
 import * as fs from 'node:fs';
@@ -136,8 +138,9 @@ export interface DescribeOptions {
   toolCallId?: string;
   parentToolUseId?: string;
   /**
-   * File-system probes for `Write` titles/diffs (`Creating` vs `Writing`, old text). Omit to
-   * avoid touching the disk (replay), in which case a write is titled `Writing`.
+   * File-system probes for a `Write` diff's `oldText` (the current file text). Omit to avoid
+   * touching the disk (replay): `oldText` is then null. Titles never depend on them
+   * ({@link toolCallTitle}).
    */
   fs?: { exists(p: string): boolean; read(p: string): string | undefined };
   /**
@@ -171,7 +174,89 @@ export const LIVE_FS: NonNullable<DescribeOptions['fs']> = {
   },
 };
 
-/** Describe one tool call for ACP (05 §7.3). */
+/**
+ * The `title` of a tool call (05 §7.3 wording; 05 §11 item 6 for the uncaptured ones). It is a
+ * pure function of the call (tool name + input) and `cwd`, and it is the ONLY title source: the
+ * live `tool_call`, the permission request, result / denial updates and `session/load` replay all
+ * go through it, so one call carries one title everywhere.
+ *
+ * `Write` is always `Creating <rel>` (DECISION): Claude's `Write` is Kiro's `fs_write` `create`
+ * command (00 §4.1 rawInput row), and kiro-cli titles by command — `Creating <file>` is the only
+ * captured wording (`[KCF:side-read-only-live]`). Whether the file already existed is not part of
+ * the title: replay cannot know it, and a title that changed with it gave one call two titles
+ * (`Creating` live, `Writing` on replay). Existence still decides the diff's `oldText`.
+ */
+export function toolCallTitle(call: Pick<KiroToolCall, 'claudeName' | 'input' | 'cwd' | 'mcp'>, cwd: string): string {
+  const base = call.cwd || cwd;
+  const input = isObj(call.input) ? call.input : {};
+  const name = call.claudeName;
+  const rel = (p: unknown): string | undefined => {
+    const abs = absOf(str(p), base);
+    return abs ? displayPath(abs, base) : undefined;
+  };
+  if (call.mcp) return `Running: @${call.mcp.server}/${call.mcp.tool}`;
+  if (name.startsWith('mcp__')) return `Running: ${name}`;
+  if (isTodoTool(name)) {
+    const id = str(input.taskId) ?? (num(input.taskId) !== undefined ? String(input.taskId) : undefined);
+    switch (name) {
+      case 'TaskCreate':
+        return `Create task: ${oneLine(str(input.subject) ?? '')}`.trimEnd();
+      case 'TaskUpdate': {
+        const st = str(input.status);
+        return `Update task${id ? ` #${id}` : ''}${st ? `: ${st}` : ''}`;
+      }
+      case 'TaskList':
+        return 'List tasks';
+      case 'TaskGet':
+        return `Get task${id ? ` #${id}` : ''}`;
+      case 'TodoWrite':
+        return 'Update TODOs';
+      default:
+        return name;
+    }
+  }
+  switch (name) {
+    case 'Bash':
+    case 'PowerShell':
+      return `Running: ${oneLine(str(input.command) ?? '', 1000)}`;
+    case 'Read': {
+      const r = rel(input.file_path);
+      return r !== undefined ? `Reading ${r}:${Math.max(1, num(input.offset) ?? 1)}` : 'Reading';
+    }
+    case 'Write': {
+      const r = rel(input.file_path);
+      return r !== undefined ? `Creating ${r}` : 'Creating';
+    }
+    case 'Edit':
+    case 'MultiEdit':
+    case 'NotebookEdit': {
+      const r = rel(str(input.file_path) ?? str(input.notebook_path));
+      return r !== undefined ? `Editing ${r}` : 'Editing';
+    }
+    case 'Grep':
+      return `Searching for '${oneLine(str(input.pattern) ?? '')}'`;
+    case 'Glob':
+      return `Finding '${oneLine(str(input.pattern) ?? '')}'`;
+    case 'WebFetch':
+      return `Fetching ${oneLine(str(input.url) ?? '')}`;
+    case 'WebSearch':
+      return `Searching the web for "${oneLine(str(input.query) ?? '')}"`;
+    case 'Agent':
+    case 'Task': {
+      const desc = str(input.description);
+      const type = str(input.subagent_type);
+      return desc ? oneLine(desc) : type ? `Subagent: ${type}` : 'Subagent';
+    }
+    case 'Skill':
+      return `Load skill: ${oneLine(str(input.skill) ?? '')}`;
+    case 'ToolSearch':
+      return `Searching tools: ${oneLine(str(input.query) ?? '')}`;
+    default:
+      return name;
+  }
+}
+
+/** Describe one tool call for ACP (05 §7.3); the title comes from {@link toolCallTitle}. */
 export function describeToolCall(call: KiroToolCall, opts: DescribeOptions): ToolDescriptor {
   const cwd = call.cwd || opts.cwd;
   const input = isObj(call.input) ? call.input : {};
@@ -185,7 +270,7 @@ export function describeToolCall(call: KiroToolCall, opts: DescribeOptions): Too
   const d: ToolDescriptor = {
     toolCallId,
     claudeName: name,
-    title: name,
+    title: toolCallTitle(call, opts.cwd),
     kind: 'other',
     updateKind: 'other',
     kiroToolName: kiroToolNameOf(call),
@@ -200,14 +285,12 @@ export function describeToolCall(call: KiroToolCall, opts: DescribeOptions): Too
 
   if (call.mcp) {
     d.mcpServerName = call.mcp.server;
-    d.title = `Running: @${call.mcp.server}/${call.mcp.tool}`;
     delete d.kind;
     d.updateKind = 'other';
     d.family = 'mcp';
     return d;
   }
   if (name.startsWith('mcp__')) {
-    d.title = `Running: ${name}`;
     delete d.kind;
     d.family = 'mcp';
     return d;
@@ -215,57 +298,29 @@ export function describeToolCall(call: KiroToolCall, opts: DescribeOptions): Too
   if (isTodoTool(name)) {
     setKind('think');
     d.family = 'todo';
-    const id = str(input.taskId) ?? (num(input.taskId) !== undefined ? String(input.taskId) : undefined);
-    switch (name) {
-      case 'TaskCreate':
-        d.title = `Create task: ${oneLine(str(input.subject) ?? '')}`.trimEnd();
-        break;
-      case 'TaskUpdate': {
-        const st = str(input.status);
-        d.title = `Update task${id ? ` #${id}` : ''}${st ? `: ${st}` : ''}`;
-        break;
-      }
-      case 'TaskList':
-        d.title = 'List tasks';
-        break;
-      case 'TaskGet':
-        d.title = `Get task${id ? ` #${id}` : ''}`;
-        break;
-      case 'TodoWrite':
-        d.title = 'Update TODOs';
-        break;
-      default:
-        d.title = name;
-    }
     return d;
   }
 
   switch (name) {
     case 'Bash':
-    case 'PowerShell': {
+    case 'PowerShell':
       setKind('execute');
       d.family = 'shell';
-      d.title = `Running: ${oneLine(str(input.command) ?? '', 1000)}`;
       break;
-    }
     case 'Read': {
       setKind('read');
       d.family = 'read';
       const abs = absOf(str(input.file_path), cwd);
-      const offset = num(input.offset);
-      const line = Math.max(1, offset ?? 1);
-      d.title = abs ? `Reading ${displayPath(abs, cwd)}:${line}` : 'Reading';
-      if (abs) d.locations = [{ path: abs, line }];
+      if (abs) d.locations = [{ path: abs, line: Math.max(1, num(input.offset) ?? 1) }];
       break;
     }
     case 'Write': {
       setKind('edit');
       d.family = 'write';
       const abs = absOf(str(input.file_path), cwd);
-      const exists = abs ? opts.fs?.exists(abs) ?? true : false;
-      d.title = abs ? `${exists ? 'Writing' : 'Creating'} ${displayPath(abs, cwd)}` : 'Writing';
       if (abs) {
         d.locations = [{ path: abs, line: 1 }];
+        const exists = opts.fs?.exists(abs) ?? false;
         const oldText = exists && opts.fs && opts.readContent !== false ? opts.fs.read(abs) ?? null : null;
         d.content = [{ type: 'diff', path: abs, oldText, newText: capText(str(input.content) ?? '') }];
       }
@@ -277,7 +332,6 @@ export function describeToolCall(call: KiroToolCall, opts: DescribeOptions): Too
       setKind('edit');
       d.family = 'edit';
       const abs = absOf(str(input.file_path) ?? str(input.notebook_path), cwd);
-      d.title = abs ? `Editing ${displayPath(abs, cwd)}` : 'Editing';
       if (abs) {
         d.locations = [{ path: abs }];
         if (name === 'Edit') {
@@ -292,54 +346,29 @@ export function describeToolCall(call: KiroToolCall, opts: DescribeOptions): Too
       }
       break;
     }
-    case 'Grep': {
-      setKind('search');
-      d.family = 'search';
-      d.title = `Searching for '${oneLine(str(input.pattern) ?? '')}'`;
-      const abs = absOf(str(input.path), cwd);
-      if (abs) d.locations = [{ path: abs }];
-      break;
-    }
+    case 'Grep':
     case 'Glob': {
       setKind('search');
       d.family = 'search';
-      d.title = `Finding '${oneLine(str(input.pattern) ?? '')}'`;
       const abs = absOf(str(input.path), cwd);
       if (abs) d.locations = [{ path: abs }];
       break;
     }
     case 'WebFetch':
-      setKind('fetch');
-      d.family = 'fetch';
-      d.title = `Fetching ${oneLine(str(input.url) ?? '')}`;
-      break;
     case 'WebSearch':
       setKind('fetch');
       d.family = 'fetch';
-      d.title = `Searching the web for "${oneLine(str(input.query) ?? '')}"`;
       break;
     case 'Agent':
     case 'Task': {
       setKind('think');
       d.family = 'subagent';
-      const desc = str(input.description);
-      const type = str(input.subagent_type);
-      d.title = desc ? oneLine(desc) : type ? `Subagent: ${type}` : 'Subagent';
       const prompt = str(input.prompt);
       if (prompt) d.content = [{ type: 'content', content: { type: 'text', text: capText(prompt) } }];
       break;
     }
-    case 'Skill':
-      setKind('other');
-      d.title = `Load skill: ${oneLine(str(input.skill) ?? '')}`;
-      break;
-    case 'ToolSearch':
-      setKind('other');
-      d.title = `Searching tools: ${oneLine(str(input.query) ?? '')}`;
-      break;
     default:
       setKind('other');
-      d.title = name;
   }
   return d;
 }

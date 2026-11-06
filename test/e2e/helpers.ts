@@ -84,8 +84,11 @@ export interface E2EProject {
   write(rel: string, content: string): string;
   /** Write a workspace V2 agent `<project>/.kiro/agents/<name>.json`. */
   agent(name: string, spec: Record<string, unknown>): string;
-  /** Remove the temp root and the Claude transcripts of the project (unless KIRO_CLAUDE_E2E_KEEP=1). */
-  cleanup(): void;
+  /**
+   * Stop every tracked CLI child still running in the project (a failed or timed-out case), then
+   * remove the temp root and the Claude transcripts of the project (unless KIRO_CLAUDE_E2E_KEEP=1).
+   */
+  cleanup(): Promise<void>;
 }
 
 /** A fresh temp project + KIRO_HOME; registers cleanup on `t` when given. */
@@ -117,12 +120,15 @@ export function makeProject(t?: TestContext, extraEnv: Record<string, string> = 
     agent(name, spec) {
       return p.write(path.join('.kiro', 'agents', `${name}.json`), JSON.stringify({ name, ...spec }, null, 2));
     },
-    cleanup() {
+    async cleanup() {
+      // Children first: a CLI (and its claude) still running after the dirs are gone would write
+      // the transcript back into the user's Claude config.
+      await stopChildrenIn(root);
       if (KEEP) {
         t?.diagnostic(`kept ${root}`);
         return;
       }
-      removeClaudeProjectDir(project, root);
+      removeClaudeProjectDir(project, root, env);
       fs.rmSync(root, { recursive: true, force: true });
     },
   };
@@ -131,21 +137,90 @@ export function makeProject(t?: TestContext, extraEnv: Record<string, string> = 
 }
 
 /**
- * The real claude writes transcripts for the temp project to
+ * The real claude writes transcripts (and an empty `memory/` dir) for a temp cwd to
  * `<CLAUDE_CONFIG_DIR|~/.claude>/projects/<sanitized cwd>/`. Remove exactly that directory, and
- * only when its name carries this run's unique temp-root name (never anything else there).
+ * only when `uniqueRoot` (the cwd itself or an ancestor) is one of this suite's `kc-e2e-*` temp
+ * dirs and the directory name carries it — never anything else in the user's Claude config.
+ * claude names the dir after its getcwd(), i.e. the realpath: both spellings are tried, so a
+ * symlinked temp dir (macOS `/var/folders` → `/private/var/folders`) is cleaned up too. Call it
+ * while `cwd` still exists. `env` is the environment the CLI child ran with (its CLAUDE_CONFIG_DIR).
  */
-function removeClaudeProjectDir(project: string, root: string): void {
+export function removeClaudeProjectDir(cwd: string, uniqueRoot: string = cwd, env: NodeJS.ProcessEnv = e2eEnv()): void {
+  if (KEEP) return;
+  const spellings: Array<[string, string]> = [[path.resolve(cwd), path.resolve(uniqueRoot)]];
   try {
-    const projects = claudeProjectsDir(e2eEnv());
-    const dir = path.join(projects, sanitizeProjectDir(project));
-    if (path.dirname(dir) !== projects) return;
-    if (!path.basename(dir).includes(sanitizeProjectDir(path.basename(root)))) return;
-    if (!/^kc-e2e-/.test(path.basename(root))) return;
-    fs.rmSync(dir, { recursive: true, force: true });
+    spellings.push([fs.realpathSync(cwd), fs.realpathSync(uniqueRoot)]);
   } catch {
-    // best effort
+    // already gone: only the given spelling
   }
+  let projects: string;
+  try {
+    projects = path.resolve(claudeProjectsDir(env));
+  } catch {
+    return;
+  }
+  const seen = new Set<string>();
+  for (const [dirCwd, root] of spellings) {
+    try {
+      if (!/^kc-e2e-/.test(path.basename(root))) continue;
+      const rel = path.relative(root, dirCwd);
+      if (rel.startsWith('..') || path.isAbsolute(rel)) continue;
+      const dir = path.join(projects, sanitizeProjectDir(dirCwd));
+      if (path.dirname(dir) !== projects || seen.has(dir)) continue;
+      if (!path.basename(dir).includes(sanitizeProjectDir(path.basename(root)))) continue;
+      seen.add(dir);
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // best effort
+    }
+  }
+}
+
+// ─────────────────────────────── child tracking ───────────────────────────────
+
+interface LiveChild {
+  child: ChildProcess;
+  cwd: string;
+  exited: Promise<void>;
+}
+
+/** Every CLI child started by these helpers that has not closed yet. */
+const liveChildren = new Set<LiveChild>();
+
+/**
+ * Track `child` (started in `cwd`) so {@link E2EProject.cleanup} of the project that contains
+ * `cwd` stops it first. runCli, CliProc and AcpClient call this for their children.
+ */
+export function trackChild(child: ChildProcess, cwd: string): void {
+  const entry: LiveChild = {
+    child,
+    cwd: path.resolve(cwd),
+    exited: new Promise<void>((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) resolve();
+      child.once('exit', () => resolve());
+      child.once('error', () => resolve());
+    }),
+  };
+  liveChildren.add(entry);
+  void entry.exited.then(() => liveChildren.delete(entry));
+}
+
+/** SIGTERM (then SIGKILL) every tracked child running under `root`; wait for them (≤ `capMs`). */
+async function stopChildrenIn(root: string, capMs = 15_000): Promise<void> {
+  const mine = [...liveChildren].filter((e) => {
+    const rel = path.relative(root, e.cwd);
+    return !rel.startsWith('..') && !path.isAbsolute(rel);
+  });
+  if (mine.length === 0) return;
+  for (const e of mine) killHard(e.child);
+  let cap: NodeJS.Timeout | undefined;
+  await Promise.race([
+    Promise.all(mine.map((e) => e.exited)),
+    new Promise<void>((resolve) => {
+      cap = setTimeout(resolve, capMs);
+    }),
+  ]);
+  clearTimeout(cap);
 }
 
 // ─────────────────────────────── running the CLI ───────────────────────────────
@@ -168,6 +243,7 @@ export function describeRun(r: { code?: number | null; stdout: string; stderr: s
 export function runCli(args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number }): Promise<RunResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [CLI_PATH, ...args], { cwd: opts.cwd, env: opts.env, stdio: ['ignore', 'pipe', 'pipe'] });
+    trackChild(child, opts.cwd);
     let stdout = '';
     let stderr = '';
     let timedOut = false;
@@ -206,6 +282,7 @@ export class CliProc {
 
   constructor(args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv }) {
     this.child = spawn(process.execPath, [CLI_PATH, ...args], { cwd: opts.cwd, env: opts.env, stdio: ['pipe', 'pipe', 'pipe'] });
+    trackChild(this.child, opts.cwd);
     this.child.stdout!.setEncoding('utf8').on('data', (d: string) => {
       this.stdout += stripAnsi(d);
       this.poke();
@@ -315,6 +392,7 @@ export class AcpClient {
 
   constructor(args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv }) {
     this.child = spawn(process.execPath, [CLI_PATH, 'acp', ...args], { cwd: opts.cwd, env: opts.env, stdio: ['pipe', 'pipe', 'pipe'] });
+    trackChild(this.child, opts.cwd);
     this.child.stdout!.setEncoding('utf8').on('data', (d: string) => this.onData(d));
     this.child.stderr!.setEncoding('utf8').on('data', (d: string) => (this.stderr += d));
     this.child.stdin!.on('error', () => undefined);

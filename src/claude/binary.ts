@@ -6,17 +6,21 @@
  * parsed once per version and cached), 04 §3 (flag table: which flags are hidden from `--help`
  * but accepted by 2.1.318).
  *
- * Discovery order ({@link findClaudeBinary}):
- *   1. `opts.explicitPath` (e.g. a `--claude-bin` flag / setting),
- *   2. `$KIRO_CLAUDE_BIN`,
- *   3. `claude` on `PATH` (honouring `PATHEXT` on Windows),
- *   4. well-known install locations (`~/.claude/local/claude`, `~/.local/bin/claude`,
+ * Discovery order ({@link findClaudeBinary}), highest precedence first:
+ *   1. `opts.explicitPath`: a path given on the command line (`crew setup --claude-bin`, or the
+ *      path `crew setup` recorded in crew.json),
+ *   2. `$KIRO_CLAUDE_BIN` — the KiroCrew shim exports it (08 KC-ENV-05), so it must beat the
+ *      user's setting: KiroCrew's agents run the claude the gateway was set up with,
+ *   3. `opts.settingPath`: the `kiroClaude.claudePath` setting (global settings only, see
+ *      config/settings CLAUDE_LAUNCH_KEYS),
+ *   4. `claude` on `PATH` (honouring `PATHEXT` on Windows),
+ *   5. well-known install locations (`~/.claude/local/claude`, `~/.local/bin/claude`,
  *      `/opt/claude-code/bin/claude`, `/usr/local/bin/claude`, `/opt/homebrew/bin/claude`).
  * Every candidate is verified by running `<bin> --version` (15 s timeout) and parsing a semver,
  * and must be at least {@link MIN_CLAUDE_VERSION} (00 §2.1 "require 2.1.x+").
- * An explicitly configured binary (1 or 2) that does not work is an ERROR — we never silently
- * fall back to a different `claude` (that could run real model calls when a test double or a
- * specific install was requested).
+ * A configured binary (1, 2 or 3: only the highest one present is considered) that does not
+ * work is an ERROR — we never silently fall back to a different `claude` (that could run real
+ * model calls when a test double or a specific install was requested).
  *
  * Spawning ({@link resolveSpawn}): `.js/.mjs/.cjs` paths run under the current Node executable
  * (used by the fake-claude test double, works on every OS); Windows `.cmd/.bat` shims are
@@ -29,10 +33,12 @@
  * on are hidden from `--help` (04 §3); {@link HIDDEN_FLAGS} adds them from the version where
  * they were verified.
  */
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+
+import { KILL_GRACE_MS, PROCESS_GROUPS, groupSpawnOptions, signalChild, trackChild } from './lifecycle.js';
 
 export class ClaudeNotFoundError extends Error {
   /** Every candidate that was tried, with the reason it was rejected. */
@@ -210,9 +216,20 @@ export interface CaptureResult {
 const MAX_CAPTURE = 4 * 1024 * 1024;
 
 /**
+ * After the child exited, how long its stdout/stderr may stay open (a grandchild that inherited
+ * them, e.g. a shell wrapper's background process) before we stop reading and resolve.
+ */
+export const CAPTURE_DRAIN_MS = 250;
+
+/**
  * Runs `binPath args` (via {@link resolveSpawn}), stdin ignored, capturing stdout/stderr.
- * Never rejects: spawn errors and timeouts are reported in the result. On timeout the child is
- * SIGKILLed.
+ * Never rejects: spawn errors and timeouts are reported in the result.
+ *
+ * Hang-proof (claude/lifecycle.ts): the child leads its own process group on POSIX; on timeout
+ * the group gets SIGTERM, then SIGKILL after {@link KILL_GRACE_MS}. The
+ * promise settles on the child's exit (plus at most {@link CAPTURE_DRAIN_MS} for the pipes), not
+ * on its pipes closing, so a grandchild holding them cannot stall it; the pipes are destroyed
+ * and every timer cleared when it settles, so nothing keeps the event loop alive afterwards.
  */
 export function runCaptured(
   binPath: string,
@@ -224,19 +241,40 @@ export function runCaptured(
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let killing = false;
     let settled = false;
     let spawnError: NodeJS.ErrnoException | undefined;
     // Declared before `finish`: spawn() can throw synchronously (NUL bytes, empty command), and
-    // `finish` then runs before the timer exists (a `const` here was a TDZ ReferenceError that
+    // `finish` then runs before the timers exist (a `const` here was a TDZ ReferenceError that
     // made this "never rejects" function reject).
     let timer: NodeJS.Timeout | undefined;
+    let killTimer: NodeJS.Timeout | undefined;
+    let drainTimer: NodeJS.Timeout | undefined;
+    let child: ChildProcess | undefined;
+    const group = PROCESS_GROUPS;
     const finish = (code: number | null, signal: NodeJS.Signals | null): void => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      if (drainTimer) clearTimeout(drainTimer);
+      if (child) {
+        // We gave up on it: whatever of its group is still around (a SIGTERM-ignoring
+        // grandchild) is not waited for — kill it now rather than after the grace.
+        if (killing) signalChild(child, 'SIGKILL', group);
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+      }
       resolve({ code, signal, stdout, stderr, timedOut, ...(spawnError ? { error: spawnError } : {}) });
     };
-    let child;
+    const kill = (): void => {
+      if (settled || killing || !child) return;
+      killing = true;
+      signalChild(child, 'SIGTERM', group);
+      killTimer = setTimeout(() => {
+        if (child) signalChild(child, 'SIGKILL', group);
+      }, KILL_GRACE_MS);
+    };
     try {
       child = spawn(spec.command, spec.args, {
         env: opts.env ?? process.env,
@@ -244,20 +282,18 @@ export function runCaptured(
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
         windowsVerbatimArguments: spec.windowsVerbatimArguments,
+        ...groupSpawnOptions(),
       });
     } catch (e) {
       spawnError = e as NodeJS.ErrnoException;
       finish(null, null);
       return;
     }
+    trackChild(child, group, { graceful: false });
     if (opts.timeoutMs && opts.timeoutMs > 0) {
       timer = setTimeout(() => {
         timedOut = true;
-        try {
-          child.kill('SIGKILL');
-        } catch {
-          /* ignore */
-        }
+        kill();
       }, opts.timeoutMs);
     }
     child.stdout?.setEncoding('utf8');
@@ -268,9 +304,20 @@ export function runCaptured(
     child.stderr?.on('data', (d: string) => {
       if (stderr.length < MAX_CAPTURE) stderr += d;
     });
+    child.stdout?.on('error', () => undefined);
+    child.stderr?.on('error', () => undefined);
     child.on('error', (e) => {
+      // Only a failed spawn (no pid) ends the run here; a failed kill() is not fatal.
+      if (child?.pid !== undefined) return;
       spawnError = e as NodeJS.ErrnoException;
       finish(null, null);
+    });
+    child.on('exit', (code, signal) => {
+      // The child is gone: its timeout no longer applies (a grandchild holding the pipes during
+      // the drain must not turn a clean exit into `timedOut` and get its group killed).
+      if (timer) clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      drainTimer = setTimeout(() => finish(code, signal), CAPTURE_DRAIN_MS);
     });
     child.on('close', (code, signal) => finish(code, signal));
   });
@@ -378,23 +425,35 @@ function tooOld(bin: ClaudeBinary, minVersion: string | null): string | undefine
 }
 
 /**
- * Finds and verifies the installed Claude Code CLI (see module doc for the order).
+ * Finds and verifies the installed Claude Code CLI (see module doc for the order: explicit
+ * command-line path > `$KIRO_CLAUDE_BIN` > `kiroClaude.claudePath` setting > PATH > well-known).
  * `minVersion` (default {@link MIN_CLAUDE_VERSION}, `null` disables) rejects older installs: an
  * explicitly configured one is an error, a discovered one is skipped in favour of later
  * candidates.
  * @throws ClaudeNotFoundError when nothing works (message lists what was tried).
  */
 export async function findClaudeBinary(
-  opts: { explicitPath?: string; env?: NodeJS.ProcessEnv; minVersion?: string | null } = {},
+  opts: {
+    /** A path given on the command line (beats `$KIRO_CLAUDE_BIN` and the setting). */
+    explicitPath?: string;
+    /** The `kiroClaude.claudePath` setting (below `$KIRO_CLAUDE_BIN`). */
+    settingPath?: string;
+    env?: NodeJS.ProcessEnv;
+    minVersion?: string | null;
+  } = {},
 ): Promise<ClaudeBinary> {
   const env = opts.env ?? process.env;
   const minVersion = opts.minVersion === undefined ? MIN_CLAUDE_VERSION : opts.minVersion;
   const tried: string[] = [];
 
   const configured: Array<{ value: string; source: string }> = [];
+  // Precedence (module doc): command line > $KIRO_CLAUDE_BIN (KiroCrew shim) > setting.
   if (opts.explicitPath) configured.push({ value: opts.explicitPath, source: 'configured path' });
   const fromEnv = envGet(env, 'KIRO_CLAUDE_BIN');
   if (fromEnv && fromEnv.trim()) configured.push({ value: fromEnv.trim(), source: '$KIRO_CLAUDE_BIN' });
+  if (opts.settingPath && opts.settingPath.trim()) {
+    configured.push({ value: opts.settingPath.trim(), source: 'setting kiroClaude.claudePath' });
+  }
   if (configured.length > 0) {
     const { value, source } = configured[0]!;
     const p = resolveConfigured(value, env);

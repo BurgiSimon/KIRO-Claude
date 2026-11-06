@@ -207,3 +207,69 @@ not leak settings into each other.
   `--setting-sources` are accepted and logged (inspect `argv` in the log) but have no effect.
 * Results always carry `user_message_uuid(s)` when the host sent a uuid (the real CLI does too for
   model and local-command turns; CLI-initiated background turns are not simulated).
+
+## `test/e2e/` — opt-in suite against the REAL Claude Code CLI
+
+Real-binary tests make model calls on the user's Claude Code login (billed to their
+subscription), so every real-claude case **skips** (`t.skip(<reason>)`) unless `KIRO_CLAUDE_E2E=1`.
+The default `npm test` glob (`dist/test/**/*.test.js`) therefore only reports them as skipped (only
+the model-free `helpers.test.ts` self-tests run there).
+
+```sh
+npm run build && KIRO_CLAUDE_E2E=1 node --test dist/test/e2e/cli-real.test.js   # or: npm run test:e2e
+```
+
+| Variable | Effect |
+|---|---|
+| `KIRO_CLAUDE_E2E=1` | run the suite at all |
+| `KIRO_CLAUDE_E2E_MODEL` | model passed as `--model` (default `haiku`) |
+| `KIRO_CLAUDE_E2E_KEEP=1` | keep the temp dirs and the Claude project dirs of the temp cwds (paths printed as test diagnostics) |
+
+* `helpers.test.ts` — self-tests of `helpers.ts` (the fake claude, temp `HOME` / `CLAUDE_CONFIG_DIR`,
+  no model calls), so they **always run**: the Claude-project-dir removal only ever removes the
+  dirs of `kc-e2e-*` temp cwds (both spellings of a symlinked temp dir), `e2eEnv()`'s isolation,
+  and `cleanup()` stopping the project's CLI children before removing it.
+* `claude-real.test.ts` drives `ClaudeProcess` directly (initialize, one turn, a PreToolUse deny).
+* `cli-real.test.ts` runs the **built** CLI (`<outDir>/src/bin/kiro-claude.js`, resolved relative
+  to the compiled test file) as a child process: (a) headless `chat --no-interactive`; (b) steering
+  resource + `agentSpawn` hook output + agent prompt in the `--append-system-prompt-file` (captured by
+  a generated `sh` wrapper used as `KIRO_CLAUDE_BIN` that copies the file and `exec`s the real
+  `claude`; POSIX only); (c) the V2 gate (`allowedPaths`, the non-interactive denial text,
+  `deniedCommands`, `allowedCommands`); (d) REPL line mode with a `y` answer at `[y/n/t]:` and
+  `/quit`; (e) ACP `initialize` → `session/new` → `session/prompt` → `session/request_permission`
+  (`allow_once`) → stdin EOF exit 0, then a new process `session/load` (replay + resumed memory);
+  (f) `<KIRO_HOME>/sessions/cli/<sid>.json` + `.jsonl` written by (e) (shared, memoized scenario: (f)
+  runs it itself when (e) did not); (g) `spec new … --type quick --yes` (600 s budget).
+
+### `test/e2e/helpers.ts`
+
+* `e2eTest(name, timeoutMs, fn)` — a `node:test` case that `t.skip`s without `KIRO_CLAUDE_E2E=1`.
+* `makeProject(t?)` — `<tmp>/kc-e2e-XXXXXX/{project,kiro-home}`: `project` is `git init`ed and used as
+  cwd, `kiro-home` is `KIRO_HOME` (with an empty `agents/` so legacy `~/.aws/amazonq` agents are not
+  read). `.env` is the caller's environment **minus** `KIRO_*` / `FAKE_CLAUDE_*` / `FORCE_COLOR`
+  (so a stray `KIRO_CLAUDE_BIN` cannot select the fake) plus `KIRO_HOME`, `KIRO_CHAT_LOG_FILE`,
+  `NO_COLOR=1`. **HOME and CLAUDE_CONFIG_DIR are not overridden** — that would hide the login.
+  `.write(rel, text)`, `.agent(name, spec)` (workspace V2 agent), `.token` (unique marker);
+  `await .cleanup()` is registered on `t.after` (call it yourself without `t`): it first stops
+  (SIGTERM, SIGKILL after 5 s, ≤ 15 s) every tracked CLI child still running in the project — a
+  failed or timed-out case would otherwise leave `claude` writing its transcript back into the
+  user's Claude config after the removal — then removes the temp root and the Claude project dir.
+* `trackChild(child, cwd)` — register a child so `cleanup()` of the project containing `cwd` stops
+  it; `runCli`, `CliProc` and `AcpClient` do this for their children.
+* `removeClaudeProjectDir(cwd, uniqueRoot?, env?)` — the real `claude` creates
+  `<CLAUDE_CONFIG_DIR|~/.claude>/projects/<sanitized cwd>/` for every temp cwd (named after its
+  getcwd(), i.e. the realpath, so both spellings are tried); this removes exactly that directory,
+  and only when `uniqueRoot` is a `kc-e2e-*` temp dir that contains `cwd` and whose name the
+  directory carries. `env` (default `e2eEnv()`) supplies `CLAUDE_CONFIG_DIR`. Nothing else in the
+  user's Claude config is touched.
+* `runCli(args, {cwd, env, timeoutMs})` — run `kiro-claude <args>` with stdin closed; ANSI-stripped
+  `stdout`/`stderr`, exit code, `timedOut` (SIGTERM, then SIGKILL after 5 s).
+* `CliProc` — a long-running CLI child with piped stdio (REPL line mode): `write(line)`, `end()`,
+  `waitUntil(cond, what, timeoutMs)` (re-checked on every output chunk, on exit and every 250 ms for
+  file-system conditions; fails early with the output tail if the process exits), `exited`.
+* `AcpClient` — a JSON-RPC 2.0 client over `kiro-claude acp …` stdio: `call(method, params, ms)` →
+  `{result, from, to}` (the frame-index range of the exchange), `chunkText(sid, kind, from, to)`,
+  `updates(...)`, `endAndWait(ms)`; `session/request_permission` is answered by `onPermission`
+  (default: the `allow_once` option), other agent → client requests get "method not found";
+  non-JSON stdout lines are collected in `nonJson`.
+* `describeRun(r)` — output tail for assertion messages (never the environment).

@@ -1,0 +1,119 @@
+{
+  "_comment": "FAKE_CLAUDE_SCRIPT of KiroCrew stage B (08-kirocrew-integration \u00a75.2; format: test/fixtures/README.md). Every turn repeats and matches the END of the user text, because KiroCrew wraps the request in a ~41 KB [AGENT SYSTEM PROMPT] or a [RUNTIME] preamble that ends with the request itself. The task-decomposition turn answers KiroCrew's taskrunner planner (C13) with a fixed 2-step plan.",
+  "turns": [
+    {
+      "repeat": true,
+      "match": "You are a task decomposition agent",
+      "steps": [
+        {
+          "text": "{\"steps\": [{\"title\": \"Create a.txt\", \"description\": \"Create the file a.txt containing exactly the single letter A.\", \"depends_on\": []}, {\"title\": \"Create b.txt\", \"description\": \"Create the file b.txt containing exactly the single letter B.\", \"depends_on\": [1]}]}"
+        }
+      ]
+    },
+    {
+      "repeat": true,
+      "match": "PING\\s*$",
+      "steps": [
+        {
+          "text": "PONG"
+        }
+      ]
+    },
+    {
+      "repeat": true,
+      "match": "RUN-ECHO\\s*$",
+      "steps": [
+        {
+          "tool": {
+            "name": "Bash",
+            "input": {
+              "command": "echo kc-e2e",
+              "description": "Print kc-e2e"
+            },
+            "result": "kc-e2e"
+          }
+        },
+        {
+          "text": "DONE"
+        }
+      ]
+    },
+    {
+      "repeat": true,
+      "match": "LEARN\\s*$",
+      "steps": [
+        {
+          "tool": {
+            "name": "mcp__kirocrew-core__learn_add",
+            "input": {
+              "lesson": "kc-e2e lesson"
+            },
+            "result": "{\"ok\":true}"
+          }
+        },
+        {
+          "text": "SAVED"
+        }
+      ]
+    },
+    {
+      "repeat": true,
+      "match": "SLOW\\s*$",
+      "steps": [
+        {
+          "text": "Working"
+        },
+        {
+          "sleepMs": 30000
+        },
+        {
+          "text": "TOO-LATE"
+        }
+      ]
+    },
+    {
+      "repeat": true,
+      "match": "READ-DENIED\\s*$",
+      "steps": [
+        {
+          "tool": {
+            "name": "Read",
+            "input": {
+              "file_path": "{{cwd}}/secret/token.txt"
+            }
+          }
+        },
+        {
+          "text": "READ-DONE {{lastToolResult}}"
+        }
+      ]
+    },
+    {
+      "repeat": true,
+      "match": "ECHO-STEER\\s*$",
+      "steps": [
+        {
+          "tool": {
+            "name": "Bash",
+            "input": {
+              "command": "echo kc-e2e",
+              "description": "Print kc-e2e"
+            },
+            "result": "kc-e2e",
+            "durationMs": 300
+          }
+        },
+        {
+          "text": "STEER-DONE"
+        }
+      ]
+    }
+  ],
+  "default": {
+    "steps": [
+      {
+        "text": "OK"
+      }
+    ]
+  }
+}

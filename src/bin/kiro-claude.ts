@@ -1,16 +1,10 @@
 #!/usr/bin/env node
 /**
- * kiro-claude executable entry point. All logic lives in cli/main.ts.
+ * kiro-claude executable entry point. All logic lives in cli/main.ts; bin/run.ts makes sure the
+ * process ends once main() has resolved (abandoned claude children shut down, stdout/stderr
+ * drained, stray handles cannot hold it open).
  */
 import { main } from '../cli/main.js';
+import { runEntry } from './run.js';
 
-main(process.argv.slice(2)).then(
-  (code) => {
-    process.exitCode = code;
-  },
-  (err: unknown) => {
-    const msg = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`kiro-claude: ${msg}\n`);
-    process.exitCode = 1;
-  },
-);
+runEntry(main, process.argv.slice(2));

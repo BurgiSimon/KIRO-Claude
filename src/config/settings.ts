@@ -5,6 +5,10 @@
  *  - global    `<kiroHome>/settings/cli.json`
  *  - workspace `<workspaceRoot>/.kiro/settings/cli.json` (overrides global, except for the
  *    global-only keys of 01 §7.1, whose workspace values are ignored and cannot be set)
+ *  - security: the `kiroClaude.*` keys that change how `claude` is launched or authenticated
+ *    ({@link CLAUDE_LAUNCH_KEYS}) are global-only too, and a workspace value of one of them
+ *    (a cloned repository's `.kiro/settings/kiro-claude.json` or `cli.json`) is reported in
+ *    `warnings` (code `workspace-launch-setting`) besides being ignored
  *  - adapter-only keys (prefix `kiroClaude.`) live in `kiro-claude.json` next to each
  *    `cli.json`, so the real kiro-cli never sees unknown keys (00 §2.1). Reads of a
  *    `kiroClaude.*` key fall back to `cli.json` when a user put it there by hand.
@@ -127,18 +131,24 @@ export const SETTINGS_SCHEMA: Record<string, SettingSchemaEntry> = {
   'toolSearch.minPct': { type: 'number', default: 5, description: 'Tool search threshold (% of context window)' },
   'toolSearch.minTokens': { type: 'number', default: 50000, description: 'Tool search threshold (tokens)' },
   // ── kiro-claude adapter keys (kiro-claude.json) ──
-  'kiroClaude.claudePath': { type: 'string', description: 'Path of the claude binary (default: $KIRO_CLAUDE_BIN, PATH, /opt/claude-code/bin/claude)' },
+  'kiroClaude.claudePath': {
+    type: 'string',
+    description: 'Path of the claude binary (below $KIRO_CLAUDE_BIN; default: PATH, /opt/claude-code/bin/claude)',
+    scope: 'global-only',
+  },
   'kiroClaude.allowApiKey': {
     type: 'boolean',
     default: false,
     description: 'Let ANTHROPIC_API_KEY and cloud-provider switches reach claude (default: subscription login only)',
+    scope: 'global-only',
   },
   'kiroClaude.claudeSettingSources': {
     type: 'string',
     default: '',
     description: 'Value for claude --setting-sources (e.g. "user,project,local"); empty = Kiro semantics only',
+    scope: 'global-only',
   },
-  'kiroClaude.extraClaudeArgs': { type: 'array', default: [], description: 'Extra arguments appended to every claude invocation' },
+  'kiroClaude.extraClaudeArgs': { type: 'array', default: [], description: 'Extra arguments appended to every claude invocation', scope: 'global-only' },
   'kiroClaude.spec.defaultWorkflow': {
     type: 'string',
     description: 'Default spec workflow: requirements-first or design-first (unset: ask)',
@@ -147,12 +157,34 @@ export const SETTINGS_SCHEMA: Record<string, SettingSchemaEntry> = {
   'kiroClaude.autonomy': { type: 'string', default: 'autopilot', description: 'Agent autonomy: autopilot or supervised' },
 };
 
-/** Keys whose workspace value is ignored and which cannot be set with workspace scope (01 §7.1). */
-export const GLOBAL_ONLY_KEYS: ReadonlySet<string> = new Set(
-  Object.entries(SETTINGS_SCHEMA)
+/**
+ * `kiroClaude.*` keys that change how `claude` is launched or authenticated — its binary
+ * (`claudePath`), its argv (`extraClaudeArgs`; `claudeSettingSources` ⇒ `--setting-sources`,
+ * which would let a repository's `.claude/settings.json` hooks run) and its environment /
+ * credentials (`allowApiKey` lets `ANTHROPIC_API_KEY` and cloud-provider switches through).
+ * A cloned repository must not control these, so they are honoured only from the global
+ * (`KIRO_HOME`) settings: a workspace value is ignored with a ConfigWarning naming the key, and
+ * `set(key, v, 'workspace')` is refused. Every other `kiroClaude.*` key (spec workflow
+ * preferences, autonomy) keeps workspace-over-global semantics. (Found by grepping every
+ * `kiroClaude.` read in src/: session/launch.ts, session/kiroSession.ts, cli/commands/*.ts.)
+ */
+export const CLAUDE_LAUNCH_KEYS: ReadonlySet<string> = new Set([
+  'kiroClaude.claudePath',
+  'kiroClaude.extraClaudeArgs',
+  'kiroClaude.claudeSettingSources',
+  'kiroClaude.allowApiKey',
+]);
+
+/**
+ * Keys whose workspace value is ignored and which cannot be set with workspace scope (01 §7.1,
+ * plus {@link CLAUDE_LAUNCH_KEYS}).
+ */
+export const GLOBAL_ONLY_KEYS: ReadonlySet<string> = new Set([
+  ...Object.entries(SETTINGS_SCHEMA)
     .filter(([, v]) => v.scope === 'global-only')
     .map(([k]) => k),
-);
+  ...CLAUDE_LAUNCH_KEYS,
+]);
 
 /**
  * Parse a CLI-supplied value: JSON when it parses, else the raw string (Kiro semantics,
@@ -317,6 +349,28 @@ export function openSettings(ws: WorkspaceContext): KiroSettingsStore {
     return Object.prototype.hasOwnProperty.call(g, key) ? g[key] : undefined;
   };
 
+  /** One warning per launch key present in a workspace file (CLAUDE_LAUNCH_KEYS: ignored). */
+  const workspaceLaunchWarnings = (): ConfigWarning[] => {
+    const f = files.workspace;
+    if (!f) return [];
+    const out: ConfigWarning[] = [];
+    const seen = new Set<string>();
+    // kiro-claude.json first: it wins over a kiroClaude.* key hand-written into cli.json.
+    for (const p of [f.adapter, f.cli]) {
+      const data = readFile(p).data;
+      for (const key of Object.keys(data).sort()) {
+        if (!CLAUDE_LAUNCH_KEYS.has(key) || seen.has(key)) continue;
+        seen.add(key);
+        out.push({
+          code: 'workspace-launch-setting',
+          message: `${p}: ${key} is ignored: it changes how Claude Code is launched, so it is honoured only in the global settings (${files.global.adapter})`,
+          path: p,
+        });
+      }
+    }
+    return out;
+  };
+
   const writable = (p: string): Record<string, unknown> => {
     const e = readFile(p);
     if (e.invalid) {
@@ -339,6 +393,7 @@ export function openSettings(ws: WorkspaceContext): KiroSettingsStore {
         const w = readFile(p).warning;
         if (w) out.push(w);
       }
+      out.push(...workspaceLaunchWarnings());
       return out;
     },
     get,

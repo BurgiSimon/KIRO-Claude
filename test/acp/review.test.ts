@@ -207,7 +207,7 @@ test('an asked Write still previews the old text (diff) before the permission re
   const sid = (await s.c.call('session/new', { cwd: s.t.work, mcpServers: [] })).sessionId as string;
   await prompt(s.c, sid, 'write it');
   const tc = s.c.updates('tool_call', sid).find((u) => u.toolCallId === 'toolu_w2')!;
-  assert.equal(tc.title, 'Writing notes.txt');
+  assert.equal(tc.title, 'Creating notes.txt');
   assert.deepEqual(tc.content, [{ type: 'diff', path: path.join(s.t.work, 'notes.txt'), oldText: 'old text', newText: 'new' }]);
   assert.equal(await s.c.close(), 0);
 });
@@ -215,7 +215,7 @@ test('an asked Write still previews the old text (diff) before the permission re
 test('describeToolCall without content probes reports existence only', () => {
   const call = toKiroCall('Write', { file_path: '/tmp/x-does-not-matter.txt', content: 'n' }, { cwd: '/tmp', toolUseId: 't1' });
   const d = describeToolCall(call, { cwd: '/tmp', fs: { exists: () => true, read: () => 'SHOULD-NOT-BE-READ' }, readContent: false });
-  assert.equal(d.title, 'Writing /tmp/x-does-not-matter.txt'.replace('/tmp/', ''));
+  assert.equal(d.title, 'Creating x-does-not-matter.txt');
   assert.equal(JSON.stringify(d).includes('SHOULD-NOT-BE-READ'), false);
 });
 
@@ -361,6 +361,6 @@ test('LIVE_FS never previews a symlink target (Write diff oldText stays null)', 
   assert.equal(LIVE_FS.read(link), undefined);
   const call = toKiroCall('Write', { file_path: link, content: 'x' }, { cwd: t.work, toolUseId: 't' });
   const d = describeToolCall(call, { cwd: t.work, fs: LIVE_FS });
-  assert.equal(d.title, 'Writing notes.txt');
+  assert.equal(d.title, 'Creating notes.txt');
   assert.equal(JSON.stringify(d).includes('PRIVATE-KEY'), false);
 });

@@ -103,7 +103,9 @@ e2eTest('b) context: steering resource, agentSpawn hook output and agent prompt 
   fs.writeFileSync(wrapper, claudeWrapperScript(realClaudePath(), captureDir), { mode: 0o755 });
 
   const codeword = `ZEBRA-${randomInt(1000, 10000)}`;
-  const hookMark = `HOOK-SPAWN-${p.token}`;
+  // The hook prints HOOK-42-<token>, which is not literally in its command: finding it proves the
+  // hook ran (and that its output, not its config, reached the prompt).
+  const hookMark = `HOOK-42-${p.token}`;
   const promptMark = `AGENT-PROMPT-${p.token}`;
   p.write(path.join('.kiro', 'steering', 'project.md'), `# Project facts\n\nThe project codeword is ${codeword}.\n`);
   p.agent('ctx', {
@@ -111,7 +113,7 @@ e2eTest('b) context: steering resource, agentSpawn hook output and agent prompt 
     prompt: `${promptMark}: you are a terse assistant; answer in one short line.`,
     tools: [],
     resources: ['file://.kiro/steering/**/*.md'],
-    hooks: { agentSpawn: [{ command: `echo ${hookMark}` }] },
+    hooks: { agentSpawn: [{ command: `echo HOOK-$((6*7))-${p.token}` }] },
     includeMcpJson: false,
   });
 
@@ -133,6 +135,12 @@ e2eTest('b) context: steering resource, agentSpawn hook output and agent prompt 
   assert.ok(sys.includes(`The project codeword is ${codeword}.`), `steering text missing\n${show}`);
   assert.ok(sys.includes(path.join(p.project, '.kiro', 'steering', 'project.md')), `steering entry has no [path] label\n${show}`);
   assert.ok(sys.includes(hookMark), `agentSpawn hook output missing\n${show}`);
+  // Q format_hook_context, agentSpawn variant (06 §3.7)
+  assert.match(
+    sys,
+    new RegExp(`--- CONTEXT ENTRY BEGIN ---\\nThis section \\(like others\\) contains important information[^\\n]* for the entire conversation\\n\\n${hookMark}\\n+--- CONTEXT ENTRY END ---`),
+    `the hook output is not in Q's agentSpawn context entry\n${show}`,
+  );
   assert.ok(sys.includes(`Follow this instruction: ${promptMark}`), `agent prompt missing\n${show}`);
   assert.ok(sys.indexOf(hookMark) < sys.indexOf(promptMark), `the agent prompt comes last\n${show}`);
   assert.ok(sys.includes('--- CONTEXT ENTRY BEGIN ---') && sys.includes('--- CONTEXT ENTRY END ---'), `Q context entry markers missing\n${show}`);
@@ -238,12 +246,11 @@ interface AcpScenario {
 }
 
 let acpScenario: Promise<AcpScenario> | undefined;
-const acpClients: AcpClient[] = [];
 const acpProjects: E2EProject[] = [];
 
-after(() => {
-  for (const c of acpClients) c.kill();
-  for (const p of acpProjects) p.cleanup();
+after(async () => {
+  // cleanup() stops the ACP children still running in the project before removing it
+  await Promise.all(acpProjects.map((p) => p.cleanup()));
 });
 
 const INIT_PARAMS = {
@@ -263,7 +270,6 @@ function runAcpScenario(): Promise<AcpScenario> {
 
     // ── process 1: initialize, session/new, PONG, a write behind request_permission, EOF
     const c1 = new AcpClient(['--model', MODEL], { cwd: p.project, env: p.env });
-    acpClients.push(c1);
     const init = await c1.call('initialize', INIT_PARAMS, 60_000);
     assert.equal(init.result.protocolVersion, 1, c1.describe());
     assert.equal(init.result.agentCapabilities?.loadSession, true, c1.describe());
@@ -296,7 +302,6 @@ function runAcpScenario(): Promise<AcpScenario> {
 
     // ── process 2: session/load replays the history and the conversation continues
     const c2 = new AcpClient(['--model', MODEL], { cwd: p.project, env: p.env });
-    acpClients.push(c2);
     await c2.call('initialize', INIT_PARAMS, 60_000);
     const loaded = await c2.call('session/load', { sessionId, cwd: p.project, mcpServers: [] }, 120_000);
     assert.ok(c2.chunkText(sessionId, 'user_message_chunk', loaded.from, loaded.to).includes(FIRST_PROMPT), `no user_message_chunk replay\n${c2.describe()}`);
@@ -333,6 +338,19 @@ e2eTest('f) ACP session files: <sid>.json envelope and <sid>.jsonl journal', 240
   assert.equal(env.session_id, sessionId);
   assert.equal(env.cwd, p.project);
   assert.equal(env.kind, 'kiro-claude-session');
+  // the rest of the kiro-cli envelope KiroCrew reads / rewrites (08a §4.2)
+  for (const k of ['created_at', 'updated_at']) assert.ok(!Number.isNaN(Date.parse(String(env[k]))), `${k}: ${String(env[k])}`);
+  const state = env.session_state as { agent_name?: unknown; permissions?: { filesystem?: Record<string, unknown> } } | undefined;
+  assert.equal(typeof state?.agent_name, 'string', `session_state: ${JSON.stringify(state)}`);
+  assert.ok(Array.isArray(state?.permissions?.filesystem?.allowed_read_paths), `session_state: ${JSON.stringify(state)}`);
+  assert.ok(Array.isArray(state?.permissions?.filesystem?.allowed_write_paths), `session_state: ${JSON.stringify(state)}`);
+  // KiroCrew's real smoke: every .json/.jsonl in sessions/cli has a UUID stem and is a non-empty
+  // regular file directly in that dir (08a §4.2)
+  for (const name of fs.readdirSync(dir).filter((n) => /\.jsonl?$/.test(n))) {
+    assert.match(name, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl?$/, `non-UUID session file ${name}`);
+    const st = fs.lstatSync(path.join(dir, name));
+    assert.ok(st.isFile() && st.size > 0, `${name} is not a non-empty regular file`);
+  }
 
   assert.ok(fs.existsSync(journalFile), `missing ${journalFile}`);
   assert.ok(fs.statSync(journalFile).size >= 10, 'KiroCrew ignores journals under 10 bytes');
@@ -340,10 +358,32 @@ e2eTest('f) ACP session files: <sid>.json envelope and <sid>.jsonl journal', 240
     .readFileSync(journalFile, 'utf8')
     .split('\n')
     .filter((l) => l.trim() !== '')
-    .map((l) => JSON.parse(l) as { version?: number; kind?: string; data?: { content?: { kind?: string; data?: unknown }[] } });
+    .map(
+      (l) =>
+        JSON.parse(l) as {
+          version?: number;
+          kind?: string;
+          timestamp?: string;
+          data?: { message_id?: string; content?: { kind?: string; data?: any }[] };
+        },
+    );
   const kinds = new Set(records.map((r) => r.kind));
   for (const k of ['Prompt', 'AssistantMessage', 'ToolResults']) assert.ok(kinds.has(k), `no ${k} record; kinds: ${[...kinds].join(', ')}`);
   assert.ok(records.every((r) => r.version === 1), 'every record is version 1');
+  assert.ok(records.every((r) => !Number.isNaN(Date.parse(String(r.timestamp)))), 'every record has an ISO timestamp');
+  for (const r of records.filter((x) => x.kind === 'Prompt' || x.kind === 'AssistantMessage')) {
+    assert.equal(typeof r.data?.message_id, 'string', `${r.kind} without data.message_id`);
+  }
+  assert.ok(
+    records.some((r) => r.kind === 'AssistantMessage' && r.data?.content?.some((b) => b.kind === 'text' && String(b.data).includes('PONG'))),
+    'no AssistantMessage text record with the PONG reply',
+  );
+  // the allowed Write: a toolResult block with its toolUseId and status success
+  const results = records.filter((r) => r.kind === 'ToolResults').flatMap((r) => r.data?.content ?? []);
+  assert.ok(
+    results.some((b) => b.kind === 'toolResult' && typeof b.data?.toolUseId === 'string' && b.data.toolUseId !== '' && b.data.status === 'success'),
+    `ToolResults content: ${JSON.stringify(results).slice(0, 500)}`,
+  );
   const firstPrompt = records.find((r) => r.kind === 'Prompt');
   assert.ok(
     firstPrompt?.data?.content?.some((b) => b.kind === 'text' && String(b.data).includes(FIRST_PROMPT)),

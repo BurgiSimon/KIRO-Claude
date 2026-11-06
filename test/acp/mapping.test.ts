@@ -182,9 +182,9 @@ test('read / write / edit / search / todo / failure result envelopes', () => {
   assert.equal('content' in wr[0]!, false, 'diff kept from the tool_call');
   assert.deepEqual(wr[0]!.rawOutput, { items: [{ Text: 'File created successfully at: /work/created.txt' }] });
   const existing = d('Write', { file_path: '/work/a.txt', content: 'new' }, { fs: { exists: () => true, read: () => 'old' } });
-  assert.equal(existing.title, 'Writing a.txt');
+  assert.equal(existing.title, 'Creating a.txt', 'Write = fs_write create: the title does not depend on existence');
   assert.deepEqual(existing.content, [{ type: 'diff', path: '/work/a.txt', oldText: 'old', newText: 'new' }]);
-  assert.equal(d('Write', { file_path: '/work/a.txt', content: 'n' }).title, 'Writing a.txt', 'no fs probes ⇒ Writing');
+  assert.equal(d('Write', { file_path: '/work/a.txt', content: 'n' }).title, 'Creating a.txt', 'no fs probes ⇒ the same title');
 
   const e = d('Edit', { file_path: '/work/a.ts', old_string: 'foo', new_string: 'bar' });
   assert.deepEqual(e.content, [{ type: 'diff', path: '/work/a.ts', oldText: 'foo', newText: 'bar' }]);
@@ -429,12 +429,12 @@ test('small helpers', () => {
   assert.equal(contextFromResult({ usage: {} }), undefined);
 });
 
-test('live fs probes: existing file gives Writing + old text', () => {
+test('live fs probes: existing file gives the old text; the title stays Creating', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kc-acp-map-'));
   const f = path.join(dir, 'a.txt');
   fs.writeFileSync(f, 'before');
   const call = toKiroCall('Write', { file_path: f, content: 'after' }, { cwd: dir, toolUseId: 't' });
   const x = describeToolCall(call, { cwd: dir, fs: { exists: (p) => fs.existsSync(p), read: (p) => fs.readFileSync(p, 'utf8') } });
-  assert.equal(x.title, 'Writing a.txt');
+  assert.equal(x.title, 'Creating a.txt');
   assert.deepEqual(x.content, [{ type: 'diff', path: f, oldText: 'before', newText: 'after' }]);
 });

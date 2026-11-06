@@ -68,6 +68,7 @@ import type {
   SessionUI,
   SubcommandRunner,
   TodoItem,
+  ToolListingEntry,
   TurnResult,
   WorkspaceContext,
 } from '../types.js';
@@ -75,6 +76,7 @@ import { KIRO_CLI_COMPAT_VERSION, KIRO_CLAUDE_VERSION } from '../version.js';
 import { createWorkspaceContext } from '../config/workspace.js';
 import { openSettings } from '../config/settings.js';
 import { agentDirs, loadAgents, selectAgent, type LoadAgentsResult } from '../config/agents.js';
+import { claudeServerName } from '../config/mcp.js';
 import { expandPrompt, findPrompt, loadPrompts, parsePromptInvocation } from '../config/prompts.js';
 import { buildModelList } from '../models/models.js';
 import { SessionStore, isSafeSessionId, sessionsDir } from '../session/store.js';
@@ -407,6 +409,8 @@ class AcpSessionState {
   readonly denied = new Map<string, string>();
   readonly parentOf = new Map<string, string>();
   readonly subagents = new Map<string, { id: string; name: string; status: string }>();
+  /** Ids for subagent events that carry no tool use id. */
+  subagentSeq = 0;
   readonly mcpReported = new Set<string>();
   todos: TodoItem[] = [];
   manualCompaction = false;
@@ -420,12 +424,21 @@ class AcpSessionState {
   activePrompt: string | number | undefined;
   /** Listener on the session's synchronous `'event'` stream (see {@link AcpServer.onLiveEvent}). */
   liveListener: ((ev: SessionEvent) => void) | undefined;
+  /**
+   * Claude MCP server name ⇒ Kiro server name (`kc_mcp` ⇒ `kc.mcp`), learned from the session's
+   * MCP status / tool listing and from the calls it maps itself. Used where this server builds a
+   * call from a raw Claude name: subagent inner calls and `session/load` replay.
+   */
+  readonly mcpNames = new Map<string, string>();
   private queue: Promise<unknown> = Promise.resolve();
 
   constructor(
     readonly id: string,
-    readonly session: KiroSession,
+    /** Replaced (same id) when a stuck `claude` child is torn down after a cancel (05 §4.6 step 5). */
+    public session: KiroSession,
     readonly ws: WorkspaceContext,
+    /** The options this session was created with (`session/new|load`), for re-creating it. */
+    readonly createOpts: KiroSessionOptions,
   ) {}
 
   /** Run `job` after every earlier queued job (errors do not break the chain). */
@@ -533,6 +546,12 @@ export class AcpServer {
    * `session/new|load`): close it (child, lock) instead of registering it, and fail the request.
    */
   private async discardLate(session: KiroSession): Promise<never> {
+    await this.closeLate(session);
+    throw internalError('Server is shutting down');
+  }
+
+  /** Close a session nobody will use (tracked so {@link serve} waits for it). */
+  private async closeLate(session: KiroSession): Promise<void> {
     const p = (async () => {
       try {
         await withTimeout(session.close(), this.timings.closeTimeoutMs);
@@ -546,7 +565,6 @@ export class AcpServer {
     } finally {
       this.closing.delete(p);
     }
-    throw internalError('Server is shutting down');
   }
 
   private warnAboutSandbox(): void {
@@ -770,7 +788,7 @@ export class AcpServer {
       throw internalError(errMessage(e));
     }
     if (this.stopping) return this.discardLate(session);
-    const st = new AcpSessionState(session.id, session, ws);
+    const st = new AcpSessionState(session.id, session, ws, opts);
     holder.st = st;
     this.attachLive(st);
     this.sessions.set(st.id, st);
@@ -816,6 +834,7 @@ export class AcpServer {
         this.log.debug('acp: mcpStatus failed:', e);
         return last;
       }
+      this.learnMcpNames(st, last);
       let pending = false;
       for (const s of last) {
         const k = kiroMcpStatus(s.status);
@@ -833,6 +852,43 @@ export class AcpServer {
       }
       if (!pending || Date.now() >= deadline) return last;
       await sleep(this.timings.mcpPollMs);
+    }
+  }
+
+  /** Learn the exact Claude ⇄ Kiro MCP server pair of a call the session mapped itself. */
+  private learnMcpCall(st: AcpSessionState, call: KiroToolCall): void {
+    if (!call.mcp) return;
+    const claude = claudeMcpServerOf(call.claudeName, call.mcp.tool);
+    if (claude !== undefined) st.mcpNames.set(claude, call.mcp.server);
+  }
+
+  /**
+   * Refresh {@link AcpSessionState.mcpNames}: exact pairs from the session's tool listing; for
+   * servers without a listed tool yet, Claude's name rule (`[^A-Za-z0-9_-]` ⇒ `_`) applied to the
+   * Kiro names in `statuses` where that is unambiguous (colliding names get numeric suffixes
+   * assigned in launch order, which only the exact sources know).
+   */
+  private learnMcpNames(st: AcpSessionState, statuses?: readonly McpStatusEntry[]): void {
+    let listing: ToolListingEntry[] = [];
+    try {
+      listing = st.session.toolListing();
+    } catch (e) {
+      this.log.debug('acp: toolListing failed:', e);
+    }
+    for (const e of listing) {
+      if (e.source !== 'mcp' || !e.server || !e.name.startsWith(`@${e.server}/`)) continue;
+      const claude = claudeMcpServerOf(e.claudeName, e.name.slice(e.server.length + 2));
+      if (claude !== undefined) st.mcpNames.set(claude, e.server);
+    }
+    if (!statuses) return;
+    const kiroNames = new Set(statuses.map((s) => s.name));
+    const byClaude = new Map<string, string[]>();
+    for (const n of kiroNames) {
+      const c = claudeServerName(n);
+      if (c !== n) byClaude.set(c, [...(byClaude.get(c) ?? []), n]);
+    }
+    for (const [c, kiro] of byClaude) {
+      if (kiro.length === 1 && !kiroNames.has(c) && !st.mcpNames.has(c)) st.mcpNames.set(c, kiro[0]!);
     }
   }
 
@@ -893,7 +949,7 @@ export class AcpServer {
     }
     if (this.stopping) return this.discardLate(session);
     if (session.id !== sessionId) this.log.warn(`acp: session/load ${sessionId}: the session module answered id ${session.id}; keeping the client's id`);
-    const st = new AcpSessionState(sessionId, session, ws);
+    const st = new AcpSessionState(sessionId, session, ws, opts);
     holder.st = st;
     this.attachLive(st);
     st.ready = session.start();
@@ -909,6 +965,12 @@ export class AcpServer {
       }
       throw internalError(errMessage(e));
     }
+    // MCP server names for the replayed calls, mapped as the live path maps them (`kc_mcp` ⇒ `kc.mcp`)
+    try {
+      this.learnMcpNames(st, await withTimeout(session.mcpStatus(), this.timings.usageTimeoutMs));
+    } catch (e) {
+      this.log.debug('acp: mcpStatus before replay failed:', e);
+    }
     if (this.stopping) {
       if (st.liveListener) session.off('event', st.liveListener);
       return this.discardLate(session);
@@ -921,12 +983,14 @@ export class AcpServer {
   }
 
   private replay(st: AcpSessionState, claudeSessionId: string | undefined): void {
+    this.learnMcpNames(st);
     const { updates, source } = buildReplay({
       sessionsDir: sessionsDir(st.ws),
       sessionId: st.id,
       ...(claudeSessionId ? { claudeSessionId } : {}),
       cwd: st.ws.cwd,
       env: this.env,
+      mcpServerNames: Object.fromEntries(st.mcpNames),
     });
     this.log.debug(`acp: replaying ${updates.length} updates from ${source} for ${st.id}`);
     for (const u of updates) this.update(st.id, u);
@@ -1436,9 +1500,11 @@ export class AcpServer {
         if (ev.text) this.update(st.id, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: ev.text } });
         return;
       case 'tool_start':
+        this.learnMcpCall(st, ev.call);
         this.ensureToolCall(st, ev.call, ev.toolUseId);
         return;
       case 'tool_denied': {
+        this.learnMcpCall(st, ev.call);
         const id = ev.toolUseId ?? ev.call.toolUseId;
         if (!id || st.finalized.has(id)) return;
         const d = this.ensureToolCall(st, ev.call, id, false);
@@ -1448,6 +1514,7 @@ export class AcpServer {
         return;
       }
       case 'tool_end':
+        if (ev.call) this.learnMcpCall(st, ev.call);
         this.finishTool(st, ev.toolUseId, ev.call, { isError: ev.isError, output: ev.output, response: ev.response });
         this.afterBoundary(st, turn, ev.toolUseId);
         return;
@@ -1467,9 +1534,17 @@ export class AcpServer {
         }
         return;
       case 'subagent': {
-        const id = ev.toolUseId ?? `${ev.agentType}-${st.subagents.size + 1}`;
+        // The list is the CURRENT one: KiroCrew reads kiro-cli's as a full snapshot rebuilt on every
+        // change, where terminated children vanish from the next update (KC
+        // acp/runtime_frame_accounting.py `_snapshot_subagent_sessions`; 05 §5.3 names the
+        // statuses only). DECISION: a finished subagent is reported once as `completed`, then
+        // dropped; whatever is still listed when the turn ends is dropped by endTurn.
+        let id = ev.toolUseId;
+        if (!id && ev.state !== 'started') id = [...st.subagents.values()].find((x) => x.name === ev.agentType && x.status === 'running')?.id;
+        id ??= `${ev.agentType}-${++st.subagentSeq}`;
         st.subagents.set(id, { id, name: ev.agentType, status: ev.state === 'started' ? 'running' : 'completed' });
-        this.conn.notify('_kiro.dev/subagent/list_update', { sessionId: st.id, subagents: [...st.subagents.values()] });
+        this.notifySubagents(st);
+        if (ev.state !== 'started') st.subagents.delete(id);
         return;
       }
       case 'rate_limit':
@@ -1524,7 +1599,8 @@ export class AcpServer {
             }
             continue;
           }
-          const call = toKiroCall(b.name, isObj(b.input) ? b.input : {}, { cwd: st.ws.cwd, toolUseId: b.id });
+          // MCP names as the session maps them (Claude `kc_mcp` ⇒ Kiro `kc.mcp`)
+          const call = toKiroCall(b.name, isObj(b.input) ? b.input : {}, { cwd: st.ws.cwd, toolUseId: b.id, mcpServerNames: Object.fromEntries(st.mcpNames) });
           this.ensureToolCall(st, call, b.id);
         }
         return;
@@ -1659,6 +1735,16 @@ export class AcpServer {
     }
     turn.liveInjected.clear();
     this.dropSteers(st);
+    // subagents cannot outlive the turn (CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1, claude/env): a
+    // listed one whose finish was never seen (cancelled / failed turn) is dropped from the list
+    if (st.subagents.size > 0) {
+      st.subagents.clear();
+      if (!st.closed) this.notifySubagents(st);
+    }
+  }
+
+  private notifySubagents(st: AcpSessionState): void {
+    this.conn.notify('_kiro.dev/subagent/list_update', { sessionId: st.id, subagents: [...st.subagents.values()] });
   }
 
   /** Steers never injected (cancelled / failed turn) are dropped and reported as cleared. */
@@ -1671,8 +1757,9 @@ export class AcpServer {
 
   /**
    * One prompt turn (plus held-steer continuations); answers through `respond` (a
-   * `PromptResponse`) or throws the JSON-RPC error. Returns only when the turn is really over,
-   * so the session queue stays blocked even when a cancelled turn was answered early.
+   * `PromptResponse`) or throws the JSON-RPC error. Returns only when the session can take the
+   * next queued operation: the turn is over, or — after a cancel the child never answered — the
+   * stuck session was replaced ({@link replaceStuckSession}).
    */
   private async runTurn(st: AcpSessionState, input: PromptInput, respond: (r: unknown) => void): Promise<void> {
     const turn = this.beginTurn(st);
@@ -1693,13 +1780,14 @@ export class AcpServer {
     try {
       const raced = await Promise.race([work, turn.cancelGrace.promise.then(() => undefined)]);
       if (raced === undefined) {
-        // 05 §4.6 step 5: no result within the grace period after cancel — answer now
-        this.log.warn(`acp[${st.id}]: no result ${this.timings.cancelGraceMs} ms after cancel; answering cancelled`);
+        // 05 §4.6 step 5: no result within the grace period after cancel — answer now, then
+        // restart the child with --resume (the stuck turn would block this session's queue forever)
+        this.log.warn(`acp[${st.id}]: no result ${this.timings.cancelGraceMs} ms after cancel; answering cancelled and restarting Claude Code`);
         this.failOpenTools(st);
         turn.detached = true;
-        respond({ stopReason: 'cancelled' });
-        await work.catch(() => undefined);
         this.endTurn(st, turn);
+        respond({ stopReason: 'cancelled' });
+        await this.replaceStuckSession(st, work);
         return;
       }
       result = raced;
@@ -1740,6 +1828,69 @@ export class AcpServer {
     respond({ stopReason: stop, ...(usage ? { usage } : {}) });
   }
 
+  /**
+   * 05 §4.6 step 5: the child produced no result within the grace period after a cancel. Close
+   * the session (stdin EOF, then SIGTERM / SIGKILL: the child dies and the stuck turn ends) and
+   * re-create it under the SAME ACP / Kiro session id with `resume` of its persisted record and
+   * the options it was created with (cwd, client MCP servers, additional directories, trust
+   * flags, the permission bridge), carrying the agent / model / effort it has now (`set_mode` /
+   * `set_model` / effort changes included). The new child starts eagerly; the session queue then
+   * continues with it. A failed re-creation is reported by every later operation on the session
+   * (`Failed to start the session: …`), like a failed start.
+   */
+  private async replaceStuckSession(st: AcpSessionState, stuck: Promise<unknown>): Promise<void> {
+    const old = st.session;
+    if (st.liveListener) old.off('event', st.liveListener);
+    st.liveListener = undefined;
+    try {
+      await withTimeout(old.close(), this.timings.closeTimeoutMs);
+    } catch (e) {
+      this.log.warn(`acp[${st.id}]: closing the stuck session failed:`, e);
+    }
+    // the stuck generator ends once its child is gone (bounded: never block the queue on it again)
+    await withTimeout(stuck.catch(() => undefined), this.timings.closeTimeoutMs);
+    if (st.closed || this.stopping) return;
+    const opts: KiroSessionOptions = { ...st.createOpts, resume: { sessionId: st.id }, agentName: old.agent.name, model: old.model };
+    delete opts.fork;
+    if (old.effort) opts.effort = old.effort;
+    else delete opts.effort;
+    if (old.trust.trustAll) opts.trustAllTools = true;
+    let fresh: KiroSession;
+    try {
+      fresh = await this.factory(opts);
+    } catch (e) {
+      this.log.error(`acp[${st.id}]: re-creating the session after a stuck cancel failed:`, e);
+      st.startError = e;
+      st.ready = Promise.reject(e);
+      st.ready.catch(() => undefined);
+      return;
+    }
+    if (st.closed || this.stopping) {
+      await this.closeLate(fresh);
+      return;
+    }
+    if (fresh.id !== st.id) this.log.warn(`acp[${st.id}]: the re-created session answered id ${fresh.id}; keeping the client's id`);
+    st.session = fresh;
+    this.attachLive(st);
+    st.ready = fresh.start();
+    st.ready.catch((e) => {
+      st.startError = e;
+      this.log.error(`acp[${st.id}]: restart failed:`, e);
+    });
+    await st.ready.catch(() => undefined);
+    this.log.info(`acp[${st.id}]: Claude Code restarted (--resume) after an unanswered cancel`);
+  }
+
+  /**
+   * `used` / `size` / percentage for `usage_update` and `_kiro.dev/metadata`, asked fresh after
+   * every turn (`get_context_usage` through `session.usage()`, nothing cached here; the result
+   * frame only fills gaps). Measured with claude 2.1.318: `totalTokens` is the sum of Claude's
+   * own categories, where `Messages` is the API-measured context minus Claude's ESTIMATE of the
+   * system prompt + tools, clamped at 0 (e.g. estimate 11236, measured 10981 ⇒ no `Messages`,
+   * total 11236). While that estimate exceeds the measured context (large tool / MCP sets early in
+   * a conversation), Claude reports the same total after every turn — the number is Claude's, and
+   * it is passed through unchanged so `used`, `contextUsagePercentage` and `/usage` agree.
+   */
   private async contextNumbers(st: AcpSessionState, raw?: Record<string, unknown>): Promise<{ pct?: number; used?: number; size?: number }> {
     let pct: number | undefined;
     let used: number | undefined;
@@ -1795,10 +1946,20 @@ export class AcpServer {
     st.manualCompaction = true;
     let ok = false;
     let reason = '';
+    let stuck: Promise<unknown> | undefined;
     try {
-      const r = await this.drain(st, turn, st.session.compact(instructions));
-      ok = !r.isError && r.stopReason !== 'cancelled' && !turn.cancelled;
-      if (!ok) reason = r.error || (turn.cancelled || r.stopReason === 'cancelled' ? 'Compaction cancelled' : 'Compaction failed');
+      const work = this.drain(st, turn, st.session.compact(instructions));
+      const r = await Promise.race([work, turn.cancelGrace.promise.then(() => undefined)]);
+      if (r === undefined) {
+        // 05 §4.6 step 5, as for a prompt turn: a cancelled compaction the child never ends
+        this.log.warn(`acp[${st.id}]: compaction still running ${this.timings.cancelGraceMs} ms after cancel; restarting Claude Code`);
+        turn.detached = true;
+        stuck = work;
+        reason = 'Compaction cancelled';
+      } else {
+        ok = !r.isError && r.stopReason !== 'cancelled' && !turn.cancelled;
+        if (!ok) reason = r.error || (turn.cancelled || r.stopReason === 'cancelled' ? 'Compaction cancelled' : 'Compaction failed');
+      }
     } catch (e) {
       reason = errMessage(e);
     } finally {
@@ -1809,10 +1970,21 @@ export class AcpServer {
     if (st.closed) return false;
     if (ok) this.conn.notify('_kiro.dev/compaction/status', { sessionId: st.id, status: { type: 'completed' }, summary: turn.compactionSummary ?? '' });
     else this.conn.notify('_kiro.dev/compaction/status', { sessionId: st.id, status: { type: 'failed' }, summary: reason });
+    if (stuck) {
+      await this.replaceStuckSession(st, stuck);
+      if (st.closed) return false;
+    }
     const n = await this.contextNumbers(st, turn.rawResult);
     this.conn.notify('_kiro.dev/metadata', { sessionId: st.id, contextUsagePercentage: n.pct ?? 0 });
     return ok;
   }
+}
+
+/** `mcp__<claude server>__<tool>` ⇒ `<claude server>`; undefined for any other shape. */
+function claudeMcpServerOf(claudeName: string, tool: string): string | undefined {
+  const suffix = `__${tool}`;
+  if (tool === '' || !claudeName.startsWith('mcp__') || !claudeName.endsWith(suffix) || claudeName.length <= 'mcp__'.length + suffix.length) return undefined;
+  return claudeName.slice('mcp__'.length, claudeName.length - suffix.length);
 }
 
 function randomHex32(): string {
