@@ -952,10 +952,32 @@ def s13(ctx: Ctx) -> None:
     c2.done()
 
 
+def s14(ctx: Ctx) -> None:
+    """Turn errors (08 KC-AUTH-04) and refusal (KC-ACP-19), stage B only (scripted by fake-claude)."""
+    c = Check("S14")
+    if ctx.real:
+        return report("S14", "SKIP", "needs scripted Claude errors (stage B only)")
+    ws, ag, sid, _ = opener(ctx, "S14", "kc-chat", spec("kc-chat"))
+    try:
+        res, err, idx, start = ag.prompt(sid, "AUTH-FAIL")
+        c.ok(err is not None and err.get("code") == -32000 and "HTTP 401" in json.dumps(err), "KC-AUTH-04 auth failure ⇒ -32000 with HTTP 401",
+             json.dumps(res or err)[:200])
+        res, err, idx, start = ag.prompt(sid, "REFUSE")
+        c.ok(err is None and (res or {}).get("stopReason") == "refusal", "KC-ACP-19 stopReason refusal", json.dumps(res or err)[:200])
+        md = [m for m in ag.msgs(start, idx) if m.get("method") == "_kiro.dev/metadata" and (m.get("params") or {}).get("stopReason") == "CONTENT_FILTERED"]
+        c.ok(bool(md) and isinstance(md[0]["params"].get("refusal"), dict), "_kiro.dev/metadata {stopReason:CONTENT_FILTERED, refusal{}} before the response",
+             json.dumps(md[:1])[:200])
+        r2, e2, i2, s2_ = ag.prompt(sid, "PING")
+        c.ok((r2 or {}).get("stopReason") == "end_turn" and "PONG" in ag.text(s2_, i2), "session usable after errors")
+    finally:
+        ag.close()
+    c.done()
+
+
 SCENARIOS = {
     "S1": s1, "S2": s2, "S3": s3,
     "S4": lambda c: s4(c, "allow"), "S4r": lambda c: s4(c, "reject"), "S4b": lambda c: s4(c, "allowed"),
-    "S5": s5, "S6": s6, "S7": s7, "S8": s8, "S9": s9, "S10": s10, "S11": s11, "S12": s12, "S13": s13,
+    "S5": s5, "S6": s6, "S7": s7, "S8": s8, "S9": s9, "S10": s10, "S11": s11, "S12": s12, "S13": s13, "S14": s14,
 }
 
 

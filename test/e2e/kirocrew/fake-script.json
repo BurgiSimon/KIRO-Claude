@@ -107,6 +107,29 @@
           "text": "STEER-DONE"
         }
       ]
+    },
+    {
+      "repeat": true,
+      "match": "AUTH-FAIL\\s*$",
+      "steps": [
+        {
+          "error": "authentication_failed"
+        }
+      ]
+    },
+    {
+      "repeat": true,
+      "match": "REFUSE\\s*$",
+      "steps": [
+        {
+          "text": "I can't help with that."
+        },
+        {
+          "result": {
+            "stop_reason": "refusal"
+          }
+        }
+      ]
     }
   ],
   "default": {

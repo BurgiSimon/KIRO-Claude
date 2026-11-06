@@ -73,6 +73,8 @@ def acp_procs() -> list[dict]:
                 argv = [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
             if len(argv) < 3 or "acp" not in argv or not any(a.endswith("kiro-claude.js") or a.endswith("/kiro-claude") for a in argv[:2]):
                 continue
+            if "--help" in argv or "-h" in argv:
+                continue  # KiroCrew's `acp --help` probe before each spawn, not a session process
             with open(f"{d}/environ", "rb") as f:
                 env = f.read().split(b"\0")
             if f"HOME={HOME}".encode() not in env:
@@ -610,7 +612,7 @@ class Pipeline:
         bad = sorted({p["agent"] or "?" for p in main if not SKILL_VIEW.match(p["agent"] or "")})
         c.ok(main and not bad, "every main/cron/subagent spawn used a kirocrew-skill-view-* agent (KC-FS-01)",
              f"{len(main)} spawns; others: {bad}")
-        c.done(f"{len(seen)} acp processes sampled; agents: {sorted({p['agent'] for p in seen})[:6]}")
+        c.done(f"{len(seen)} acp processes sampled; agents: {sorted({str(p['agent']) for p in seen})[:6]}")
 
     def spec_warnings(self):
         """KC-SPEC-02 side check: kiro-claude's ACP log (KIRO_CHAT_LOG_FILE) must not warn that the
