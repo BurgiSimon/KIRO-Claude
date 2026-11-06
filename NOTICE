@@ -1,0 +1,18 @@
+kiro-claude
+Copyright (c) 2026 kiro-claude contributors
+
+kiro-claude is an independent, unofficial project. It is not affiliated with,
+endorsed by, or sponsored by Amazon Web Services, Inc. or Anthropic, PBC.
+"Kiro" is a trademark of Amazon.com, Inc. or its affiliates. "Claude" and
+"Claude Code" are trademarks of Anthropic, PBC.
+
+Parts of kiro-claude re-implement behavior (permission evaluation, hook
+semantics, context formatting, user-facing messages) of the Amazon Q Developer
+CLI (https://github.com/aws/amazon-q-developer-cli), which is dual-licensed
+under the Apache License 2.0 and the MIT License:
+
+  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+kiro-claude does not contain the Kiro CLI, which is closed source, and it does
+not contain Claude Code. It runs the Claude Code CLI that you install and log
+in to yourself.

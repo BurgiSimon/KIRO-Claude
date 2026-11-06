@@ -10,20 +10,25 @@ credentials.
 ```
  ┌──────────────────────────── kiro-claude ─────────────────────────────┐
  │ cli/        argv parsing, subcommands (chat, agent, mcp, settings,   │
- │             spec, acp, login/whoami/logout, doctor, translate, ...)  │
- │ chat/       interactive REPL, slash commands, renderer, approvals    │
+ │             spec, acp, login/whoami/logout, doctor, ...)             │
+ │ repl/       interactive chat: line editor, slash commands, renderer, │
+ │             y/n/t approvals                                          │
+ │ headless/   `chat --no-interactive` runner                           │
  │ spec/       Kiro spec workflow (requirements → design → tasks → run) │
- │ acp/        Agent Client Protocol server (kiro-cli acp drop-in)      │
- │ session/    KiroSession: one live conversation = agent + engine      │
- │ adapter/    Kiro → Claude Code translation (launch spec, tool/model  │
- │             mapping, system prompt composition, MCP, subagents)      │
- │ permissions/ Kiro permission semantics (allowedTools, toolsSettings) │
- │ hooks/      Kiro hook runner (agentSpawn, userPromptSubmit,          │
- │             preToolUse, postToolUse, stop)                           │
+ │ acp/        Agent Client Protocol server (`kiro-cli acp` drop-in)    │
+ │ session/    KiroSession orchestrator + launch builder + session index│
+ │ context/    system-prompt file (steering, resources, AGENTS.md, hook │
+ │             output, agent prompt) and per-turn user text (@, #)      │
+ │ models/     Kiro ⇄ Claude model id mapping                           │
+ │ policy/     tool map + the gate: Q engine (V2 agents), capability    │
+ │             engine (V3 agents), invariants, session trust            │
+ │ hooks/      Kiro hook runner (V2 + V3 dialects, all triggers)        │
  │ config/     ~/.kiro + .kiro loaders (agents, steering, mcp, prompts, │
- │             skills, settings), kiro-claude settings & data dirs      │
- │ engine/     ClaudeProcess: spawn installed `claude`, stream-json I/O,│
- │             control protocol, capability probe, session index        │
+ │             skills, hooks, permissions.yaml, settings)               │
+ │ claude/     ClaudeProcess: spawn installed `claude`, stream-json I/O,│
+ │             control protocol, capability probe, env scrub, auth      │
+ │ util/       globs, shlex, yaml/front matter, fs, shell exec, logging │
+ │ types.ts    every cross-module contract                              │
  └──────────────────────────────────────┬───────────────────────────────┘
                                         │ stdin/stdout NDJSON (stream-json)
                                         ▼
