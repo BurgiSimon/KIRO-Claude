@@ -176,9 +176,30 @@ function copyDir(src: string, dst: string, depth = 0): void {
 }
 
 /**
+ * Kiro SKILL.md text made inert for Claude Code. A Kiro skill is plain instructions (02 §6.2:
+ * name, description, license, compatibility, metadata). Claude Code gives the same file execution
+ * semantics that would bypass the Kiro permission gate: inline `` !`cmd` `` and ```` ```! ````
+ * blocks run while the skill prompt is built (no tool call, so no PreToolUse callback), and
+ * front-matter `hooks:` / `allowed-tools:` become native hooks and permission grants. So the
+ * plugin gets a rewritten SKILL.md: front matter reduced to `name` and `description`, and the
+ * shell-injection markers broken with a zero-width joiner so they stay visible text, as in Kiro.
+ * (launch.ts also passes `--settings {"disableSkillShellExecution":true}` as a second guard.)
+ */
+export function sanitizeSkillForClaude(skill: Pick<SkillInfo, 'name' | 'description'>, body: string): string {
+  const zwj = '\u200d';
+  const inert = body.replace(/!`/g, `!${zwj}\``).replace(/^([ \t]*)(`{3,}|~{3,})([ \t]*)!/gm, `$1$2${zwj}$3!`);
+  const fm = [`name: ${JSON.stringify(skill.name)}`];
+  if (skill.description !== undefined && skill.description !== '') fm.push(`description: ${JSON.stringify(skill.description)}`);
+  return `---\n${fm.join('\n')}\n---\n\n${inert}\n`;
+}
+
+/**
  * Build `<targetDir>/kiro` as a Claude plugin exposing `skills` (see module doc). Returns
  * the plugin directory, or `undefined` when `skills` is empty. Any previous `skills/`
- * content of that plugin directory is replaced.
+ * content of that plugin directory is replaced. Each skill gets a real directory holding a
+ * sanitized SKILL.md ({@link sanitizeSkillForClaude}); the skill's other entries (scripts/,
+ * references/, assets/ …) are linked (or copied) next to it so relative references resolve.
+ * The user's skill files are never modified.
  */
 export function buildSkillsPluginDir(skills: SkillInfo[], targetDir: string): string | undefined {
   if (skills.length === 0) return undefined;
@@ -190,15 +211,37 @@ export function buildSkillsPluginDir(skills: SkillInfo[], targetDir: string): st
   mkdirp(skillsDir);
   const names = pluginSkillDirNames(skills);
   skills.forEach((s, i) => {
-    const link = path.join(skillsDir, names[i]!);
+    const dir = path.join(skillsDir, names[i]!);
+    mkdirp(dir);
+    fs.writeFileSync(path.join(dir, 'SKILL.md'), sanitizeSkillForClaude(s, readSkillBody(s)), { mode: 0o600 });
+    const skillFileName = path.basename(s.skillFile).toLowerCase();
+    let entries: fs.Dirent[] = [];
     try {
-      fs.symlinkSync(path.resolve(s.dir), link, process.platform === 'win32' ? 'junction' : 'dir');
-    } catch (e) {
-      const code = (e as { code?: string }).code;
-      if (code === 'EPERM' || code === 'EACCES' || code === 'ENOTSUP' || code === 'EINVAL' || process.platform === 'win32') {
-        copyDir(s.dir, link);
-      } else {
-        throw e;
+      entries = fs.readdirSync(s.dir, { withFileTypes: true });
+    } catch {
+      entries = [];
+    }
+    for (const e of entries) {
+      const lower = e.name.toLowerCase();
+      if (lower === skillFileName || lower === 'skill.md') continue;
+      const src = path.resolve(s.dir, e.name);
+      const dst = path.join(dir, e.name);
+      try {
+        fs.symlinkSync(src, dst, process.platform === 'win32' ? 'junction' : undefined);
+      } catch (err) {
+        const code = (err as { code?: string }).code;
+        if (code === 'EPERM' || code === 'EACCES' || code === 'ENOTSUP' || code === 'EINVAL' || process.platform === 'win32') {
+          let st: fs.Stats | undefined;
+          try {
+            st = fs.statSync(src);
+          } catch {
+            st = undefined;
+          }
+          if (st?.isDirectory()) copyDir(src, dst);
+          else if (st?.isFile()) fs.copyFileSync(src, dst);
+        } else {
+          throw err;
+        }
       }
     }
   });

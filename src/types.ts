@@ -361,6 +361,12 @@ export interface SessionTrust {
   allowedTools: string[];
   /** V3 session rules. */
   rules: PermissionRule[];
+  /**
+   * Agent `allowedTools` entries revoked for this session by `/tools untrust` (normalized V2
+   * names / `@srv[/tool]`). Q edits the agent's in-memory allowedTools (06 §1.1); this models
+   * that without touching the agent. Cleared by `/tools reset`; a later trust removes an entry.
+   */
+  revokedTools?: string[];
 }
 
 export type PolicyVerdict =

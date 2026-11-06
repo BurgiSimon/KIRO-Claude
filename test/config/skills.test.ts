@@ -128,7 +128,7 @@ describe('config/skills plugin dir (00 §2.2 Skills)', () => {
     return readSkill(path.dirname(f), 'workspace')!;
   };
 
-  it('layout: kiro/.claude-plugin/plugin.json + skills/<name> symlinks', () => {
+  it('layout: kiro/.claude-plugin/plugin.json + skills/<name> dirs (sanitized SKILL.md, other entries linked)', () => {
     fx = makeFixture();
     const skills = [mk(fx, 'backend-patterns'), mk(fx, 'Weird Name!', 'weird')];
     const target = fx.mkdir('runtime');
@@ -136,11 +136,12 @@ describe('config/skills plugin dir (00 §2.2 Skills)', () => {
     assert.equal(dir, path.join(target, 'kiro'));
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, '.claude-plugin', 'plugin.json'), 'utf8')), { name: 'kiro', version: '0.0.0' });
     assert.deepEqual(fs.readdirSync(path.join(dir, 'skills')).sort(), ['backend-patterns', 'weird-name']);
-    const link = path.join(dir, 'skills', 'backend-patterns');
-    assert.ok(fs.lstatSync(link).isSymbolicLink());
-    assert.equal(fs.realpathSync(link), fs.realpathSync(skills[0]!.dir));
-    assert.equal(fs.readFileSync(path.join(link, 'SKILL.md'), 'utf8'), skillMd('backend-patterns', 'backend-patterns skill'));
-    assert.equal(fs.readFileSync(path.join(link, 'scripts', 'run.sh'), 'utf8'), 'echo hi\n');
+    const sdir = path.join(dir, 'skills', 'backend-patterns');
+    assert.ok(fs.lstatSync(sdir).isDirectory() && !fs.lstatSync(sdir).isSymbolicLink(), 'a real dir (the SKILL.md is rewritten)');
+    const md = fs.readFileSync(path.join(sdir, 'SKILL.md'), 'utf8');
+    assert.match(md, /^---\nname: "backend-patterns"\ndescription: "backend-patterns skill"\n---\n/);
+    assert.equal(fs.realpathSync(path.join(sdir, 'scripts')), fs.realpathSync(path.join(skills[0]!.dir, 'scripts')), 'other entries linked');
+    assert.equal(fs.readFileSync(path.join(sdir, 'scripts', 'run.sh'), 'utf8'), 'echo hi\n');
   });
 
   it('no skills ⇒ undefined and nothing created', () => {
@@ -159,7 +160,8 @@ describe('config/skills plugin dir (00 §2.2 Skills)', () => {
     buildSkillsPluginDir([c], target);
     const dir = buildSkillsPluginDir([a, b], target)!;
     assert.deepEqual(fs.readdirSync(path.join(dir, 'skills')).sort(), ['dup', 'dup-2']);
-    assert.equal(fs.realpathSync(path.join(dir, 'skills', 'dup-2')), fs.realpathSync(b.dir));
+    assert.match(fs.readFileSync(path.join(dir, 'skills', 'dup-2', 'SKILL.md'), 'utf8'), /^---\nname: "dup"/);
+    assert.equal(fs.existsSync(path.join(dir, 'skills', 'other')), false, 'previous skills replaced');
   });
 
   const nameTable: [string, string][] = [

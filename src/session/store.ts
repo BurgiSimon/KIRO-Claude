@@ -134,6 +134,7 @@ export function fromDiskJson(raw: unknown, id: string): SessionRecord | undefine
       trustAll: trustRaw.trustAll === true,
       allowedTools: strArr(trustRaw.allowedTools),
       rules: Array.isArray(trustRaw.rules) ? (trustRaw.rules.filter(isObj) as unknown as SessionRecord['trust']['rules']) : [],
+      ...(Array.isArray(trustRaw.revokedTools) ? { revokedTools: strArr(trustRaw.revokedTools) } : {}),
     },
     planMode: raw.planMode === true,
   };
@@ -319,6 +320,7 @@ export class SessionStore {
         trustAll: init.trust?.trustAll ?? false,
         allowedTools: [...(init.trust?.allowedTools ?? [])],
         rules: (init.trust?.rules ?? []).map((r) => ({ ...r })),
+        ...(init.trust?.revokedTools ? { revokedTools: [...init.trust.revokedTools] } : {}),
       },
       planMode: init.planMode ?? false,
     };

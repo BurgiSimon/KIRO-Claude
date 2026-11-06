@@ -691,6 +691,24 @@ describe('trust helpers (06 §1.7, 00 §4.3)', () => {
     H.state.agent = makeAgent({ name: 'main', dialect: 'v3' });
     assert.equal((await decide('mcp__git__status', {})).kind, 'allow');
   });
+  it("untrustTools revokes an agent allowedTools entry for the session (Q edits the in-memory agent, 06 §1.1)", async () => {
+    H.state.agent = makeAgent({ name: 'main', allowedTools: ['shell'] });
+    assert.equal((await decide('Bash', bash('make'))).kind, 'allow');
+    assert.deepEqual(H.gate.untrustTools(['shell']), ['execute_bash']);
+    assert.equal((await decide('Bash', bash('make'))).kind, 'ask');
+    assert.equal(H.gate.describeTool(toKiroCall('Bash', bash('make'), { cwd: '/w' })), 'not trusted');
+    assert.deepEqual(H.gate.untrustTools(['shell']), [], 'already revoked');
+    H.gate.trustTools(['shell']);
+    assert.equal((await decide('Bash', bash('make'))).kind, 'allow', 'trust again un-revokes');
+    H.gate.untrustTools(['execute_cmd']);
+    assert.equal((await decide('Bash', bash('make'))).kind, 'ask');
+    H.gate.resetTrust();
+    assert.equal((await decide('Bash', bash('make'))).kind, 'allow', '/tools reset restores the agent file');
+    assert.deepEqual(H.deps.trust.revokedTools, []);
+    H.state.agent = makeAgent({ name: 'main', allowedTools: ['execute_bash'] });
+    assert.deepEqual(H.gate.untrustTools(['shell']), ['execute_bash'], 'alias spelling in the agent file');
+    assert.equal((await decide('Bash', bash('make'))).kind, 'ask');
+  });
   it('untrustTools removes names and their session rules', async () => {
     H.gate.trustTools(['shell', '@git']);
     assert.deepEqual(H.gate.untrustTools(['execute_cmd', 'nothing']), ['execute_bash']);
@@ -704,7 +722,7 @@ describe('trust helpers (06 §1.7, 00 §4.3)', () => {
     assert.equal((await decide('Bash', bash('make'))).kind, 'allow');
     H.gate.trustTools(['shell']);
     H.gate.resetTrust();
-    assert.deepEqual(H.deps.trust, { trustAll: false, allowedTools: [], rules: [] });
+    assert.deepEqual(H.deps.trust, { trustAll: false, allowedTools: [], rules: [], revokedTools: [] });
     assert.equal(H.gate.trust, H.deps.trust);
     assert.equal((await decide('Bash', bash('make'))).kind, 'ask');
   });

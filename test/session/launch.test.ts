@@ -13,6 +13,7 @@ import {
   mandatoryMcpNames,
   mergeMcpServers,
   sanitizeExtraArgs,
+  withSkillShellDisabled,
   subagentDefinition,
   type LaunchInput,
 } from '../../src/session/launch.js';
@@ -77,6 +78,7 @@ describe('launch: argv goldens', () => {
       '--append-system-prompt-file', path.join(rt, 'context.md'),
       '--system-prompt-snapshot', 'off',
       '--session-id', SID,
+      '--settings', '{"disableSkillShellExecution":true}',
     ]);
     assert.equal(l.sessionId, SID);
     assert.deepEqual(l.initialize, { hooks: buildInitializeHooks(), skills: [] });
@@ -235,11 +237,11 @@ describe('launch: argv goldens', () => {
     const sb = mkSandbox();
     sb.agent('r', { tools: ['read'] });
     const res = launchFor(sb, 'r', { resume: { claudeSessionId: 'aaa' } });
-    assert.deepEqual(res.args.slice(-2), ['--resume', 'aaa']);
+    assert.deepEqual(res.args.slice(-4, -2), ['--resume', 'aaa']);
     assert.equal(res.args.includes('--session-id'), false);
     assert.equal(res.sessionId, undefined);
     const fork = launchFor(sb, 'r', { resume: { claudeSessionId: 'aaa', fork: true, at: 'uuid-1' } });
-    assert.deepEqual(fork.args.slice(-7), ['--resume', 'aaa', '--fork-session', '--resume-session-at', 'uuid-1', '--session-id', SID]);
+    assert.deepEqual(fork.args.slice(-9, -2), ['--resume', 'aaa', '--fork-session', '--resume-session-at', 'uuid-1', '--session-id', SID]);
     assert.equal(fork.sessionId, SID);
   });
 
@@ -291,11 +293,31 @@ describe('launch: argv goldens', () => {
     assert.equal(flagValue(l.args, '--setting-sources'), 'user');
     const i = l.args.indexOf('--add-dir');
     assert.deepEqual(l.args.slice(i, i + 4), ['--add-dir', '/a', '--add-dir', '/b']);
-    assert.deepEqual(l.args.slice(-2), ['--debug-file', '/tmp/d']);
+    assert.deepEqual(l.args.slice(-4), ['--debug-file', '/tmp/d', '--settings', '{"disableSkillShellExecution":true}']);
     assert.equal(l.args.includes('--bare'), false);
     assert.equal(l.args.filter((a) => a === '--permission-mode').length, 1);
     assert.equal(flagValue(l.args, '--permission-mode'), 'default');
     assert.ok(l.warnings.some((w) => /--bare is not allowed/.test(w)));
+  });
+
+  it('always passes --settings {disableSkillShellExecution:true} (skill !`cmd` blocks bypass the gate), merging a user --settings', () => {
+    const sb = mkSandbox();
+    sb.agent('g', { tools: ['*'] });
+    const l = launchFor(sb, 'g');
+    assert.equal(l.args.filter((a) => a === '--settings').length, 1);
+    assert.deepEqual(JSON.parse(flagValue(l.args, '--settings')!), { disableSkillShellExecution: true });
+
+    const w: string[] = [];
+    const file = sb.write('my-settings.json', JSON.stringify({ cleanupPeriodDays: 3, disableSkillShellExecution: false }));
+    const merged = withSkillShellDisabled(['--x', '--settings', '{"a":1}', '--settings=' + file, '--y'], true, sb.root, w);
+    assert.deepEqual(merged.slice(0, 2), ['--x', '--y']);
+    assert.deepEqual(merged.slice(2, 3), ['--settings']);
+    assert.deepEqual(JSON.parse(merged[3]!), { a: 1, cleanupPeriodDays: 3, disableSkillShellExecution: true }, 'user values kept, safety wins');
+    assert.deepEqual(w, []);
+    const bad = withSkillShellDisabled(['--settings', 'missing.json'], true, sb.root, w);
+    assert.deepEqual(JSON.parse(bad[1]!), { disableSkillShellExecution: true });
+    assert.match(w[0]!, /--settings missing\.json could not be read/);
+    assert.deepEqual(withSkillShellDisabled(['--settings', '{"a":1}'], false, sb.root, []), ['--settings', '{"a":1}'], 'unsupported: untouched');
   });
 
   it('sanitizeExtraArgs accepts a string (shlex) and drops forbidden flags with their values', () => {

@@ -73,13 +73,23 @@ export function toolSettings(agent: Pick<KiroAgent, 'toolsSettings'>, qName: str
   return undefined;
 }
 
-/** Effective allow list: agent + session entries, raw and alias-normalized. */
-export function effectiveAllowedTools(agent: Pick<KiroAgent, 'allowedTools'>, trust: Pick<SessionTrust, 'allowedTools'>): string[] {
+/**
+ * Effective allow list: agent + session entries, raw and alias-normalized. Agent entries revoked
+ * this session (`/tools untrust`, {@link SessionTrust.revokedTools}) are left out; session
+ * entries always count.
+ */
+export function effectiveAllowedTools(
+  agent: Pick<KiroAgent, 'allowedTools'>,
+  trust: Pick<SessionTrust, 'allowedTools'> & Partial<Pick<SessionTrust, 'revokedTools'>>,
+): string[] {
+  const revoked = new Set(trust.revokedTools ?? []);
   const out = new Set<string>();
-  for (const n of [...(agent.allowedTools ?? []), ...(trust.allowedTools ?? [])]) {
+  const add = (n: string): void => {
     out.add(n);
     out.add(normalizeV2Name(n));
-  }
+  };
+  for (const n of agent.allowedTools ?? []) if (!revoked.has(n) && !revoked.has(normalizeV2Name(n))) add(n);
+  for (const n of trust.allowedTools ?? []) add(n);
   return [...out];
 }
 

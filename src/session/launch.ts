@@ -188,6 +188,42 @@ export function sanitizeExtraArgs(raw: unknown, warnings: string[]): string[] {
   return out;
 }
 
+/**
+ * The extra args with `--settings {"disableSkillShellExecution":true,…}` enforced. Claude Code
+ * runs a skill's inline `` !`cmd` `` blocks while it builds the skill prompt, outside any tool
+ * call, so the Kiro gate never sees them (skills.ts sanitizes the plugin's SKILL.md; this is the
+ * second guard, and it also covers commands loaded via kiroClaude.claudeSettingSources). A
+ * `--settings` the user put in kiroClaude.extraClaudeArgs (inline JSON or a JSON file) is merged
+ * instead of being overridden, since claude keeps only the last `--settings`. Unreadable user
+ * settings are dropped with a warning: the safety setting wins.
+ */
+export function withSkillShellDisabled(extra: readonly string[], supported: boolean, cwd: string, warnings: string[]): string[] {
+  if (!supported) return [...extra];
+  const out: string[] = [];
+  let user: Record<string, unknown> = {};
+  for (let i = 0; i < extra.length; i++) {
+    const a = extra[i]!;
+    let value: string | undefined;
+    if (a === '--settings') value = extra[++i];
+    else if (a.startsWith('--settings=')) value = a.slice('--settings='.length);
+    else {
+      out.push(a);
+      continue;
+    }
+    if (value === undefined) continue;
+    try {
+      const text = value.trim().startsWith('{') ? value : fs.readFileSync(path.resolve(cwd, value), 'utf8');
+      const parsed: unknown = JSON.parse(text);
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not a JSON object');
+      user = { ...user, ...(parsed as Record<string, unknown>) };
+    } catch (e) {
+      warnings.push(`kiroClaude.extraClaudeArgs: --settings ${value} could not be read (${e instanceof Error ? e.message : String(e)}) and was ignored`);
+    }
+  }
+  out.push('--settings', JSON.stringify({ ...user, disableSkillShellExecution: true }));
+  return out;
+}
+
 /** Names from `$ASBX_KIRO_MANDATORY_MCPS` (comma/space separated). */
 export function mandatoryMcpNames(env: NodeJS.ProcessEnv): string[] {
   const v = env.ASBX_KIRO_MANDATORY_MCPS;
@@ -467,7 +503,8 @@ export function buildLaunch(input: LaunchInput): LaunchResult {
     sessionId = input.claudeSessionId ?? randomUUID();
     args.push('--session-id', sessionId);
   }
-  args.push(...sanitizeExtraArgs(settings.get('kiroClaude.extraClaudeArgs'), warnings));
+  const extra = sanitizeExtraArgs(settings.get('kiroClaude.extraClaudeArgs'), warnings);
+  args.push(...withSkillShellDisabled(extra, has('--settings'), input.ws.cwd, warnings));
 
   const result: LaunchResult = {
     args,

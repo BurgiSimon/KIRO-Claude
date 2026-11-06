@@ -140,6 +140,13 @@ const NATIVE_TOOL_NAMES = new Set([
   'tool_search',
 ]);
 
+/** A tool trusted again (`t`, `/tools trust`) is no longer revoked for the session. */
+function unrevoke(t: SessionTrust, name: string): void {
+  if (!t.revokedTools?.length) return;
+  const norm = normalizeV2Name(name);
+  t.revokedTools = t.revokedTools.filter((x) => x !== name && x !== norm);
+}
+
 // ───────────────────────────── deps ─────────────────────────────
 
 export interface GateDeps {
@@ -523,6 +530,7 @@ export class Gate {
   trustCall(call: KiroToolCall): void {
     const t = this.deps.trust;
     const name = call.mcp ? `@${call.mcp.server}/${call.mcp.tool}` : call.v2Name;
+    unrevoke(t, name);
     if (!t.allowedTools.includes(name)) t.allowedTools.push(name);
     const rule = sessionRuleForName(name);
     if (rule && !t.rules.some((r) => sameRule(r, rule))) t.rules.push(rule);
@@ -543,6 +551,7 @@ export class Gate {
       if (!norm.startsWith('@') && !NATIVE_TOOL_NAMES.has(norm) && !norm.startsWith('mcp_')) {
         this.deps.notify('warn', trustToolsWarning(n));
       }
+      unrevoke(t, norm);
       if (!t.allowedTools.includes(norm)) t.allowedTools.push(norm);
       const rule = sessionRuleForName(norm);
       if (rule && !t.rules.some((r) => sameRule(r, rule))) t.rules.push(rule);
@@ -551,9 +560,14 @@ export class Gate {
     return out;
   }
 
-  /** `/tools untrust`: remove names (and their session rules); returns the names that were trusted. */
+  /**
+   * `/tools untrust`: remove names from session trust (and their session rules), and revoke them
+   * for the session when the agent's own allowedTools grants them (Q edits the in-memory agent,
+   * 06 §1.1). Returns the names that were trusted.
+   */
   untrustTools(names: string[]): string[] {
     const t = this.deps.trust;
+    const agentAllowed = this.deps.agent().allowedTools ?? [];
     const removed: string[] = [];
     for (const raw of names) {
       const n = raw.trim();
@@ -564,7 +578,15 @@ export class Gate {
       const rule = sessionRuleForName(norm);
       const rulesBefore = t.rules.length;
       if (rule) t.rules = t.rules.filter((r) => !(r.scope === 'session' && sameRule(r, rule)));
-      if (t.allowedTools.length !== before || t.rules.length !== rulesBefore) removed.push(norm);
+      let revoked = false;
+      if (agentAllowed.some((a) => a === n || a === norm || normalizeV2Name(a) === norm)) {
+        const list = (t.revokedTools ??= []);
+        if (!list.includes(norm)) {
+          list.push(norm);
+          revoked = true;
+        }
+      }
+      if (t.allowedTools.length !== before || t.rules.length !== rulesBefore || revoked) removed.push(norm);
     }
     return removed;
   }
@@ -580,6 +602,7 @@ export class Gate {
     t.trustAll = false;
     t.allowedTools = [];
     t.rules = [];
+    t.revokedTools = [];
   }
 
   /**

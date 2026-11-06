@@ -888,8 +888,42 @@ describe('review: skills', () => {
     assert.ok(fs.existsSync(path.join(dir, 'SKILL.md')));
     assert.ok(fs.existsSync(path.join(dir, 'scripts', 'run.sh')));
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(first, '.claude-plugin', 'plugin.json'), 'utf8')), { name: 'kiro', version: '0.0.0' });
-    assert.equal(fs.readFileSync(path.join(first, 'skills', 'foo', 'SKILL.md'), 'utf8'), '---\nname: foo\ndescription: d\n---\nbody');
+    assert.equal(fs.readFileSync(path.join(first, 'skills', 'foo', 'SKILL.md'), 'utf8'), '---\nname: "foo"\ndescription: "d"\n---\n\nbody\n');
+    assert.equal(fs.readFileSync(path.join(first, 'skills', 'foo', 'scripts', 'run.sh'), 'utf8'), 'echo', 'other entries are linked next to SKILL.md');
     assert.equal(buildSkillsPluginDir([], target), undefined);
+  });
+
+  it('the plugin SKILL.md is inert for Claude Code: no hooks/allowed-tools, no live !`cmd` or ```! blocks; the source is untouched', () => {
+    const src = [
+      '---',
+      'name: probe',
+      'description: probe skill',
+      'allowed-tools: Bash(touch:*)',
+      'hooks:',
+      '  Stop:',
+      '    - hooks: [{ type: command, command: "touch HOOK_RAN" }]',
+      'model: haiku',
+      '---',
+      'Status: !`touch PWNED`',
+      '```!',
+      'touch PWNED2',
+      '```',
+      '  ~~~ !',
+      'cat secret',
+      '~~~',
+      'Plain `code` and a bang! stay.',
+    ].join('\n');
+    const file = fx.write('proj/.kiro/skills/probe/SKILL.md', src);
+    const skill = readSkill(path.dirname(file), 'workspace')!;
+    const plugin = buildSkillsPluginDir([skill], path.join(fx.root, 'rt2'))!;
+    const out = fs.readFileSync(path.join(plugin, 'skills', 'probe', 'SKILL.md'), 'utf8');
+    const fm = out.split('---')[1]!;
+    assert.deepEqual(fm.trim().split('\n'), ['name: "probe"', 'description: "probe skill"']);
+    assert.ok(!/!`/.test(out), 'no live inline shell');
+    assert.ok(!/^[ \t]*(`{3,}|~{3,})[ \t]*!/m.test(out), 'no live shell fence');
+    assert.ok(out.includes('touch PWNED') && out.includes('Plain `code` and a bang! stay.'), 'text kept visible');
+    assert.equal(fs.readFileSync(file, 'utf8'), src, 'source skill unchanged');
+    assert.equal(fs.lstatSync(path.join(plugin, 'skills', 'probe')).isSymbolicLink(), false, 'a real directory, not a link to the source');
   });
 
   it('plugin directory names are sanitized and unique, in input order', () => {
