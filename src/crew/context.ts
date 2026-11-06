@@ -143,6 +143,7 @@ export function gatewayEnvFor(c: CrewCtx, state: CrewState, opts: { extra?: Reco
     membersAdapter: state.members.adapter ?? c.paths.membersAdapter,
     extra: opts.extra,
     platform: c.deps.sys.platform,
+    allowApiKey: c.cli.settings.getBoolean('kiroClaude.allowApiKey', false),
   });
 }
 

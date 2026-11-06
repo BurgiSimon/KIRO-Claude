@@ -10,6 +10,25 @@ const STATE = {
 };
 
 describe('gateway env (08 §3.7)', () => {
+  it('drops API-key / provider variables (Bot billing stays on the subscription) unless allowApiKey; --env still wins', () => {
+    const base = { HOME: '/h', ANTHROPIC_API_KEY: 'x', ANTHROPIC_AUTH_TOKEN: 't', CLAUDE_CODE_USE_BEDROCK: '1', KEEP: '1' };
+    const opts = { shim: '/s', state: STATE, membersAdapter: '/a', platform: 'linux' as const };
+    const r = computeGatewayEnv(base, opts);
+    for (const k of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_USE_BEDROCK']) assert.equal(r.env[k], undefined, k);
+    assert.equal(r.env.KEEP, '1');
+    assert.equal(r.warnings.length, 1);
+    assert.match(r.warnings[0]!, /ANTHROPIC_API_KEY/);
+    assert.match(r.warnings[0]!, /kiroClaude\.allowApiKey/);
+    const allowed = computeGatewayEnv(base, { ...opts, allowApiKey: true });
+    assert.equal(allowed.env.ANTHROPIC_API_KEY, 'x');
+    assert.equal(allowed.env.CLAUDE_CODE_USE_BEDROCK, '1');
+    assert.deepEqual(allowed.warnings, []);
+    const explicit = computeGatewayEnv(base, { ...opts, extra: { ANTHROPIC_API_KEY: 'y' } });
+    assert.equal(explicit.env.ANTHROPIC_API_KEY, 'y', 'an explicit --env is an opt-in');
+    const win = computeGatewayEnv({ anthropic_api_key: 'x' }, { ...opts, platform: 'win32' });
+    assert.equal(win.env.anthropic_api_key, undefined);
+  });
+
   it("puts setup's Node first on PATH for the members adapter (its #!/usr/bin/env node shebang), once", () => {
     const state = { ...STATE, node: '/opt/node22/bin/node' };
     const base = { HOME: '/h', PATH: '/usr/local/bin:/opt/node22/bin:/usr/bin' };

@@ -17,7 +17,7 @@
  */
 import * as path from 'node:path';
 
-import { isScrubbedSessionVar } from '../claude/env.js';
+import { API_KEY_VARS, apiKeyOverrides, isScrubbedSessionVar } from '../claude/env.js';
 import { homeDir } from '../util/paths.js';
 import type { CrewState } from './state.js';
 
@@ -39,6 +39,13 @@ export interface GatewayEnvOptions {
   membersAdapter?: string;
   /** `--env K=V` pairs, applied last. */
   extra?: Record<string, string>;
+  /**
+   * Keep API-key / cloud-provider variables (`API_KEY_VARS`) in the gateway env. Default false:
+   * Bot sessions run claude through claude-agent-acp, which passes the gateway env on, so a stray
+   * `ANTHROPIC_API_KEY` would move their billing off the subscription (00 §3.2, 08 §3.7 step 2).
+   * Set from the global `kiroClaude.allowApiKey`, like chat.
+   */
+  allowApiKey?: boolean;
   platform?: NodeJS.Platform;
 }
 
@@ -57,10 +64,20 @@ export function computeGatewayEnv(base: NodeJS.ProcessEnv, opts: GatewayEnvOptio
   const platform = opts.platform ?? process.platform;
   const warnings: string[] = [];
   const env: NodeJS.ProcessEnv = {};
+  const keyNames = new Set(API_KEY_VARS.map((n) => (platform === 'win32' ? n.toUpperCase() : n)));
   for (const [k, v] of Object.entries(base)) {
     if (v === undefined) continue;
     if (isScrubbedSessionVar(k, platform)) continue;
+    if (!opts.allowApiKey && keyNames.has(platform === 'win32' ? k.toUpperCase() : k)) continue;
     env[k] = v;
+  }
+  if (!opts.allowApiKey) {
+    const found = apiKeyOverrides(base);
+    if (found.length) {
+      warnings.push(
+        `${found.join(', ')} ${found.length === 1 ? 'is' : 'are'} set: removed from the Kiro Crew gateway environment, so Bot sessions use your Claude Code login (set kiroClaude.allowApiKey true in the global settings to keep ${found.length === 1 ? 'it' : 'them'}).`,
+      );
+    }
   }
   if (isRelocatedXdgDataHome(env)) {
     warnings.push(
