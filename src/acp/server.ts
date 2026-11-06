@@ -1,0 +1,1903 @@
+/**
+ * `kiro-claude acp` — an Agent Client Protocol server that is a drop-in for `kiro-cli acp`
+ * (the kiro-cli v2 ACP dialect KiroCrew drives, as a superset of standard ACP v1 for Zed and
+ * JetBrains). Binding references: research 05 (whole file) as corrected by 08 §0, §2.2,
+ * §2.5–2.7 and §6; golden transcripts 08b §4 and KiroCrew's captured kiro-cli corpus.
+ *
+ * Launch surface (05 §2.1, 08 KC-CLI-02/10): `--agent`, `--model`, `--effort`,
+ * `-a/--trust-all-tools`, `--trust-tools`, `--agent-engine v1|v2` (accepted, ignored; `v3`
+ * exits 2 with a clap-style error), `--auth-method cli|client` (ignored), `--login`, `-v`,
+ * `-h`. {@link ACP_HELP_TEXT} is the 05 §2.2 text verbatim (no `v3` anywhere).
+ *
+ * Process model (05 §1 items 9–10, 08 KC-ACP-15): one server serves many ACP sessions; each is
+ * one {@link KiroSession} (`createSession` with origin `acp`, interactive, and this server's
+ * permission bridge as UI) backed by its own `claude` child, spawned eagerly at `session/new`
+ * (08 KC-ACP-02). Session files (`<sid>.json` + `<sid>.jsonl`) are written by the session
+ * module; `session/load` replays the journal (see ./replay.ts). Per session, operations that
+ * touch the conversation (`prompt`, `set_mode`, `set_model`, `set_config_option`,
+ * `commands/execute`) run one at a time in arrival order (05 §3); `session/cancel`,
+ * `_session/steer[/clear]` and `_kiro.dev/session/terminate` act immediately. A `session/cancel`
+ * also answers `cancelled` for prompts received before it that have not started their turn yet
+ * (queued, or waiting for the child to start); `$/cancel_request` cancels only its own prompt.
+ * Concurrent `session/load`s of one id share one session; a session that finishes creating
+ * after shutdown began is closed instead of registered (no orphaned `claude` child or lock).
+ *
+ * Ordering (05 §3): every update a request produces is written before its response, except
+ * where kiro-cli does otherwise: `/compact` answers `end_turn` first and then sends the
+ * compaction status frames (05 §4.5.4); `session/new|load` answers first and then reports MCP
+ * servers, a `_kiro.dev/metadata` and `available_commands_update` (08b §4.4); `_session/steer`
+ * answers `{queued:true}` before its `AgentExecutionUserMessageQueued` notification.
+ *
+ * Permission flow (05 §6.1, 08 KC-ACP-11/12): the gate inside the session asks this server's
+ * `requestApproval`; it makes sure the `tool_call` frame went out first, sends
+ * `session/request_permission` with kiro-cli's three options and maps the outcome:
+ * `allow_once` ⇒ allow-once, `allow_always` ⇒ allow-always (session trust), `reject_once` ⇒
+ * deny with `User denied tool execution` and a failed update carrying
+ * `toolCallFailureReason:"permission_denied"`, `cancelled` / failure ⇒ cancelled / deny.
+ * Frames of a call the gate denied never carry the target file's current text (a `Write` diff's
+ * `oldText` is read only for calls that may run), so a `deniedPaths` file cannot leak through
+ * the client.
+ *
+ * Steering (05 §4.13): steers are held here and written to the session at the next tool
+ * boundary — observed on the session's synchronous `'event'` stream, where Claude is still busy
+ * and folds the line (priority `next`) into the running turn — so `_session/steer/clear` only
+ * ever drops held entries. A steer still held when the turn ends is sent as a continuation
+ * inside the same prompt request; steers of a cancelled turn are dropped and reported with
+ * `AgentExecutionUserMessageCleared`. Injection is reported as `AgentExecutionSteeringInjected`
+ * right after the tool result update, as kiro-cli does.
+ *
+ * Library rule: only JSON-RPC frames go to `ctx.stdout`; logs go to the log file
+ * (`$KIRO_CHAT_LOG_FILE`, util/log) and a few warnings to `ctx.stderr`.
+ */
+
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import type { Readable, Writable } from 'node:stream';
+import type {
+  ApprovalRequest,
+  ApprovalResponse,
+  CliContext,
+  KiroAgent,
+  KiroSession,
+  KiroSessionOptions,
+  KiroToolCall,
+  McpStatusEntry,
+  ModelEntry,
+  PromptInput,
+  SessionEvent,
+  SessionUI,
+  SubcommandRunner,
+  TodoItem,
+  TurnResult,
+  WorkspaceContext,
+} from '../types.js';
+import { KIRO_CLI_COMPAT_VERSION, KIRO_CLAUDE_VERSION } from '../version.js';
+import { createWorkspaceContext } from '../config/workspace.js';
+import { openSettings } from '../config/settings.js';
+import { agentDirs, loadAgents, selectAgent, type LoadAgentsResult } from '../config/agents.js';
+import { expandPrompt, findPrompt, loadPrompts, parsePromptInvocation } from '../config/prompts.js';
+import { buildModelList } from '../models/models.js';
+import { SessionStore, isSafeSessionId, sessionsDir } from '../session/store.js';
+import { toKiroCall } from '../policy/toolmap.js';
+import { findClaudeBinary } from '../claude/binary.js';
+import { runAuthCommand } from '../claude/auth.js';
+import { buildChildEnv } from '../claude/env.js';
+import { createLogger, levelFromVerbosity, parseLogLevel, type Logger } from '../util/log.js';
+import { JsonRpcConnection, RpcError, internalError, invalidParams, methodNotFound, respondThen, type RequestContext } from './jsonrpc.js';
+import {
+  CANCELLED_TEXT,
+  EFFORT_LEVELS,
+  KIRO_PERMISSION_OPTIONS,
+  LIVE_FS,
+  USER_DENIED_TEXT,
+  abandonedUpdate,
+  acpMcpServersToConfigs,
+  configOptions,
+  contextFromResult,
+  deniedUpdate,
+  describeToolCall,
+  inProgressUpdate,
+  invalidModelError,
+  mapStopReason,
+  modeState,
+  modelState,
+  permissionToolCall,
+  planUpdate,
+  promptToInput,
+  promptUsage,
+  resolveModelId,
+  stripToolUseError,
+  toolCallUpdate,
+  toolMeta,
+  toolResultUpdates,
+  trustOptionsFor,
+  turnErrorToRpc,
+  type ToolDescriptor,
+} from './mapping.js';
+import {
+  argString,
+  availableCommandsUpdate,
+  contextText,
+  helpText,
+  invalidEffortResult,
+  isAcpCommand,
+  kiroMcpStatus,
+  mcpResult,
+  normalizeEffort,
+  parseCommandParam,
+  parseSlashText,
+  toolsResult,
+  usageText,
+  ACP_COMMANDS,
+  type CommandResult,
+} from './commands.js';
+import { buildReplay } from './replay.js';
+
+// ───────────────────────────── help / flags ─────────────────────────────
+
+/**
+ * `kiro-claude acp --help` (05 §2.2 verbatim; 08 KC-CLI-02). KiroCrew parses the
+ * `--agent-engine` block up to the next `\n      --` for `[possible values: …]` and treats any
+ * `v3` substring as "this binary offers KAS", so the text must never contain it.
+ */
+export const ACP_HELP_TEXT = `Run kiro-claude as an Agent Client Protocol (ACP) agent over stdio
+
+Usage: kiro-claude acp [OPTIONS]
+
+Options:
+      --agent-engine <ENGINE>
+          Agent harness (accepted for compatibility; kiro-claude has one engine)
+
+          [possible values: v1, v2]
+
+      --auth-method <METHOD>
+          Accepted for compatibility; Claude Code owns authentication
+
+          [possible values: cli, client]
+
+      --login
+          Sign in to Claude Code in this terminal, then exit
+
+      --agent <AGENT>
+          Agent to start sessions with
+
+      --model <MODEL>
+          Model for new sessions
+
+      --effort <LEVEL>
+          Initial reasoning effort
+
+          [possible values: low, medium, high, xhigh, max]
+
+  -a, --trust-all-tools
+          Allow every tool without confirmation
+
+      --trust-tools <TOOLS>
+          Comma-separated tools to allow without confirmation
+
+  -v, --verbose...
+          Increase logging verbosity
+
+  -h, --help
+          Print help
+`;
+
+const USAGE_LINE = 'Usage: kiro-claude acp [OPTIONS]';
+const MORE_INFO = "For more information, try '--help'.";
+
+/** Parsed `acp` flags. */
+export interface AcpFlags {
+  agent?: string;
+  model?: string;
+  effort?: string;
+  trustAllTools: boolean;
+  trustTools: string[];
+  agentEngine?: string;
+  authMethod?: string;
+  login: boolean;
+  verbose: number;
+  help: boolean;
+}
+
+export type AcpFlagParse = { ok: true; flags: AcpFlags } | { ok: false; exitCode: number; stderr: string };
+
+const VALUE_FLAGS: Record<string, { key: 'agent' | 'model' | 'effort' | 'trustTools' | 'agentEngine' | 'authMethod'; metavar: string; possible?: readonly string[] }> = {
+  '--agent': { key: 'agent', metavar: '<AGENT>' },
+  '--model': { key: 'model', metavar: '<MODEL>' },
+  '--effort': { key: 'effort', metavar: '<LEVEL>', possible: EFFORT_LEVELS },
+  '--trust-tools': { key: 'trustTools', metavar: '<TOOLS>' },
+  '--agent-engine': { key: 'agentEngine', metavar: '<ENGINE>', possible: ['v1', 'v2'] },
+  '--auth-method': { key: 'authMethod', metavar: '<METHOD>', possible: ['cli', 'client'] },
+  '--authMethod': { key: 'authMethod', metavar: '<METHOD>', possible: ['cli', 'client'] },
+};
+
+function clapError(msg: string, withUsage = false): string {
+  return `error: ${msg}\n\n${withUsage ? `${USAGE_LINE}\n\n` : ''}${MORE_INFO}\n`;
+}
+
+/** Parse `acp` arguments clap-style (05 §2.1; 08 KC-CLI-10 for `v3`). */
+export function parseAcpFlags(args: readonly string[]): AcpFlagParse {
+  const flags: AcpFlags = { trustAllTools: false, trustTools: [], login: false, verbose: 0, help: false };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === '--') {
+      if (i + 1 < args.length) return { ok: false, exitCode: 2, stderr: clapError(`unexpected argument '${args[i + 1]}' found`, true) };
+      break;
+    }
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=');
+      const name = eq >= 0 ? a.slice(0, eq) : a;
+      const spec = VALUE_FLAGS[name];
+      if (spec) {
+        let value: string | undefined;
+        if (eq >= 0) value = a.slice(eq + 1);
+        else if (i + 1 < args.length && !(args[i + 1]!.startsWith('-') && args[i + 1] !== '-')) value = args[++i];
+        if (value === undefined) {
+          return { ok: false, exitCode: 2, stderr: clapError(`a value is required for '${name === '--authMethod' ? '--auth-method' : name} ${spec.metavar}' but none was supplied`) };
+        }
+        if (spec.possible && !spec.possible.includes(value)) {
+          const flagName = name === '--authMethod' ? '--auth-method' : name;
+          const head = `error: invalid value '${value}' for '${flagName} ${spec.metavar}'\n  [possible values: ${spec.possible.join(', ')}]\n\n`;
+          if (spec.key === 'agentEngine' && value === 'v3') {
+            return { ok: false, exitCode: 2, stderr: `${head}kiro-claude has no v3 (KAS) agent engine.\n` };
+          }
+          return { ok: false, exitCode: 2, stderr: `${head}${MORE_INFO}\n` };
+        }
+        if (spec.key === 'trustTools') {
+          flags.trustTools.push(...value.split(',').map((s) => s.trim()).filter((s) => s !== ''));
+        } else {
+          flags[spec.key] = value;
+        }
+        continue;
+      }
+      if (eq >= 0) return { ok: false, exitCode: 2, stderr: clapError(`unexpected argument '${a}' found`, true) };
+      switch (a) {
+        case '--trust-all-tools':
+          flags.trustAllTools = true;
+          continue;
+        case '--login':
+          flags.login = true;
+          continue;
+        case '--verbose':
+          flags.verbose++;
+          continue;
+        case '--help':
+          flags.help = true;
+          continue;
+        default:
+          return { ok: false, exitCode: 2, stderr: clapError(`unexpected argument '${a}' found`, true) };
+      }
+    }
+    if (a.startsWith('-') && a.length > 1) {
+      for (const ch of a.slice(1)) {
+        if (ch === 'a') flags.trustAllTools = true;
+        else if (ch === 'v') flags.verbose++;
+        else if (ch === 'h') flags.help = true;
+        else return { ok: false, exitCode: 2, stderr: clapError(`unexpected argument '-${ch}' found`, true) };
+      }
+      continue;
+    }
+    return { ok: false, exitCode: 2, stderr: clapError(`unexpected argument '${a}' found`, true) };
+  }
+  return { ok: true, flags };
+}
+
+// ───────────────────────────── server ─────────────────────────────
+
+/** Creates one KiroSession (default: `createSession` from src/session/kiroSession.ts). */
+export type SessionFactory = (opts: KiroSessionOptions) => Promise<KiroSession>;
+
+/**
+ * `createSession` from the fixed Wave-2 entry point src/session/kiroSession.ts, loaded lazily so
+ * `acp --help` and flag errors never load the engine (08 KC-BIN-05: fast probes).
+ */
+export const defaultSessionFactory: SessionFactory = async (opts) => {
+  const mod = await import('../session/kiroSession.js');
+  return mod.createSession(opts);
+};
+
+export interface AcpServerTimings {
+  /** After `session/cancel`, answer `cancelled` at the latest after this (05 §4.6 step 5). */
+  cancelGraceMs: number;
+  /** Max wait for MCP servers to leave `pending` (08 KC-ACP-05: 30 s). */
+  mcpWaitMs: number;
+  /** MCP status poll interval. */
+  mcpPollMs: number;
+  /** Per-session close budget at shutdown / terminate (05 §2.5: 5 s). */
+  closeTimeoutMs: number;
+  /** Max wait for `usage()` when computing `_kiro.dev/metadata`. */
+  usageTimeoutMs: number;
+}
+
+const DEFAULT_TIMINGS: AcpServerTimings = { cancelGraceMs: 10_000, mcpWaitMs: 30_000, mcpPollMs: 250, closeTimeoutMs: 5_000, usageTimeoutMs: 5_000 };
+
+export interface AcpServerOptions {
+  ctx: CliContext;
+  flags?: Partial<AcpFlags>;
+  /** Defaults to `ctx.stdin` / `ctx.stdout`. */
+  input?: Readable;
+  output?: Writable;
+  createSession?: SessionFactory;
+  logger?: Logger;
+  timings?: Partial<AcpServerTimings>;
+}
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve(v: T): void;
+  reject(e: unknown): void;
+  settled: boolean;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (v: T) => void;
+  let reject!: (e: unknown) => void;
+  const d = {} as Deferred<T>;
+  d.settled = false;
+  d.promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  d.resolve = (v) => {
+    if (d.settled) return;
+    d.settled = true;
+    resolve(v);
+  };
+  d.reject = (e) => {
+    if (d.settled) return;
+    d.settled = true;
+    reject(e);
+  };
+  return d;
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms).unref?.());
+
+/** `p`, or undefined after `ms`; a rejection arriving after the timeout is swallowed (never unhandled). */
+async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
+  let timer: NodeJS.Timeout | undefined;
+  p.catch(() => undefined);
+  try {
+    return await Promise.race([p, new Promise<undefined>((r) => (timer = setTimeout(() => r(undefined), ms)))]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
+
+function errMessage(e: unknown): string {
+  if (e instanceof Error) return e.message || e.name;
+  return String(e);
+}
+
+const sessionNotFound = (): RpcError => internalError('Session not found');
+
+/** Per-turn bookkeeping. */
+class TurnCtx {
+  readonly abort = new AbortController();
+  cancelled = false;
+  detached = false;
+  rawResult: Record<string, unknown> | undefined;
+  assistantError: string | undefined;
+  rateLimit: { status: string; rateLimitType?: string } | undefined;
+  /** Auto-compaction finished but the summary has not been seen yet. */
+  compactionPending = false;
+  compactionSummary: string | undefined;
+  compactionStarted = false;
+  readonly startedAt = Date.now();
+  cancelTimer: NodeJS.Timeout | undefined;
+  readonly cancelGrace = deferred<void>();
+  /** Tool boundaries (`tool_end` / `tool_denied` ids) seen on the session's live `'event'` stream. */
+  readonly liveBoundaries = new Set<string>();
+  /** Steers written at a live tool boundary, announced once the generator reaches that boundary. */
+  readonly liveInjected = new Map<string, { id: string; text: string }>();
+}
+
+/** One ACP session (see module doc). */
+class AcpSessionState {
+  ready: Promise<void> = Promise.resolve();
+  startError: unknown;
+  turn: TurnCtx | undefined;
+  closed = false;
+  steers: { id: string; text: string }[] = [];
+  readonly tools = new Map<string, ToolDescriptor>();
+  readonly finalized = new Set<string>();
+  readonly denied = new Map<string, string>();
+  readonly parentOf = new Map<string, string>();
+  readonly subagents = new Map<string, { id: string; name: string; status: string }>();
+  readonly mcpReported = new Set<string>();
+  todos: TodoItem[] = [];
+  manualCompaction = false;
+  /**
+   * Bumped by every `session/cancel`: a prompt that was received before the bump and has not
+   * started its turn yet (queued behind another prompt, or waiting for the child to start) is
+   * answered `cancelled` without running (05 §4.6, 08 KC-ACP-07).
+   */
+  cancelEpoch = 0;
+  /** JSON-RPC id of the `session/prompt` whose job is running (for `$/cancel_request`). */
+  activePrompt: string | number | undefined;
+  /** Listener on the session's synchronous `'event'` stream (see {@link AcpServer.onLiveEvent}). */
+  liveListener: ((ev: SessionEvent) => void) | undefined;
+  private queue: Promise<unknown> = Promise.resolve();
+
+  constructor(
+    readonly id: string,
+    readonly session: KiroSession,
+    readonly ws: WorkspaceContext,
+  ) {}
+
+  /** Run `job` after every earlier queued job (errors do not break the chain). */
+  enqueue<T>(job: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(job, job);
+    this.queue = run.catch(() => undefined);
+    return run;
+  }
+
+  /** Await `start()`; a failed start is reported to every later operation. */
+  async whenReady(): Promise<void> {
+    try {
+      await this.ready;
+    } catch (e) {
+      throw internalError(`Failed to start the session: ${errMessage(e)}`);
+    }
+  }
+}
+
+/** The ACP server (see module doc). */
+export class AcpServer {
+  readonly conn: JsonRpcConnection;
+  private readonly ctx: CliContext;
+  private readonly flags: AcpFlags;
+  private readonly factory: SessionFactory;
+  private readonly log: Logger;
+  private readonly timings: AcpServerTimings;
+  private readonly env: NodeJS.ProcessEnv;
+  private readonly sessions = new Map<string, AcpSessionState>();
+  /** In-flight `session/prompt` request id ⇒ session id (for `$/cancel_request`). */
+  private readonly promptRequests = new Map<string | number, string>();
+  private clientInfo: Record<string, unknown> | undefined;
+  private clientCapabilities: Record<string, unknown> | undefined;
+  private stopping = false;
+  /** `session/load`s still creating their session, by id (a second load waits and re-attaches). */
+  private readonly loading = new Map<string, Promise<unknown>>();
+  /** Session closes still running (awaited by {@link serve} before it returns). */
+  private readonly closing = new Set<Promise<void>>();
+
+  constructor(opts: AcpServerOptions) {
+    this.ctx = opts.ctx;
+    this.flags = { trustAllTools: false, trustTools: [], login: false, verbose: 0, help: false, ...opts.flags };
+    this.factory = opts.createSession ?? defaultSessionFactory;
+    this.timings = { ...DEFAULT_TIMINGS, ...opts.timings };
+    this.env = { ...opts.ctx.ws.env };
+    // never forwarded to Claude children (08 KC-ENV-01)
+    delete this.env.KIRO_API_KEY;
+    this.log =
+      opts.logger ??
+      createLogger({
+        env: opts.ctx.ws.env,
+        level: parseLogLevel(opts.ctx.ws.env.KIRO_LOG_LEVEL) ?? levelFromVerbosity((opts.ctx.verbosity ?? 0) + this.flags.verbose),
+      });
+    this.conn = new JsonRpcConnection({
+      input: opts.input ?? opts.ctx.stdin,
+      output: opts.output ?? opts.ctx.stdout,
+      onRequest: (m, p, c) => this.onRequest(m, p, c),
+      onNotification: (m, p) => this.onNotification(m, p),
+      logger: this.log,
+    });
+  }
+
+  /** `initialize.clientCapabilities` of the connected client (fs/terminal are never used, 05 §6.2). */
+  get client(): { info?: Record<string, unknown>; capabilities?: Record<string, unknown> } {
+    return { ...(this.clientInfo ? { info: this.clientInfo } : {}), ...(this.clientCapabilities ? { capabilities: this.clientCapabilities } : {}) };
+  }
+
+  /** Live ACP session ids. */
+  get sessionIds(): string[] {
+    return [...this.sessions.keys()];
+  }
+
+  /** Serve until the input ends (or {@link stop}), then shut every session down. */
+  async serve(): Promise<void> {
+    this.log.info(`acp: kiro-claude ${KIRO_CLAUDE_VERSION} serving (agent=${this.flags.agent ?? '-'}, client app=${this.env.KIRO_CLI_CLIENT_APPLICATION ?? '-'})`);
+    if (this.flags.authMethod) this.log.info(`acp: --auth-method ${this.flags.authMethod} ignored (Claude Code owns authentication)`);
+    if (this.flags.agentEngine) this.log.debug(`acp: --agent-engine ${this.flags.agentEngine} accepted (single engine)`);
+    this.warnAboutSandbox();
+    await this.conn.start();
+    await this.shutdown();
+    // let cancelled prompts and other in-flight requests write their answers (stdout may still be read)
+    const end = Date.now() + 2000;
+    while (!this.conn.closed && this.conn.inFlightRequestIds.length > 0 && Date.now() < end) await sleep(10);
+    this.conn.close();
+    // sessions that finished creating after shutdown began are closed by their handlers
+    while (this.closing.size > 0) await Promise.allSettled([...this.closing]);
+  }
+
+  /** Stop serving (signal handlers): closes the connection; {@link serve} then shuts down. */
+  stop(): void {
+    this.conn.close();
+  }
+
+  /** Cancel turns and close every session (≤ closeTimeoutMs each, in parallel). */
+  async shutdown(): Promise<void> {
+    if (this.stopping) return;
+    this.stopping = true;
+    const all = [...this.sessions.values()];
+    this.sessions.clear();
+    await Promise.allSettled(all.map((st) => this.closeSession(st)));
+  }
+
+  /**
+   * A session finished creating while the server is shutting down (stdin EOF / SIGTERM during
+   * `session/new|load`): close it (child, lock) instead of registering it, and fail the request.
+   */
+  private async discardLate(session: KiroSession): Promise<never> {
+    const p = (async () => {
+      try {
+        await withTimeout(session.close(), this.timings.closeTimeoutMs);
+      } catch (e) {
+        this.log.warn('acp: closing a late session failed:', e);
+      }
+    })();
+    this.closing.add(p);
+    try {
+      await p;
+    } finally {
+      this.closing.delete(p);
+    }
+    throw internalError('Server is shutting down');
+  }
+
+  private warnAboutSandbox(): void {
+    // 05 §2.6: KiroCrew skips its own sandbox when kiro-cli claims an internal one.
+    try {
+      const p = path.join(this.ctx.ws.kiroHome, 'settings', 'amazon-internal.json');
+      const v = JSON.parse(fs.readFileSync(p, 'utf8')) as unknown;
+      if (isObj(v) && v.sandbox === true) {
+        const msg = `kiro-claude acp: warning: ${p} sets "sandbox": true, but kiro-claude has no internal sandbox; KiroCrew may skip its own sandbox for this backend.\n`;
+        this.ctx.stderr.write(msg);
+        this.log.warn(msg.trim());
+      }
+    } catch {
+      // absent / unreadable: nothing to warn about
+    }
+  }
+
+  // ───────────── dispatch ─────────────
+
+  private onRequest(method: string, params: unknown, rc: RequestContext): unknown {
+    const p = isObj(params) ? params : {};
+    this.log.debug(`acp: ← ${method}`);
+    switch (method) {
+      case 'initialize':
+        return this.initialize(p);
+      case 'authenticate':
+        return {};
+      case 'session/new':
+        return this.sessionNew(p);
+      case 'session/load':
+        return this.sessionLoad(p);
+      case 'session/prompt':
+        return this.sessionPrompt(p, rc);
+      case 'session/cancel':
+        this.cancel(str(p.sessionId));
+        return {};
+      case 'session/set_mode':
+        return this.setMode(p);
+      case 'session/set_model':
+        return this.setModel(p);
+      case 'session/set_config_option':
+        return this.setConfigOption(p);
+      case 'session/list':
+        return this.sessionList(p);
+      case 'session/close':
+      case '_kiro.dev/session/terminate':
+      case '_session/terminate':
+        return this.terminate(str(p.sessionId));
+      case '_kiro.dev/commands/execute':
+        return this.commandsExecute(p);
+      case '_kiro.dev/commands/options':
+        return this.commandsOptions(p);
+      case '_session/steer':
+        return this.steer(p);
+      case '_session/steer/clear':
+        return this.steerClear(p);
+      default:
+        throw methodNotFound(method);
+    }
+  }
+
+  private onNotification(method: string, params: unknown): void {
+    const p = isObj(params) ? params : {};
+    switch (method) {
+      case 'session/cancel':
+        this.cancel(str(p.sessionId));
+        return;
+      case '$/cancel_request': {
+        // A queued prompt is cancelled through its request signal (aborted by the transport);
+        // only the running one needs its turn interrupted (05 §4.14).
+        const rid = p.requestId;
+        if (typeof rid === 'string' || typeof rid === 'number') {
+          const sid = this.promptRequests.get(rid);
+          const st = sid !== undefined ? this.sessions.get(sid) : undefined;
+          if (st && st.activePrompt === rid) this.cancelTurn(st);
+        }
+        return;
+      }
+      case '_session/terminate':
+        void this.terminate(str(p.sessionId));
+        return;
+      default:
+        this.log.debug(`acp: ignored notification ${method}`);
+    }
+  }
+
+  private update(sessionId: string, update: Record<string, unknown>): void {
+    this.conn.notify('session/update', { sessionId, update });
+  }
+
+  private kiroUpdate(sessionId: string, update: Record<string, unknown>): void {
+    this.conn.notify('_kiro.dev/session/update', { sessionId, update });
+  }
+
+  private getSession(sessionId: unknown): AcpSessionState {
+    const id = str(sessionId);
+    const st = id !== undefined ? this.sessions.get(id) : undefined;
+    if (!st || st.closed) throw sessionNotFound();
+    return st;
+  }
+
+  // ───────────── initialize ─────────────
+
+  /** 05 §4.1 as corrected by 08 KC-ACP-01 (static, fast; `agentInfo.version` = compat version). */
+  private initialize(p: Record<string, unknown>): Record<string, unknown> {
+    if (isObj(p.clientInfo)) this.clientInfo = p.clientInfo;
+    if (isObj(p.clientCapabilities)) this.clientCapabilities = p.clientCapabilities;
+    this.log.info(`acp: initialize from ${str(this.clientInfo?.name) ?? 'unknown client'} (protocolVersion ${JSON.stringify(p.protocolVersion)})`);
+    return {
+      protocolVersion: 1,
+      agentCapabilities: {
+        loadSession: true,
+        promptCapabilities: { image: true, audio: false, embeddedContext: true },
+        mcpCapabilities: { http: true, sse: true },
+        sessionCapabilities: { list: {}, close: {} },
+      },
+      authMethods: [],
+      agentInfo: { name: 'kiro-claude', title: `kiro-claude ${KIRO_CLAUDE_VERSION} (Claude Code)`, version: KIRO_CLI_COMPAT_VERSION },
+    };
+  }
+
+  // ───────────── session creation ─────────────
+
+  private sessionWs(cwd: unknown): WorkspaceContext {
+    if (typeof cwd !== 'string' || cwd === '' || !path.isAbsolute(cwd)) throw invalidParams('cwd must be an absolute path');
+    try {
+      if (!fs.statSync(cwd).isDirectory()) throw invalidParams(`cwd is not a directory: ${cwd}`);
+    } catch (e) {
+      if (e instanceof RpcError) throw e;
+      throw invalidParams(`cwd does not exist: ${cwd}`);
+    }
+    return createWorkspaceContext(cwd, this.env);
+  }
+
+  /**
+   * Resolve the agent for a new/loaded session: the requested one (process `--agent`, V3
+   * `_meta.kiro.modeId`, or the stored agent) must exist — a missing or broken spec is an error
+   * naming the file, never a silent fallback (08 KC-ACP-02, Guard A2) — else `chat.defaultAgent`,
+   * else `kiro_default`.
+   */
+  private resolveAgent(ws: WorkspaceContext, requested: string | undefined): { name: string; loaded: LoadAgentsResult } {
+    const settings = openSettings(ws);
+    const loaded = loadAgents(ws, { settings });
+    if (requested) {
+      if (loaded.agents.has(requested)) return { name: requested, loaded };
+      const failed = loaded.failed.get(requested);
+      if (failed) {
+        throw internalError(`Failed to load agent '${requested}'${failed.path ? ` from ${failed.path}` : ''}: ${failed.message}`);
+      }
+      const dirs = agentDirs(ws);
+      throw internalError(
+        `Agent '${requested}' not found: no ${path.join(dirs.workspace, `${requested}.json`)} or ${path.join(dirs.global, `${requested}.json`)} (or .md)`,
+      );
+    }
+    const sel = selectAgent(ws, loaded.agents, settings, undefined);
+    return { name: sel.agent.name, loaded };
+  }
+
+  private makeUi(holder: { st?: AcpSessionState }): SessionUI {
+    return {
+      requestApproval: (req, signal) => this.requestApproval(holder.st, req, signal),
+      notice: (level, message) => {
+        if (level === 'error') this.log.error(`acp[${holder.st?.id ?? '-'}]: ${message}`);
+        else if (level === 'warn') this.log.warn(`acp[${holder.st?.id ?? '-'}]: ${message}`);
+        else this.log.info(`acp[${holder.st?.id ?? '-'}]: ${message}`);
+      },
+    };
+  }
+
+  private baseSessionOptions(ws: WorkspaceContext, ui: SessionUI, p: Record<string, unknown>): KiroSessionOptions {
+    const o: KiroSessionOptions = { ws, origin: 'acp', interactive: true, ui, env: this.env };
+    if (this.flags.trustAllTools) o.trustAllTools = true;
+    if (this.flags.trustTools.length) o.trustTools = [...this.flags.trustTools];
+    if (Array.isArray(p.additionalDirectories)) {
+      const dirs = p.additionalDirectories.filter((d): d is string => typeof d === 'string' && path.isAbsolute(d));
+      if (dirs.length) o.additionalDirectories = dirs;
+    }
+    return o;
+  }
+
+  private async listModels(st: AcpSessionState): Promise<ModelEntry[]> {
+    try {
+      const m = await withTimeout(st.session.listModels(), 3000);
+      if (m && m.length) return m;
+    } catch (e) {
+      this.log.debug('acp: listModels failed:', e);
+    }
+    return buildModelList();
+  }
+
+  private async sessionState(st: AcpSessionState, agents?: Iterable<KiroAgent>): Promise<Record<string, unknown>> {
+    const list = agents ?? loadAgents(st.ws, { settings: openSettings(st.ws) }).agents.values();
+    const entries = await this.listModels(st);
+    return {
+      modes: modeState(list, st.session.agent.name),
+      models: modelState(entries, st.session.model),
+      configOptions: configOptions(entries, st.session.model, st.session.effort),
+    };
+  }
+
+  /** `session/new` (05 §4.3, 08 KC-ACP-02). */
+  private async sessionNew(p: Record<string, unknown>): Promise<unknown> {
+    const ws = this.sessionWs(p.cwd);
+    const { servers, warnings } = acpMcpServersToConfigs(p.mcpServers);
+    for (const w of warnings) this.log.warn(`acp: ${w}`);
+    const kmeta = isObj(p._meta) && isObj(p._meta.kiro) ? p._meta.kiro : {};
+    const { name, loaded } = this.resolveAgent(ws, str(kmeta.modeId) ?? this.flags.agent);
+    const holder: { st?: AcpSessionState } = {};
+    const opts = this.baseSessionOptions(ws, this.makeUi(holder), p);
+    opts.agentName = name;
+    const model = str(kmeta.modelId) ?? this.flags.model;
+    if (model) opts.model = model;
+    const effort = normalizeEffort(str(kmeta.effortLevel)) ?? this.flags.effort;
+    if (effort) opts.effort = effort;
+    if (servers.length) opts.extraMcpServers = servers;
+    let session: KiroSession;
+    try {
+      session = await this.factory(opts);
+    } catch (e) {
+      if (e instanceof RpcError) throw e;
+      throw internalError(errMessage(e));
+    }
+    if (this.stopping) return this.discardLate(session);
+    const st = new AcpSessionState(session.id, session, ws);
+    holder.st = st;
+    this.attachLive(st);
+    this.sessions.set(st.id, st);
+    // eager spawn (08 KC-ACP-02): the child starts while we answer
+    st.ready = session.start();
+    st.ready.catch((e) => {
+      st.startError = e;
+      this.log.error(`acp[${st.id}]: start failed:`, e);
+    });
+    const state = await this.sessionState(st, loaded.agents.values());
+    this.log.info(`acp: session/new ${st.id} agent=${st.session.agent.name} cwd=${ws.cwd}`);
+    return respondThen({ sessionId: st.id, ...state }, () => this.afterSessionStart(st, 0));
+  }
+
+  /** After `session/new|load`: MCP reports, `_kiro.dev/metadata`, available commands (08b §4.4). */
+  private async afterSessionStart(st: AcpSessionState, pct: number | undefined): Promise<void> {
+    try {
+      await st.ready;
+    } catch {
+      return;
+    }
+    if (st.closed) return;
+    await this.reportMcp(st);
+    if (st.closed) return;
+    let percent = pct;
+    if (percent === undefined) percent = (await this.contextNumbers(st)).pct ?? 0;
+    this.conn.notify('_kiro.dev/metadata', { sessionId: st.id, contextUsagePercentage: percent });
+    this.update(st.id, availableCommandsUpdate(loadPrompts(st.ws)));
+  }
+
+  /**
+   * `_kiro.dev/mcp/server_initialized` / `server_init_failure` once per server as soon as
+   * Claude reports it connected / failed (08 KC-ACP-04); polls while servers are pending.
+   */
+  private async reportMcp(st: AcpSessionState): Promise<McpStatusEntry[]> {
+    const deadline = Date.now() + this.timings.mcpWaitMs;
+    let last: McpStatusEntry[] = [];
+    for (;;) {
+      if (st.closed) return last;
+      try {
+        last = await st.session.mcpStatus();
+      } catch (e) {
+        this.log.debug('acp: mcpStatus failed:', e);
+        return last;
+      }
+      let pending = false;
+      for (const s of last) {
+        const k = kiroMcpStatus(s.status);
+        if (k === 'loading') {
+          pending = true;
+          continue;
+        }
+        if (st.mcpReported.has(s.name) || k === 'disabled') continue;
+        st.mcpReported.add(s.name);
+        if (k === 'running') this.conn.notify('_kiro.dev/mcp/server_initialized', { sessionId: st.id, serverName: s.name });
+        else {
+          const error = s.error ?? (s.status === 'needs-auth' ? 'needs authentication; run `claude mcp` to authenticate' : `status: ${s.status}`);
+          this.conn.notify('_kiro.dev/mcp/server_init_failure', { sessionId: st.id, serverName: s.name, error });
+        }
+      }
+      if (!pending || Date.now() >= deadline) return last;
+      await sleep(this.timings.mcpPollMs);
+    }
+  }
+
+  /**
+   * `session/load` (05 §4.4, 08 KC-ACP-10): replay, then respond with modes/models. A load of a
+   * session that is live in this process re-attaches (no new child, still replays); a load that
+   * arrives while another load of the same id is still starting waits for it and re-attaches,
+   * so one ACP session id never gets two `claude` children.
+   */
+  private async sessionLoad(p: Record<string, unknown>): Promise<unknown> {
+    const sessionId = str(p.sessionId);
+    if (!sessionId) throw invalidParams('sessionId is required');
+    const ws = this.sessionWs(p.cwd);
+    const inflight = this.loading.get(sessionId);
+    if (inflight) await inflight.catch(() => undefined);
+    const live = this.sessions.get(sessionId);
+    if (live && !live.closed) {
+      return live.enqueue(async () => {
+        if (live.closed) throw sessionNotFound();
+        await live.whenReady();
+        this.replay(live, live.session.claudeSessionId ?? live.session.record.claudeSessionId);
+        const state = await this.sessionState(live);
+        return respondThen(state, () => this.afterSessionStart(live, undefined));
+      });
+    }
+    if (!isSafeSessionId(sessionId)) throw internalError('Session not found');
+    const job = this.loadFresh(sessionId, ws, p);
+    this.loading.set(sessionId, job);
+    try {
+      return await job;
+    } finally {
+      if (this.loading.get(sessionId) === job) this.loading.delete(sessionId);
+    }
+  }
+
+  private async loadFresh(sessionId: string, ws: WorkspaceContext, p: Record<string, unknown>): Promise<unknown> {
+    const dir = sessionsDir(ws);
+    const rec = new SessionStore(dir).read(sessionId);
+    if (!rec) throw internalError('Session not found');
+    const { servers, warnings } = acpMcpServersToConfigs(p.mcpServers);
+    for (const w of warnings) this.log.warn(`acp: ${w}`);
+    // the process --agent wins (KiroCrew's Guard A2 compares currentModeId with it); else the stored agent
+    const { name, loaded } = this.resolveAgent(ws, this.flags.agent ?? (rec.agent || undefined));
+    const holder: { st?: AcpSessionState } = {};
+    const opts = this.baseSessionOptions(ws, this.makeUi(holder), p);
+    opts.agentName = name;
+    opts.resume = { sessionId };
+    if (rec.model) opts.model = rec.model;
+    if (rec.effort) opts.effort = rec.effort;
+    if (!opts.additionalDirectories && rec.additionalDirectories.length) opts.additionalDirectories = [...rec.additionalDirectories];
+    if (servers.length) opts.extraMcpServers = servers;
+    let session: KiroSession;
+    try {
+      session = await this.factory(opts);
+    } catch (e) {
+      if (e instanceof RpcError) throw e;
+      throw internalError(errMessage(e));
+    }
+    if (this.stopping) return this.discardLate(session);
+    if (session.id !== sessionId) this.log.warn(`acp: session/load ${sessionId}: the session module answered id ${session.id}; keeping the client's id`);
+    const st = new AcpSessionState(sessionId, session, ws);
+    holder.st = st;
+    this.attachLive(st);
+    st.ready = session.start();
+    try {
+      await st.ready;
+    } catch (e) {
+      // e.g. "Session is active in another process" — KiroCrew retries on that text
+      if (st.liveListener) session.off('event', st.liveListener);
+      try {
+        await withTimeout(session.close(), this.timings.closeTimeoutMs);
+      } catch {
+        // ignore
+      }
+      throw internalError(errMessage(e));
+    }
+    if (this.stopping) {
+      if (st.liveListener) session.off('event', st.liveListener);
+      return this.discardLate(session);
+    }
+    this.sessions.set(st.id, st);
+    this.replay(st, session.claudeSessionId ?? rec.claudeSessionId);
+    const state = await this.sessionState(st, loaded.agents.values());
+    this.log.info(`acp: session/load ${st.id} agent=${st.session.agent.name}`);
+    return respondThen(state, () => this.afterSessionStart(st, undefined));
+  }
+
+  private replay(st: AcpSessionState, claudeSessionId: string | undefined): void {
+    const { updates, source } = buildReplay({
+      sessionsDir: sessionsDir(st.ws),
+      sessionId: st.id,
+      ...(claudeSessionId ? { claudeSessionId } : {}),
+      cwd: st.ws.cwd,
+      env: this.env,
+    });
+    this.log.debug(`acp: replaying ${updates.length} updates from ${source} for ${st.id}`);
+    for (const u of updates) this.update(st.id, u);
+  }
+
+  // ───────────── list / terminate ─────────────
+
+  /** `session/list` (05 §4.10, P2): our session index, newest first, 50 per page. */
+  private sessionList(p: Record<string, unknown>): Record<string, unknown> {
+    const store = new SessionStore(sessionsDir(this.ctx.ws));
+    const cwd = str(p.cwd);
+    const recs = store.list(cwd && path.isAbsolute(cwd) ? { cwd } : {});
+    const offset = Math.max(0, Number.parseInt(str(p.cursor) ?? '0', 10) || 0);
+    const page = recs.slice(offset, offset + 50);
+    const out: Record<string, unknown> = {
+      sessions: page.map((r) => ({ sessionId: r.sessionId, cwd: r.cwd, ...(r.title ? { title: r.title } : {}), updatedAt: r.updatedAt })),
+    };
+    if (offset + 50 < recs.length) out.nextCursor = String(offset + 50);
+    return out;
+  }
+
+  /** `_kiro.dev/session/terminate` (05 §4.11, 08 KC-ACP-09): evict, keep files, idempotent. */
+  private async terminate(sessionId: string | undefined): Promise<Record<string, unknown>> {
+    if (!sessionId) return {};
+    const st = this.sessions.get(sessionId);
+    if (!st) return {};
+    this.sessions.delete(sessionId);
+    await this.closeSession(st);
+    this.log.info(`acp: terminated ${sessionId}`);
+    return {};
+  }
+
+  private async closeSession(st: AcpSessionState): Promise<void> {
+    if (st.closed) return;
+    st.closed = true;
+    const turn = st.turn;
+    if (turn) {
+      turn.cancelled = true;
+      turn.abort.abort();
+      try {
+        await withTimeout(st.session.interrupt(), 1000);
+      } catch {
+        // ignore
+      }
+    }
+    st.steers = [];
+    try {
+      await withTimeout(st.session.close(), this.timings.closeTimeoutMs);
+    } catch (e) {
+      this.log.warn(`acp[${st.id}]: close failed:`, e);
+    }
+    if (st.liveListener) st.session.off('event', st.liveListener);
+  }
+
+  // ───────────── modes / models / config ─────────────
+
+  private async swapTo(st: AcpSessionState, modeId: string): Promise<void> {
+    const agents = loadAgents(st.ws, { settings: openSettings(st.ws) });
+    if (!agents.agents.has(modeId)) throw internalError(`Mode '${modeId}' not found`);
+    const switched = modeId !== st.session.agent.name;
+    if (switched) {
+      try {
+        await st.session.swapAgent(modeId);
+      } catch (e) {
+        throw internalError(`Failed to switch to agent '${modeId}': ${errMessage(e)}`);
+      }
+      st.mcpReported.clear();
+    }
+    this.update(st.id, { sessionUpdate: 'current_mode_update', currentModeId: st.session.agent.name });
+    if (switched) this.conn.notify('_kiro.dev/agent/switched', { sessionId: st.id, agentName: st.session.agent.name });
+  }
+
+  /** `session/set_mode` (05 §4.7, 08 KC-ACP-03). */
+  private setMode(p: Record<string, unknown>): Promise<unknown> {
+    const st = this.getSession(p.sessionId);
+    const modeId = str(p.modeId);
+    if (!modeId) throw invalidParams('modeId is required');
+    return st.enqueue(async () => {
+      if (st.closed) throw sessionNotFound();
+      await st.whenReady();
+      const before = st.session.agent.name;
+      await this.swapTo(st, modeId);
+      if (before === st.session.agent.name) return {};
+      return respondThen({}, async () => {
+        await this.reportMcp(st);
+        this.update(st.id, availableCommandsUpdate(loadPrompts(st.ws)));
+      });
+    });
+  }
+
+  private async applyModel(st: AcpSessionState, modelId: string): Promise<void> {
+    const entries = await this.listModels(st);
+    const id = resolveModelId(entries, modelId);
+    if (!id) throw invalidModelError(modelId);
+    try {
+      await st.session.setModel(id);
+    } catch (e) {
+      throw new RpcError(-32602, `Invalid model ID: ${modelId}`, errMessage(e));
+    }
+    this.update(st.id, { sessionUpdate: 'config_option_update', configOptions: configOptions(entries, st.session.model, st.session.effort) });
+  }
+
+  private async applyEffort(st: AcpSessionState, level: string): Promise<void> {
+    await st.session.setEffort(level);
+    const entries = await this.listModels(st);
+    this.update(st.id, { sessionUpdate: 'config_option_update', configOptions: configOptions(entries, st.session.model, st.session.effort ?? level) });
+  }
+
+  /** `session/set_model` (05 §4.8, 08 KC-ACP-08). */
+  private setModel(p: Record<string, unknown>): Promise<unknown> {
+    const st = this.getSession(p.sessionId);
+    const modelId = str(p.modelId);
+    if (!modelId) throw invalidParams('modelId is required');
+    return st.enqueue(async () => {
+      if (st.closed) throw sessionNotFound();
+      await st.whenReady();
+      await this.applyModel(st, modelId);
+      return {};
+    });
+  }
+
+  /** `session/set_config_option` (05 §4.9). */
+  private setConfigOption(p: Record<string, unknown>): Promise<unknown> {
+    const st = this.getSession(p.sessionId);
+    const configId = str(p.configId);
+    if (!configId) throw invalidParams('configId is required');
+    return st.enqueue(async () => {
+      if (st.closed) throw sessionNotFound();
+      await st.whenReady();
+      const value = p.value;
+      switch (configId) {
+        case 'model':
+          if (typeof value !== 'string') throw invalidParams('model value must be a string');
+          await this.applyModel(st, value);
+          break;
+        case 'effortLevel':
+        case 'effort':
+        case 'reasoning_effort':
+        case 'thought_level': {
+          const level = normalizeEffort(str(value));
+          if (!level) throw invalidParams(`Invalid effort level: ${String(value)}`);
+          await this.applyEffort(st, level);
+          break;
+        }
+        case 'mode':
+          if (typeof value !== 'string') throw invalidParams('mode value must be a string');
+          await this.swapTo(st, value);
+          break;
+        default:
+          throw invalidParams(`Unknown config option: ${configId}`);
+      }
+      const entries = await this.listModels(st);
+      return { configOptions: configOptions(entries, st.session.model, st.session.effort) };
+    });
+  }
+
+  // ───────────── commands ─────────────
+
+  /** `_kiro.dev/commands/execute` (05 §4.12, 08 KC-ACP-05). */
+  private commandsExecute(p: Record<string, unknown>): Promise<unknown> {
+    const st = this.getSession(p.sessionId);
+    const cmd = parseCommandParam(p.command);
+    if (!cmd) return Promise.resolve({ success: false, message: 'Unknown command: /' });
+    if (cmd.name === 'compact') {
+      const done = deferred<unknown>();
+      st.enqueue(async () => {
+        if (st.closed) throw sessionNotFound();
+        await st.whenReady();
+        const ok = await this.runCompaction(st, argString(cmd.args, 'value', 'instructions'), undefined);
+        done.resolve(ok ? { success: true, message: 'Conversation compacted' } : { success: false, message: 'Compaction failed' });
+      }).catch((e) => done.reject(e));
+      return done.promise;
+    }
+    return st.enqueue(async () => {
+      if (st.closed) throw sessionNotFound();
+      await st.whenReady();
+      return this.runCommand(st, cmd.name, cmd.args);
+    });
+  }
+
+  /** `_kiro.dev/commands/options` (P2; shape UNVERIFIED, 05 §4.12). */
+  private commandsOptions(p: Record<string, unknown>): Record<string, unknown> {
+    const st = this.getSession(p.sessionId);
+    const partial = (str(p.partial) ?? str(p.query) ?? '').replace(/^\//, '').toLowerCase();
+    const all = [...ACP_COMMANDS.map((c) => ({ name: c.name, description: c.description })), ...loadPrompts(st.ws).map((x) => ({ name: x.name, description: `Prompt: ${x.description ?? x.name}` }))];
+    return { options: all.filter((o) => o.name.toLowerCase().startsWith(partial)) };
+  }
+
+  private async waitForMcp(st: AcpSessionState): Promise<McpStatusEntry[]> {
+    return this.reportMcp(st);
+  }
+
+  /** Run a Kiro command against a session (queued by the caller). */
+  private async runCommand(st: AcpSessionState, name: string, args: Record<string, unknown>): Promise<CommandResult> {
+    const value = argString(args, 'value');
+    switch (name) {
+      case 'effort': {
+        const raw = argString(args, 'level', 'value', 'effort');
+        const level = normalizeEffort(raw);
+        if (!level) return invalidEffortResult(raw);
+        // a session refusal (e.g. a model without effort levels) is a command failure, not a
+        // JSON-RPC error (05 §4.12: commands answer {success:false} and never error)
+        try {
+          await this.applyEffort(st, level);
+        } catch (e) {
+          return { success: false, message: errMessage(e) };
+        }
+        return { success: true, message: `Effort set to ${level}` };
+      }
+      case 'clear':
+        try {
+          await st.session.clear();
+        } catch (e) {
+          return { success: false, message: errMessage(e) };
+        }
+        this.conn.notify('_kiro.dev/clear/status', { sessionId: st.id, status: 'completed' });
+        return { success: true, message: 'Conversation cleared' };
+      case 'model': {
+        const id = argString(args, 'value', 'model', 'modelId');
+        const entries = await this.listModels(st);
+        if (!id) {
+          const lines = entries.map((e) => `${e.kiroId === st.session.model ? '*' : ' '} ${e.kiroId}${e.displayName && e.kiroId !== 'auto' ? ` (${e.displayName})` : ''}`);
+          return { success: true, message: `Current model: ${st.session.model}\n${lines.join('\n')}`, data: { model: { id: st.session.model } } };
+        }
+        try {
+          await this.applyModel(st, id);
+        } catch (e) {
+          return { success: false, message: e instanceof RpcError ? e.message : errMessage(e) };
+        }
+        return { success: true, message: `Model set to ${st.session.model}`, data: { model: { id: st.session.model } } };
+      }
+      case 'agent': {
+        let target = argString(args, 'name', 'agent');
+        if (!target && value) {
+          const words = value.split(/\s+/);
+          if (words[0] === 'swap' || words[0] === 'set') target = words[1];
+          else if (words[0] !== 'list') target = words[0];
+        }
+        if (!target) {
+          const agents = [...loadAgents(st.ws, { settings: openSettings(st.ws) }).agents.keys()];
+          const lines = agents.map((a) => `${a === st.session.agent.name ? '*' : ' '} ${a}`);
+          return { success: true, message: lines.join('\n'), data: { agent: { name: st.session.agent.name } } };
+        }
+        try {
+          const before = st.session.agent.name;
+          await this.swapTo(st, target);
+          if (before !== st.session.agent.name) {
+            void this.reportMcp(st)
+              .then(() => this.update(st.id, availableCommandsUpdate(loadPrompts(st.ws))))
+              .catch((e) => this.log.debug('acp: post-swap report failed:', e));
+          }
+        } catch (e) {
+          return { success: false, message: e instanceof RpcError && typeof e.data === 'string' ? e.data : errMessage(e) };
+        }
+        return { success: true, message: `Agent changed to ${st.session.agent.name}`, data: { agent: { name: st.session.agent.name } } };
+      }
+      case 'mcp':
+        return mcpResult(await this.waitForMcp(st));
+      case 'tools':
+        await this.waitForMcp(st);
+        return toolsResult(st.session.toolListing());
+      case 'context':
+        try {
+          return { success: true, message: contextText(await st.session.contextReport()) };
+        } catch (e) {
+          return { success: false, message: errMessage(e) };
+        }
+      case 'usage':
+        try {
+          return { success: true, message: usageText(await st.session.usage()) };
+        } catch (e) {
+          return { success: false, message: errMessage(e) };
+        }
+      case 'help':
+        return { success: true, message: helpText(loadPrompts(st.ws)) };
+      default:
+        return { success: false, message: `Unknown command: /${name}` };
+    }
+  }
+
+  // ───────────── steering ─────────────
+
+  /** `_session/steer` (05 §4.13, 08 KC-ACP-17). */
+  private steer(p: Record<string, unknown>): unknown {
+    const st = this.getSession(p.sessionId);
+    let text = str(p.message);
+    if (text === undefined && Array.isArray(p.prompt)) text = promptToInput(p.prompt).input.text;
+    if (text === undefined && Array.isArray(p.content)) text = promptToInput(p.content).input.text;
+    if (!text || text.trim() === '' || !st.turn || st.turn.cancelled || st.manualCompaction) return { queued: false };
+    const id = `steer-${randomHex32()}`;
+    st.steers.push({ id, text });
+    const content = st.steers.map((s) => s.text).join('\n\n');
+    return respondThen({ queued: true }, () => {
+      this.kiroUpdate(st.id, { sessionUpdate: 'AgentExecutionUserMessageQueued', messageId: id, content });
+    });
+  }
+
+  /** `_session/steer/clear` (05 §4.13). */
+  private steerClear(p: Record<string, unknown>): unknown {
+    const st = this.getSession(p.sessionId);
+    const dropped = st.steers.map((s) => s.id);
+    st.steers = [];
+    if (dropped.length === 0) return { cleared: true };
+    return respondThen({ cleared: true }, () => {
+      this.kiroUpdate(st.id, { sessionUpdate: 'AgentExecutionUserMessageCleared', messageIds: dropped });
+    });
+  }
+
+  /**
+   * The session emits every event as `'event'` synchronously when the Claude frame arrives,
+   * while `prompt()` yields them later (the consumer lags behind the child). Held steers are
+   * therefore written at the LIVE tool boundary: Claude is still busy there (a model call always
+   * follows a tool result), so the session sends the line with priority `next` and Claude folds
+   * it into the running turn. Written later, the session would find Claude idle and hold the
+   * text for the next prompt instead (05 §4.13, 00 §2.5 steer row).
+   */
+  private attachLive(st: AcpSessionState): void {
+    const l = (ev: SessionEvent): void => {
+      try {
+        this.onLiveEvent(st, ev);
+      } catch (e) {
+        this.log.warn(`acp[${st.id}]: live event handling failed:`, e);
+      }
+    };
+    st.liveListener = l;
+    st.session.on('event', l);
+  }
+
+  private onLiveEvent(st: AcpSessionState, ev: SessionEvent): void {
+    const turn = st.turn;
+    if (!turn || turn.cancelled || turn.detached || st.closed || st.manualCompaction) return;
+    const id = ev.type === 'tool_end' ? ev.toolUseId : ev.type === 'tool_denied' ? ev.toolUseId : undefined;
+    if (!id) return;
+    turn.liveBoundaries.add(id);
+    if (st.steers.length === 0) return;
+    const batch = st.steers;
+    st.steers = [];
+    const text = batch.map((x) => x.text).join('\n\n');
+    try {
+      st.session.steer(text);
+    } catch (e) {
+      this.log.warn(`acp[${st.id}]: steer failed:`, e);
+      st.steers = [...batch, ...st.steers];
+      return;
+    }
+    turn.liveInjected.set(id, { id: batch[batch.length - 1]!.id, text });
+  }
+
+  /** At a tool boundary reached by the generator: announce a live injection, or inject now. */
+  private afterBoundary(st: AcpSessionState, turn: TurnCtx, toolUseId: string | undefined): void {
+    if (toolUseId && turn.liveBoundaries.has(toolUseId)) {
+      const inj = turn.liveInjected.get(toolUseId);
+      if (inj) {
+        turn.liveInjected.delete(toolUseId);
+        this.kiroUpdate(st.id, { sessionUpdate: 'AgentExecutionSteeringInjected', messageId: inj.id, content: inj.text });
+      }
+      return;
+    }
+    // sessions without a live event stream: inject at the generator's boundary
+    this.injectSteers(st);
+  }
+
+  /** Write held steers into the running turn (tool boundary); returns whether any were sent. */
+  private injectSteers(st: AcpSessionState): boolean {
+    if (st.steers.length === 0 || !st.turn || st.turn.cancelled) return false;
+    const batch = st.steers;
+    st.steers = [];
+    const text = batch.map((s) => s.text).join('\n\n');
+    try {
+      st.session.steer(text);
+    } catch (e) {
+      this.log.warn(`acp[${st.id}]: steer failed:`, e);
+      return false;
+    }
+    this.kiroUpdate(st.id, { sessionUpdate: 'AgentExecutionSteeringInjected', messageId: batch[batch.length - 1]!.id, content: text });
+    return true;
+  }
+
+  // ───────────── cancel ─────────────
+
+  /**
+   * `session/cancel` (05 §4.6): interrupt the running turn and cancel every prompt received
+   * before this point that has not started yet (see {@link AcpSessionState.cancelEpoch}).
+   */
+  private cancel(sessionId: string | undefined): void {
+    if (!sessionId) return;
+    const st = this.sessions.get(sessionId);
+    if (!st) return;
+    st.cancelEpoch++;
+    this.cancelTurn(st);
+  }
+
+  /** Interrupt the running turn (if any); the prompt then answers `cancelled`. */
+  private cancelTurn(st: AcpSessionState): void {
+    const turn = st.turn;
+    if (!turn || turn.cancelled) return;
+    turn.cancelled = true;
+    turn.abort.abort();
+    st.session.interrupt().catch((e) => this.log.warn(`acp[${st.id}]: interrupt failed:`, e));
+    turn.cancelTimer = setTimeout(() => turn.cancelGrace.resolve(), this.timings.cancelGraceMs);
+    turn.cancelTimer.unref?.();
+  }
+
+  // ───────────── permission bridge ─────────────
+
+  /** {@link SessionUI.requestApproval} for ACP sessions (05 §6.1). */
+  private async requestApproval(st: AcpSessionState | undefined, req: ApprovalRequest, signal: AbortSignal): Promise<ApprovalResponse> {
+    if (!st || st.closed) return { kind: 'cancelled' };
+    const toolUseId = req.call.toolUseId ?? req.requestId;
+    const d = this.ensureToolCall(st, req.call, toolUseId);
+    const trustOptions = trustOptionsFor(d, st.ws.cwd);
+    const params: Record<string, unknown> = {
+      sessionId: st.id,
+      toolCall: permissionToolCall(d),
+      options: KIRO_PERMISSION_OPTIONS.map((o) => ({ ...o })),
+      ...(trustOptions ? { _meta: { trustOptions } } : {}),
+    };
+    let answer: unknown;
+    try {
+      answer = await this.conn.request('session/request_permission', params, { signal }).promise;
+    } catch (e) {
+      if (signal.aborted || st.turn?.cancelled) {
+        st.denied.set(toolUseId, CANCELLED_TEXT);
+        return { kind: 'cancelled' };
+      }
+      this.log.warn(`acp[${st.id}]: permission request failed:`, e);
+      st.denied.set(toolUseId, 'Permission request failed');
+      return { kind: 'deny', message: 'Permission request failed' };
+    }
+    const outcome = isObj(answer) && isObj(answer.outcome) ? answer.outcome : undefined;
+    if (outcome?.outcome === 'cancelled') {
+      st.denied.set(toolUseId, CANCELLED_TEXT);
+      return { kind: 'cancelled' };
+    }
+    const optionId = outcome?.outcome === 'selected' ? str(outcome.optionId) : undefined;
+    switch (optionId) {
+      case 'allow_once':
+        this.update(st.id, inProgressUpdate(d));
+        return { kind: 'allow-once' };
+      case 'allow_always':
+        this.update(st.id, inProgressUpdate(d));
+        return { kind: 'allow-always' };
+      case 'reject_once':
+      case 'reject_always':
+        st.denied.set(toolUseId, USER_DENIED_TEXT);
+        return { kind: 'deny', message: USER_DENIED_TEXT };
+      default:
+        this.log.warn(`acp[${st.id}]: unexpected permission answer: ${JSON.stringify(answer)}`);
+        st.denied.set(toolUseId, 'Permission request failed');
+        return { kind: 'deny', message: 'Permission request failed' };
+    }
+  }
+
+  // ───────────── tool frames ─────────────
+
+  /**
+   * Emit the `tool_call` frame once per id. `readContent:false` (gate-denied calls) keeps the
+   * current text of a `Write` target out of the diff: a denied path's contents never leave the
+   * machine through the client (KiroCrew logs and relays tool frames).
+   */
+  private ensureToolCall(st: AcpSessionState, call: KiroToolCall, toolUseId: string, readContent = true): ToolDescriptor {
+    const have = st.tools.get(toolUseId);
+    if (have) return have;
+    const parent = st.parentOf.get(toolUseId);
+    const d = describeToolCall(call, { cwd: st.ws.cwd, toolCallId: toolUseId, fs: LIVE_FS, readContent, ...(parent ? { parentToolUseId: parent } : {}) });
+    st.tools.set(toolUseId, d);
+    this.update(st.id, toolCallUpdate(d));
+    return d;
+  }
+
+  private minimalDescriptor(st: AcpSessionState, toolUseId: string): ToolDescriptor {
+    const call = toKiroCall('tool', {}, { cwd: st.ws.cwd, toolUseId });
+    return this.ensureToolCall(st, call, toolUseId);
+  }
+
+  private finishTool(st: AcpSessionState, toolUseId: string, call: KiroToolCall | undefined, r: { isError: boolean; output: string; response?: unknown }): void {
+    if (st.finalized.has(toolUseId)) return;
+    const d = st.tools.get(toolUseId) ?? (call ? this.ensureToolCall(st, call, toolUseId) : this.minimalDescriptor(st, toolUseId));
+    st.finalized.add(toolUseId);
+    const denial = st.denied.get(toolUseId);
+    if (denial !== undefined && r.isError) {
+      this.update(st.id, deniedUpdate(d, denial));
+      return;
+    }
+    let todos: TodoItem[] | undefined;
+    if (d.family === 'todo') {
+      try {
+        todos = st.session.todos();
+      } catch {
+        todos = st.todos;
+      }
+      if (!todos || todos.length === 0) todos = st.todos;
+    }
+    for (const u of toolResultUpdates(d, { ...r, ...(todos ? { todos } : {}) })) this.update(st.id, u);
+  }
+
+  private onEvent(st: AcpSessionState, turn: TurnCtx, ev: SessionEvent): void {
+    if (turn.detached || st.closed) return;
+    switch (ev.type) {
+      case 'text_delta':
+        if (ev.text) this.update(st.id, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: ev.text } });
+        return;
+      case 'text':
+        if (ev.text) this.update(st.id, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: ev.text } });
+        return;
+      case 'thinking_delta':
+        if (ev.text) this.update(st.id, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: ev.text } });
+        return;
+      case 'tool_start':
+        this.ensureToolCall(st, ev.call, ev.toolUseId);
+        return;
+      case 'tool_denied': {
+        const id = ev.toolUseId ?? ev.call.toolUseId;
+        if (!id || st.finalized.has(id)) return;
+        const d = this.ensureToolCall(st, ev.call, id, false);
+        st.finalized.add(id);
+        this.update(st.id, deniedUpdate(d, st.denied.get(id) ?? (stripToolUseError(ev.reason) || USER_DENIED_TEXT)));
+        this.afterBoundary(st, turn, id);
+        return;
+      }
+      case 'tool_end':
+        this.finishTool(st, ev.toolUseId, ev.call, { isError: ev.isError, output: ev.output, response: ev.response });
+        this.afterBoundary(st, turn, ev.toolUseId);
+        return;
+      case 'todo_update':
+        st.todos = ev.todos.map((t) => ({ ...t }));
+        this.update(st.id, planUpdate(st.todos));
+        return;
+      case 'compaction':
+        if (st.manualCompaction) return;
+        if (ev.state === 'started') {
+          turn.compactionStarted = true;
+          this.conn.notify('_kiro.dev/compaction/status', { sessionId: st.id, status: { type: 'started' }, summary: null });
+        } else if (turn.compactionSummary !== undefined) {
+          this.finishAutoCompaction(st, turn);
+        } else {
+          turn.compactionPending = true;
+        }
+        return;
+      case 'subagent': {
+        const id = ev.toolUseId ?? `${ev.agentType}-${st.subagents.size + 1}`;
+        st.subagents.set(id, { id, name: ev.agentType, status: ev.state === 'started' ? 'running' : 'completed' });
+        this.conn.notify('_kiro.dev/subagent/list_update', { sessionId: st.id, subagents: [...st.subagents.values()] });
+        return;
+      }
+      case 'rate_limit':
+        turn.rateLimit = { status: ev.status, ...(turn.rateLimit?.rateLimitType ? { rateLimitType: turn.rateLimit.rateLimitType } : {}) };
+        return;
+      case 'notice':
+        this.log[ev.level === 'error' ? 'error' : ev.level === 'warn' ? 'warn' : 'info'](`acp[${st.id}]: ${ev.message}`);
+        return;
+      case 'raw':
+        this.onRaw(st, turn, ev.frame);
+        return;
+      default:
+        return;
+    }
+  }
+
+  private finishAutoCompaction(st: AcpSessionState, turn: TurnCtx): void {
+    turn.compactionPending = false;
+    turn.compactionStarted = false;
+    this.conn.notify('_kiro.dev/compaction/status', { sessionId: st.id, status: { type: 'completed' }, summary: turn.compactionSummary ?? '' });
+    turn.compactionSummary = undefined;
+  }
+
+  /** Raw Claude frames: result/usage hints, subagent tool frames, compaction summaries. */
+  private onRaw(st: AcpSessionState, turn: TurnCtx, frame: unknown): void {
+    if (!isObj(frame)) return;
+    switch (frame.type) {
+      case 'result':
+        turn.rawResult = frame;
+        return;
+      case 'rate_limit_event': {
+        const info = isObj(frame.rate_limit_info) ? frame.rate_limit_info : {};
+        const status = str(info.status) ?? turn.rateLimit?.status ?? 'unknown';
+        const type = str(info.rateLimitType);
+        turn.rateLimit = { status, ...(type ? { rateLimitType: type } : {}) };
+        return;
+      }
+      case 'assistant': {
+        if (typeof frame.error === 'string') turn.assistantError = frame.error;
+        const parent = str(frame.parent_tool_use_id);
+        const msg = isObj(frame.message) ? frame.message : undefined;
+        if (!parent || !msg || !Array.isArray(msg.content)) return;
+        // inner tool calls of a Claude subagent: reported under this (the parent) session (08 KC-ACP-21)
+        for (const b of msg.content.filter(isObj)) {
+          if (b.type !== 'tool_use' || typeof b.id !== 'string' || typeof b.name !== 'string') continue;
+          st.parentOf.set(b.id, parent);
+          const have = st.tools.get(b.id);
+          if (have) {
+            if (!have.parentToolUseId) {
+              have.parentToolUseId = parent;
+              this.update(st.id, { sessionUpdate: 'tool_call_update', toolCallId: b.id, _meta: toolMeta(have) });
+            }
+            continue;
+          }
+          const call = toKiroCall(b.name, isObj(b.input) ? b.input : {}, { cwd: st.ws.cwd, toolUseId: b.id });
+          this.ensureToolCall(st, call, b.id);
+        }
+        return;
+      }
+      case 'user': {
+        const msg = isObj(frame.message) ? frame.message : undefined;
+        if (!msg) return;
+        if (frame.isSynthetic === true && (turn.compactionStarted || turn.compactionPending || st.manualCompaction)) {
+          const text = typeof msg.content === 'string' ? msg.content : Array.isArray(msg.content) ? msg.content.filter(isObj).map((b) => (typeof b.text === 'string' ? b.text : '')).join('\n') : '';
+          if (text) {
+            turn.compactionSummary = extractSummary(text);
+            if (turn.compactionPending) this.finishAutoCompaction(st, turn);
+          }
+          return;
+        }
+        const parent = str(frame.parent_tool_use_id);
+        if (!parent || !Array.isArray(msg.content)) return;
+        for (const b of msg.content.filter(isObj)) {
+          if (b.type !== 'tool_result' || typeof b.tool_use_id !== 'string') continue;
+          if (!st.tools.has(b.tool_use_id) || st.finalized.has(b.tool_use_id)) continue;
+          let text = '';
+          if (typeof b.content === 'string') text = b.content;
+          else if (Array.isArray(b.content)) text = b.content.filter(isObj).map((x) => (typeof x.text === 'string' ? x.text : '')).join('\n');
+          this.finishTool(st, b.tool_use_id, undefined, { isError: b.is_error === true, output: text, ...(frame.tool_use_result !== undefined ? { response: frame.tool_use_result } : {}) });
+        }
+        return;
+      }
+      default:
+        return;
+    }
+  }
+
+  // ───────────── prompt ─────────────
+
+  /** `session/prompt` (05 §4.5, 08 KC-ACP-06). */
+  private sessionPrompt(p: Record<string, unknown>, rc: RequestContext): Promise<unknown> {
+    const st = this.getSession(p.sessionId);
+    const blocks = Array.isArray(p.prompt) ? p.prompt : Array.isArray(p.content) ? p.content : undefined;
+    if (!blocks) throw invalidParams('prompt must be an array of content blocks');
+    const { input, skipped } = promptToInput(blocks);
+    if (skipped.length) this.log.info(`acp[${st.id}]: skipped prompt content: ${skipped.join(', ')}`);
+    const done = deferred<unknown>();
+    this.promptRequests.set(rc.id, st.id);
+    const epoch = st.cancelEpoch;
+    const cancelledBeforeStart = (): boolean => st.cancelEpoch !== epoch || rc.signal.aborted;
+    st.enqueue(async () => {
+      if (st.closed) throw sessionNotFound();
+      if (cancelledBeforeStart()) return done.resolve({ stopReason: 'cancelled' });
+      st.activePrompt = rc.id;
+      try {
+        await st.whenReady();
+        // a cancel that arrived while the child was still starting
+        if (cancelledBeforeStart()) return done.resolve({ stopReason: 'cancelled' });
+        await this.handlePrompt(st, input, (r) => done.resolve(r));
+      } finally {
+        if (st.activePrompt === rc.id) st.activePrompt = undefined;
+      }
+    })
+      .catch((e) => done.reject(e))
+      .finally(() => {
+        this.promptRequests.delete(rc.id);
+        done.reject(internalError('prompt finished without a response'));
+      });
+    return done.promise;
+  }
+
+  private async handlePrompt(st: AcpSessionState, input: PromptInput, respond: (r: unknown) => void): Promise<void> {
+    const slash = input.images?.length ? undefined : parseSlashText(input.text);
+    if (slash) {
+      if (slash.name === 'compact') {
+        this.update(st.id, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Compacting conversation...\n' } });
+        await this.runCompaction(st, argString(slash.args, 'value'), respond);
+        return;
+      }
+      if (isAcpCommand(slash.name)) {
+        const res = await this.runCommand(st, slash.name, slash.args);
+        const text = res.message ?? (res.success ? 'Done.' : 'Failed.');
+        this.update(st.id, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: text.endsWith('\n') ? text : `${text}\n` } });
+        respond({ stopReason: 'end_turn' });
+        return;
+      }
+      const prompt = findPrompt(loadPrompts(st.ws), slash.name);
+      if (prompt) {
+        const inv = parsePromptInvocation(input.text);
+        input = { ...input, text: expandPrompt(prompt, 'args' in inv ? inv.args : []) };
+      }
+    }
+    if (input.text.trim() === '' && !input.images?.length) {
+      respond({ stopReason: 'end_turn' });
+      return;
+    }
+    await this.runTurn(st, input, respond);
+  }
+
+  private async drain(st: AcpSessionState, turn: TurnCtx, gen: AsyncGenerator<SessionEvent, TurnResult>): Promise<TurnResult> {
+    for (;;) {
+      const r = await gen.next();
+      if (r.done) return r.value;
+      try {
+        this.onEvent(st, turn, r.value);
+      } catch (e) {
+        this.log.warn(`acp[${st.id}]: event mapping failed:`, e);
+      }
+    }
+  }
+
+  private failOpenTools(st: AcpSessionState): void {
+    for (const [id, d] of st.tools) {
+      if (st.finalized.has(id)) continue;
+      st.finalized.add(id);
+      const denial = st.denied.get(id);
+      this.update(st.id, denial !== undefined ? deniedUpdate(d, denial) : abandonedUpdate(d));
+    }
+  }
+
+  private beginTurn(st: AcpSessionState): TurnCtx {
+    const turn = new TurnCtx();
+    st.turn = turn;
+    st.tools.clear();
+    st.finalized.clear();
+    st.denied.clear();
+    st.parentOf.clear();
+    return turn;
+  }
+
+  private endTurn(st: AcpSessionState, turn: TurnCtx): void {
+    if (turn.cancelTimer) clearTimeout(turn.cancelTimer);
+    if (st.turn === turn) st.turn = undefined;
+    // written live but their boundary never reached the generator (e.g. a detached turn)
+    for (const inj of turn.liveInjected.values()) {
+      if (!st.closed) this.kiroUpdate(st.id, { sessionUpdate: 'AgentExecutionSteeringInjected', messageId: inj.id, content: inj.text });
+    }
+    turn.liveInjected.clear();
+    this.dropSteers(st);
+  }
+
+  /** Steers never injected (cancelled / failed turn) are dropped and reported as cleared. */
+  private dropSteers(st: AcpSessionState): void {
+    if (st.steers.length === 0) return;
+    const ids = st.steers.map((x) => x.id);
+    st.steers = [];
+    if (!st.closed) this.kiroUpdate(st.id, { sessionUpdate: 'AgentExecutionUserMessageCleared', messageIds: ids });
+  }
+
+  /**
+   * One prompt turn (plus held-steer continuations); answers through `respond` (a
+   * `PromptResponse`) or throws the JSON-RPC error. Returns only when the turn is really over,
+   * so the session queue stays blocked even when a cancelled turn was answered early.
+   */
+  private async runTurn(st: AcpSessionState, input: PromptInput, respond: (r: unknown) => void): Promise<void> {
+    const turn = this.beginTurn(st);
+    let result: TurnResult | undefined;
+    let failure: unknown;
+    const work = (async (): Promise<TurnResult> => {
+      let r = await this.drain(st, turn, st.session.prompt(input, { signal: turn.abort.signal }));
+      while (!turn.cancelled && !st.closed && !r.isError && st.steers.length > 0) {
+        // steers still held at the end of the turn: continue inside this prompt request
+        const batch = st.steers;
+        st.steers = [];
+        const text = batch.map((s) => s.text).join('\n\n');
+        this.kiroUpdate(st.id, { sessionUpdate: 'AgentExecutionSteeringInjected', messageId: batch[batch.length - 1]!.id, content: text });
+        r = await this.drain(st, turn, st.session.prompt({ text, skipPromptHooks: true }, { signal: turn.abort.signal }));
+      }
+      return r;
+    })();
+    try {
+      const raced = await Promise.race([work, turn.cancelGrace.promise.then(() => undefined)]);
+      if (raced === undefined) {
+        // 05 §4.6 step 5: no result within the grace period after cancel — answer now
+        this.log.warn(`acp[${st.id}]: no result ${this.timings.cancelGraceMs} ms after cancel; answering cancelled`);
+        this.failOpenTools(st);
+        turn.detached = true;
+        respond({ stopReason: 'cancelled' });
+        await work.catch(() => undefined);
+        this.endTurn(st, turn);
+        return;
+      }
+      result = raced;
+    } catch (e) {
+      failure = e;
+    }
+    if (turn.compactionPending || (turn.compactionStarted && turn.compactionSummary !== undefined)) this.finishAutoCompaction(st, turn);
+    this.failOpenTools(st);
+    this.endTurn(st, turn);
+    if (st.closed || turn.cancelled) {
+      respond({ stopReason: 'cancelled' });
+      return;
+    }
+    if (failure !== undefined) {
+      if (failure instanceof RpcError) throw failure;
+      throw internalError(errMessage(failure));
+    }
+    const r = result!;
+    const stop = mapStopReason(r, turn.rawResult);
+    if (stop === undefined) {
+      throw turnErrorToRpc(r, {
+        ...(turn.rateLimit ? { rateLimit: turn.rateLimit } : {}),
+        ...(turn.assistantError ? { assistantError: turn.assistantError } : {}),
+        model: st.session.model,
+      });
+    }
+    if (stop === 'refusal') {
+      // 05 §5.3: before the prompt response
+      this.conn.notify('_kiro.dev/metadata', {
+        sessionId: st.id,
+        stopReason: 'CONTENT_FILTERED',
+        refusal: { category: 'OTHER', explanation: r.text || 'The model declined to respond.', recommendedModel: null },
+        modelId: st.session.model,
+      });
+    }
+    await this.emitTurnMetadata(st, turn, Date.now() - turn.startedAt);
+    const usage = promptUsage(r.usage);
+    respond({ stopReason: stop, ...(usage ? { usage } : {}) });
+  }
+
+  private async contextNumbers(st: AcpSessionState, raw?: Record<string, unknown>): Promise<{ pct?: number; used?: number; size?: number }> {
+    let pct: number | undefined;
+    let used: number | undefined;
+    let size: number | undefined;
+    try {
+      const u = await withTimeout(st.session.usage(), this.timings.usageTimeoutMs);
+      if (u) {
+        if (typeof u.contextPercent === 'number' && Number.isFinite(u.contextPercent)) pct = u.contextPercent;
+        if (typeof u.contextTokens === 'number') used = u.contextTokens;
+        if (typeof u.contextWindowTokens === 'number' && u.contextWindowTokens > 0) size = u.contextWindowTokens;
+      }
+    } catch (e) {
+      this.log.debug('acp: usage() failed:', e);
+    }
+    if (used === undefined || size === undefined) {
+      const c = contextFromResult(raw);
+      if (c) {
+        used ??= c.used;
+        size ??= c.size;
+      }
+    }
+    if (pct === undefined && used !== undefined && size) pct = (used / size) * 100;
+    return { ...(pct !== undefined ? { pct } : {}), ...(used !== undefined ? { used } : {}), ...(size !== undefined ? { size } : {}) };
+  }
+
+  /** `_kiro.dev/metadata` + `usage_update` after a turn (05 §5.3, §7.7; 08 KC-ACP-13/18). */
+  private async emitTurnMetadata(st: AcpSessionState, turn: TurnCtx, wallMs: number): Promise<void> {
+    const n = await this.contextNumbers(st, turn.rawResult);
+    const dur = typeof turn.rawResult?.duration_ms === 'number' ? turn.rawResult.duration_ms : wallMs;
+    const effort = st.session.effort;
+    this.conn.notify('_kiro.dev/metadata', {
+      sessionId: st.id,
+      contextUsagePercentage: n.pct ?? 0,
+      turnDurationMs: Math.round(dur),
+      // shape as captured from kiro-cli 2.35 (`support` spellings other than "unavailable" UNVERIFIED, 05 §11 item 7)
+      reasoning: { support: 'unavailable', ...(effort ? { effort } : {}), effortLevels: [...EFFORT_LEVELS] },
+    });
+    if (n.used !== undefined && n.size) this.update(st.id, { sessionUpdate: 'usage_update', used: n.used, size: n.size });
+  }
+
+  /**
+   * `/compact` (05 §4.5.4, 08 KC-ACP-14): with `respond` (prompt path) answer `end_turn` first,
+   * then `compaction/status` started → completed{summary} | failed, then `_kiro.dev/metadata`.
+   */
+  private async runCompaction(st: AcpSessionState, instructions: string | undefined, respond: ((r: unknown) => void) | undefined): Promise<boolean> {
+    if (respond) {
+      respond({ stopReason: 'end_turn' });
+      // the response is written from a promise callback: let it go out before the status frames
+      await new Promise<void>((r) => setImmediate(r));
+    }
+    this.conn.notify('_kiro.dev/compaction/status', { sessionId: st.id, status: { type: 'started' }, summary: null });
+    const turn = this.beginTurn(st);
+    st.manualCompaction = true;
+    let ok = false;
+    let reason = '';
+    try {
+      const r = await this.drain(st, turn, st.session.compact(instructions));
+      ok = !r.isError && r.stopReason !== 'cancelled' && !turn.cancelled;
+      if (!ok) reason = r.error || (turn.cancelled || r.stopReason === 'cancelled' ? 'Compaction cancelled' : 'Compaction failed');
+    } catch (e) {
+      reason = errMessage(e);
+    } finally {
+      st.manualCompaction = false;
+      this.failOpenTools(st);
+      this.endTurn(st, turn);
+    }
+    if (st.closed) return false;
+    if (ok) this.conn.notify('_kiro.dev/compaction/status', { sessionId: st.id, status: { type: 'completed' }, summary: turn.compactionSummary ?? '' });
+    else this.conn.notify('_kiro.dev/compaction/status', { sessionId: st.id, status: { type: 'failed' }, summary: reason });
+    const n = await this.contextNumbers(st, turn.rawResult);
+    this.conn.notify('_kiro.dev/metadata', { sessionId: st.id, contextUsagePercentage: n.pct ?? 0 });
+    return ok;
+  }
+}
+
+function randomHex32(): string {
+  let s = '';
+  for (let i = 0; i < 32; i++) s += Math.floor(Math.random() * 16).toString(16);
+  return s;
+}
+
+/** The summary part of Claude's synthetic compaction message. */
+export function extractSummary(text: string): string {
+  const i = text.indexOf('Summary:');
+  if (i >= 0 && i < 600) return text.slice(i + 'Summary:'.length).trim();
+  return text.trim();
+}
+
+// ───────────────────────────── subcommand ─────────────────────────────
+
+/** Extra knobs for tests (the CLI passes none). */
+export interface RunAcpOptions {
+  createSession?: SessionFactory;
+  timings?: Partial<AcpServerTimings>;
+  logger?: Logger;
+  /** Called with the server once it is serving. */
+  onServer?: (s: AcpServer) => void;
+}
+
+/** `kiro-claude acp …` with injectable dependencies (see {@link runAcpCommand}). */
+export async function runAcp(args: string[], ctx: CliContext, opts: RunAcpOptions = {}): Promise<number> {
+  const parsed = parseAcpFlags(args);
+  if (!parsed.ok) {
+    ctx.stderr.write(parsed.stderr);
+    return parsed.exitCode;
+  }
+  const flags = parsed.flags;
+  if (flags.help) {
+    ctx.stdout.write(ACP_HELP_TEXT);
+    return 0;
+  }
+  if (flags.login) {
+    try {
+      const bin = await findClaudeBinary({ env: ctx.ws.env });
+      return await runAuthCommand(bin, 'login', ['--claudeai'], buildChildEnv(ctx.ws.env));
+    } catch (e) {
+      ctx.stderr.write(`error: ${errMessage(e)}\n`);
+      return 1;
+    }
+  }
+  const server = new AcpServer({
+    ctx,
+    flags,
+    ...(opts.createSession ? { createSession: opts.createSession } : {}),
+    ...(opts.timings ? { timings: opts.timings } : {}),
+    ...(opts.logger ? { logger: opts.logger } : {}),
+  });
+  let exitCode = 0;
+  const realProcess = (ctx.stdin as unknown) === process.stdin;
+  const onTerm = (): void => {
+    exitCode = 143;
+    server.stop();
+  };
+  const onInt = (): void => {
+    exitCode = 130;
+    server.stop();
+  };
+  if (realProcess) {
+    process.once('SIGTERM', onTerm);
+    process.once('SIGINT', onInt);
+  }
+  opts.onServer?.(server);
+  try {
+    await server.serve();
+  } finally {
+    if (realProcess) {
+      process.removeListener('SIGTERM', onTerm);
+      process.removeListener('SIGINT', onInt);
+      // after SIGTERM the parent may keep our stdin open: release it so the process can exit (05 §2.5)
+      try {
+        process.stdin.destroy();
+      } catch {
+        // ignore
+      }
+    }
+  }
+  return exitCode;
+}
+
+/** `kiro-claude acp` (the fixed Wave-2 entry point used by cli/main.ts). */
+export const runAcpCommand: SubcommandRunner = (args, ctx) => runAcp(args, ctx);

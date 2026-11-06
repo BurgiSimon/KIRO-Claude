@@ -325,6 +325,25 @@ export class SessionStore {
     }
   }
 
+  /**
+   * The id a record file gives itself (our `sessionId` key) when it differs from its filename
+   * stem, i.e. the file is a copy made by someone else: KiroCrew's peer session transfer rewrites
+   * the kiro-cli envelope under a new sid filename but keeps our keys (08a §4.2). Undefined for
+   * our own files (and for missing / foreign / unsafe ones).
+   */
+  copiedFrom(id: string): string | undefined {
+    if (!isSafeSessionId(id)) return undefined;
+    const text = readText(path.join(this.dir, `${id}.json`));
+    if (text === undefined) return undefined;
+    try {
+      const raw = JSON.parse(text) as unknown;
+      if (!isObj(raw) || raw.kind !== SESSION_KIND) return undefined;
+      return typeof raw.sessionId === 'string' && raw.sessionId !== '' && raw.sessionId !== id ? raw.sessionId : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   private persist(rec: SessionRecord): void {
     this.ensureDir();
     writeJsonAtomic(this.pathFor(rec.sessionId), toDiskJson(rec), { mode: 0o600 });
