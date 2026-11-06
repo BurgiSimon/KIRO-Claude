@@ -4,7 +4,8 @@
  *
  * Subcommands: setup, doctor, start, stop, status, open, logs, exec, unstub, uninstall.
  * Flags follow 08 §3.3/§3.8, plus the aliases this task names: `setup --source <dir>` = `--dir`,
- * `setup --no-claude-acp` = `--members none`, `setup --remove-identity-stub` = `crew unstub`.
+ * `setup --no-claude-acp` = `--members none`, `setup --remove-identity-stub` = `crew unstub`, and
+ * the test-only `setup --kiro-bin <abs>` of the e2e plan (08 §5.0 stage A).
  * Exit codes: 0 ok, 1 failure, 2 usage error; `status`: 0 running and ready, 3 stopped, 4 running
  * but not ready; `open`: 3 when not running; `exec`: the child's exit code.
  *

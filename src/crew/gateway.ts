@@ -12,7 +12,11 @@
  * - stop: `kirocrew stop`, wait for the holder to go, SIGTERM then (after 10 s) SIGKILL the
  *   recorded pid if still alive, then reap orphaned `kiro-claude acp` processes whose environ has
  *   `KIROCREW_SPAWNED=1` and the same `HOME`; remove `run/token` (and `ready.json`, which holds the
- *   token too). Prints `Stopped (pid <n>); <k> orphan agent process(es) reaped`.
+ *   token too, and the token in `gateway.out`'s READY line). Prints `Stopped (pid <n>); <k> orphan
+ *   agent process(es) reaped`.
+ * - `--approval auto` is passed as KiroCrew's `yolo` (its choices are reads|yolo|interactive).
+ * - Every command uses one gateway env (context.gatewayEnvFor): a `--kiro-bin` given to the
+ *   start that launched the running gateway is used by exec/stop/status/doctor too.
  * - status: `gateway-pid` plus cookie-authenticated `/api/status`, `/api/kiro-prerequisite`,
  *   `/api/acp-backends`. Exit 0 running and ready, 3 stopped, 4 running but not ready.
  * - open: `kirocrew token --port <p> --ttl <ttl>` → open with `xdg-open`/`open` unless `--print`;
