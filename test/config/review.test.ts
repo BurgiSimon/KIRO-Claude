@@ -221,11 +221,14 @@ describe('review: settings value parsing (serde_json::from_str ∥ string)', () 
     assert.equal(s.get('chat.defaultModel'), 'w-model');
     assert.equal(s.get('chat.agentEngine'), 'v2');
     assert.throws(() => s.set('chat.agentEngine', 'v1', 'workspace'), /only be set globally/);
-    s.set('kiroClaude.allowApiKey', 'true', 'workspace');
-    assert.equal(s.pathFor('kiroClaude.allowApiKey', 'workspace'), path.join(fx.ws, '.kiro', 'settings', 'kiro-claude.json'));
-    assert.equal(s.getBoolean('kiroClaude.allowApiKey', false), true);
+    // launch keys are global-only; other adapter keys may be set per workspace
+    assert.throws(() => s.set('kiroClaude.allowApiKey', 'true', 'workspace'), /only be set globally/);
+    assert.equal(s.getBoolean('kiroClaude.allowApiKey', false), false);
+    s.set('kiroClaude.spec.maxParallelTasks', '2', 'workspace');
+    assert.equal(s.pathFor('kiroClaude.spec.maxParallelTasks', 'workspace'), path.join(fx.ws, '.kiro', 'settings', 'kiro-claude.json'));
+    assert.equal(s.getNumber('kiroClaude.spec.maxParallelTasks', 1), 2);
     const cli = JSON.parse(fs.readFileSync(path.join(fx.ws, '.kiro', 'settings', 'cli.json'), 'utf8')) as Record<string, unknown>;
-    assert.equal(cli['kiroClaude.allowApiKey'], undefined);
+    assert.equal(cli['kiroClaude.spec.maxParallelTasks'], undefined);
     assert.deepEqual(Object.keys(s.list()), [...Object.keys(s.list())].sort());
   });
 

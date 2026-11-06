@@ -144,17 +144,20 @@ describe('config/settings store', () => {
     fx.mkdir('proj/.kiro');
     const s = openSettings(fx.ctx());
     s.set('kiroClaude.allowApiKey', 'true');
-    s.set('kiroClaude.extraClaudeArgs', '["--debug"]', 'workspace');
+    s.set('kiroClaude.spec.defaultWorkflow', 'design-first', 'workspace');
+    // launch keys (claude argv/env/binary/credentials) are global-only
+    assert.throws(() => s.set('kiroClaude.extraClaudeArgs', '["--debug"]', 'workspace'), /only be set globally/);
     s.set('chat.defaultAgent', 'reviewer', 'workspace');
     assert.deepEqual(readJson(path.join(fx.kiroHome, 'settings', 'kiro-claude.json')), { 'kiroClaude.allowApiKey': true });
     assert.equal(fs.existsSync(path.join(fx.kiroHome, 'settings', 'cli.json')), false);
-    assert.deepEqual(readJson(path.join(fx.ws, '.kiro', 'settings', 'kiro-claude.json')), { 'kiroClaude.extraClaudeArgs': ['--debug'] });
+    assert.deepEqual(readJson(path.join(fx.ws, '.kiro', 'settings', 'kiro-claude.json')), { 'kiroClaude.spec.defaultWorkflow': 'design-first' });
     assert.deepEqual(readJson(path.join(fx.ws, '.kiro', 'settings', 'cli.json')), { 'chat.defaultAgent': 'reviewer' });
     assert.equal(s.getBoolean('kiroClaude.allowApiKey', false), true);
-    assert.deepEqual(s.get('kiroClaude.extraClaudeArgs'), ['--debug']);
+    assert.equal(s.get('kiroClaude.spec.defaultWorkflow'), 'design-first');
+    assert.deepEqual(s.get('kiroClaude.extraClaudeArgs'), undefined);
     assert.equal(s.pathFor('kiroClaude.x', 'global'), path.join(fx.kiroHome, 'settings', 'kiro-claude.json'));
     assert.equal(s.pathFor('chat.x', 'workspace'), path.join(fx.ws, '.kiro', 'settings', 'cli.json'));
-    assert.deepEqual(Object.keys(s.list()), ['chat.defaultAgent', 'kiroClaude.allowApiKey', 'kiroClaude.extraClaudeArgs']);
+    assert.deepEqual(Object.keys(s.list()), ['chat.defaultAgent', 'kiroClaude.allowApiKey', 'kiroClaude.spec.defaultWorkflow']);
   });
 
   it('a kiroClaude.* key hand-written in cli.json is read, and moved on set', () => {

@@ -61,7 +61,8 @@ export const WHOAMI_DEF: CommandDef = {
 
 /** The path we would run, for messages (`$KIRO_CLAUDE_BIN`, `kiroClaude.claudePath`, else `claude`). */
 export function configuredClaudePath(ctx: CliContext): string {
-  return ctx.settings.getString('kiroClaude.claudePath') || ctx.ws.env.KIRO_CLAUDE_BIN?.trim() || 'claude';
+  // same precedence as findClaudeBinary: $KIRO_CLAUDE_BIN > kiroClaude.claudePath > PATH
+  return ctx.ws.env.KIRO_CLAUDE_BIN?.trim() || ctx.settings.getString('kiroClaude.claudePath') || 'claude';
 }
 
 /** Locate `claude` with the session's discovery rules (claude/binary.ts). */

@@ -2,8 +2,9 @@
  * Adversarial checks of the hung-child-after-cancel fix (05 §4.6 step 5): the replacement must
  * also cover a stuck `/compact`, survive terminate / shutdown while it runs, keep the
  * queued-before-cancel semantics (08 KC-ACP-07), not depend on the old child ever closing, and
- * let a queued `session/load` re-attach on the replacement. Mock sessions, plus one run of the
- * REAL session module with test/fixtures/fake-claude.mjs (a `/compact` the child never ends).
+ * let a queued `session/load` re-attach on the replacement. Mock sessions, plus two runs of the
+ * REAL session module with test/fixtures/fake-claude.mjs (a cancelled `/compact` the child never
+ * ends ⇒ replaced; one it ends on the interrupt ⇒ no restart).
  */
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -277,4 +278,35 @@ test('stuck /compact with the real session module (fake claude ignores the inter
   assert.ok((starts().at(-1)!.argv as string[]).includes('--resume'), 'the replacement resumed the conversation');
   assert.equal(await c.close(20_000), 0);
   assert.deepEqual(c.nonJson, []);
+});
+
+test('a cancelled /compact the child does end (interrupt honoured) fails fast and keeps the same child', { skip, timeout: 60_000 }, async () => {
+  const t = tmpEnv({
+    FAKE_CLAUDE_SCRIPT_JSON: JSON.stringify({ turns: [{ repeat: true, match: 'PING', steps: [{ text: 'PONG' }] }] }),
+    FAKE_CLAUDE_PERSIST: '1',
+    FAKE_CLAUDE_COMPACT_MS: '120000',
+  });
+  const log = path.join(t.root, 'fake-claude.jsonl');
+  t.env.FAKE_CLAUDE_LOG = log;
+  writeAgent(path.join(t.work, '.kiro'), 'kc-probe', { description: 'probe', tools: ['*'], allowedTools: [], includeMcpJson: false });
+  const c = new TestClient({ args: ['--agent', 'kc-probe'], env: t.env, cwd: t.work, timings: { cancelGraceMs: 5_000 } });
+  clients.push(c);
+  await c.initialize();
+  const sid = (await c.call('session/new', { cwd: t.work, mcpServers: [] }, 30_000)).sessionId as string;
+  assert.deepEqual((await promptReq(c, sid, '/compact', 30_000)).result, { stopReason: 'end_turn' });
+  await until(() => fs.readFileSync(log, 'utf8').includes('/compact'), 10_000, 'the child got /compact');
+  const t0 = Date.now();
+  c.notify('session/cancel', { sessionId: sid });
+  await c.waitFor((f) => f.method === '_kiro.dev/compaction/status' && f.params.status.type === 'failed', 10_000, 'compaction failed');
+  assert.ok(Date.now() - t0 < 2_000, `failed well before the grace period (${Date.now() - t0} ms)`);
+  await c.waitFor((f) => f.method === '_kiro.dev/metadata' && typeof f.params.contextUsagePercentage === 'number' && f.params.turnDurationMs === undefined, 10_000, 'metadata after compaction', c.indexOf((f) => f.method === '_kiro.dev/compaction/status' && f.params.status.type === 'failed'));
+  assert.equal((await promptReq(c, sid, 'PING', 30_000)).result?.stopReason, 'end_turn');
+  const starts = fs
+    .readFileSync(log, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l) as Frame)
+    .filter((x) => x.event === 'start' && Array.isArray(x.argv) && x.argv.includes('-p'));
+  assert.equal(starts.length, 1, 'no restart for a compaction that ended on the interrupt');
+  assert.equal(await c.close(20_000), 0);
 });

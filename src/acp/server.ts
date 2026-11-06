@@ -1934,6 +1934,8 @@ export class AcpServer {
   /**
    * `/compact` (05 §4.5.4, 08 KC-ACP-14): with `respond` (prompt path) answer `end_turn` first,
    * then `compaction/status` started → completed{summary} | failed, then `_kiro.dev/metadata`.
+   * A cancelled compaction the child never ends is `failed` after the grace period and the stuck
+   * session is replaced before the metadata ({@link replaceStuckSession}), as for a prompt turn.
    */
   private async runCompaction(st: AcpSessionState, instructions: string | undefined, respond: ((r: unknown) => void) | undefined): Promise<boolean> {
     if (respond) {
@@ -2025,7 +2027,9 @@ export async function runAcp(args: string[], ctx: CliContext, opts: RunAcpOption
   }
   if (flags.login) {
     try {
-      const bin = await findClaudeBinary({ env: ctx.ws.env });
+      const settingPath = ctx.settings.getString('kiroClaude.claudePath');
+      // same precedence as chat: $KIRO_CLAUDE_BIN > kiroClaude.claudePath > PATH (claude/binary.ts)
+      const bin = await findClaudeBinary({ ...(settingPath ? { settingPath } : {}), env: ctx.ws.env });
       return await runAuthCommand(bin, 'login', ['--claudeai'], buildChildEnv(ctx.ws.env));
     } catch (e) {
       ctx.stderr.write(`error: ${errMessage(e)}\n`);
