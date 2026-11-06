@@ -293,6 +293,15 @@ describe('review: buildSystemPrompt edge cases', () => {
     assert.deepEqual(r.warnings, [`Skipping context file ${dir}: not a regular file`]);
   });
 
+  it('default preamble uses the 00 §4.1 Kiro 2.x names (glob and grep are not "read")', () => {
+    const ws = tmpWorkspace();
+    const r = buildSystemPrompt(spInput({ ws, preamble: undefined }));
+    for (const n of ['read (Read)', 'glob (Glob)', 'grep (Grep)', 'write (Write, Edit, NotebookEdit)', 'shell (Bash)', 'subagent (Agent)', 'todo_list']) {
+      assert.ok(r.text.includes(n), n);
+    }
+    assert.ok(r.text.split('\n').filter((l) => l !== '').length <= 5);
+  });
+
   it('systemPromptFilePath rejects ids that could escape the runtime dir', () => {
     const env = { XDG_RUNTIME_DIR: fs.mkdtempSync(path.join(os.tmpdir(), 'kc-rt-')) };
     for (const bad of ['', '..', '../x', 'a/b', 'a\\b', '.hidden', 'a..b', ' x']) {

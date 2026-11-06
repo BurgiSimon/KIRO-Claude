@@ -27,11 +27,12 @@
  *
  * {@link SteeringActivator} owns the "inject each conditional steering file at most once per
  * session" state (03 §3):
- *  - `forPrompt(text)`: manual/auto files named by `#<name>`, `#steering:<name>` (any
- *    conditional file) or a whole-token `/<name>` (names are file stems, case-insensitive;
- *    tokens inside code are ignored), plus fileMatch files whose patterns match a path token
- *    of the prompt (`@path`, `#path`, quoted or back-ticked paths, bare tokens containing `/`
- *    or a file extension);
+ *  - `forPrompt(text)`: manual/auto files named by `#<name>` / `#"<name>"` or a whole-token
+ *    `/<name>`, and any conditional file named by `#steering:<name|name.md|path>` (names match
+ *    the steering name or the file stem, case-insensitively, the same lookup as context/refs
+ *    `findSteering`; tokens inside code are ignored), plus fileMatch files whose patterns
+ *    match a path token of the prompt (`@path`, `#path`, quoted or back-ticked paths, bare
+ *    tokens containing `/` or a file extension);
  *  - `forToolPath(absPath)`: fileMatch files matching a path the agent read or wrote ⇒ text for
  *    the PostToolUse `additionalContext`;
  *  - `reset()` forgets what was injected (new Claude conversation: /clear, respawn without

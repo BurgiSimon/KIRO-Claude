@@ -313,7 +313,12 @@ function expandOne(abs: string, typed: string, st: fs.Stats, allowImages: boolea
       return { warning: `⚠ Image '${typed}' was not attached (at most ${MAX_IMAGES_PER_MESSAGE} images per message)` };
     }
     try {
-      return { image: { mediaType: media, dataBase64: fs.readFileSync(abs).toString('base64'), path: abs } };
+      const data = fs.readFileSync(abs);
+      if (base64Length(data.length) > MAX_IMAGE_BYTES) {
+        // grew after stat
+        return { warning: `⚠ Image '${typed}' was not attached (exceeds the ${MAX_IMAGE_BYTES / 1024 / 1024}MB image limit once encoded)` };
+      }
+      return { image: { mediaType: media, dataBase64: data.toString('base64'), path: abs } };
     } catch (e) {
       return { warning: `⚠ Could not read '${typed}': ${errorText(e)}` };
     }
