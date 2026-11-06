@@ -156,6 +156,22 @@ test('list / status / view against a temp workspace', async () => {
   }
 });
 
+test('a rejected usage limit is shown once on stderr (C19: the session sends only the rate_limit event)', async () => {
+  const base = fakeModel({});
+  const script: ModelScript = async (input, s) => {
+    const r = await base(input, s);
+    return { ...r, events: [{ type: 'rate_limit', status: 'rejected', resetsAt: 1_900_000_000 }, { type: 'rate_limit', status: 'allowed' }, { type: 'text_delta', text: r.text ?? '' }] };
+  };
+  const r = rig({}, { createSession: async (o) => new MockSession(o, script) as KiroSession });
+  try {
+    await r.run('new todo-export --description Export todos as CSV');
+    const hits = r.err.data.match(/WARNING: Claude Code usage limit reached \(resets 2030-03-17T17:46:40\.000Z\)/g) ?? [];
+    assert.equal(hits.length, 1, r.err.data);
+  } finally {
+    r.w.cleanup();
+  }
+});
+
 test('new (non-interactive): stops at the first checkpoint; approve continues; --yes finishes', async () => {
   const r = rig();
   try {
@@ -408,6 +424,50 @@ test('interactive TTY: a tool approval after stdin EOF (Ctrl+D) is cancelled, ne
     assert.ok(answers.length >= 2, `${answers.length} approvals`);
     assert.deepEqual(answers, answers.map(() => ({ kind: 'cancelled' })));
     assert.equal(out.prompts, answers.length, 'the question is asked once per approval');
+    assert.equal(code, 1);
+  } finally {
+    w.cleanup();
+  }
+});
+
+test('interactive TTY: Ctrl+D while the [y/n/t] question waits cancels the approval (C13)', async () => {
+  const w = makeWs();
+  try {
+    const stdin = new PassThrough(); // still open: the user has not answered yet
+    const out = new BoundedOut();
+    const ctx: CliContext = {
+      ws: w.ctx,
+      settings: mockSettings(),
+      stdin: stdin as unknown as NodeJS.ReadStream,
+      stdout: out as unknown as NodeJS.WriteStream,
+      stderr: new Capture() as unknown as NodeJS.WriteStream,
+      progName: 'kiro-claude',
+      verbosity: 0,
+    };
+    let answer: unknown;
+    let failure: unknown;
+    let calls = 0;
+    const req = { call: { displayName: 'shell', summary: 'echo hi' }, requestId: 'r1', reasons: [], agentName: 'kiro_default' } as unknown as ApprovalRequest;
+    const deps: SpecCliDeps = {
+      isTTY: true,
+      createSession: async (o) => {
+        if (calls++ > 0) throw new Error('stop'); // the driver may try again: no second approval
+        const pending = o.ui.requestApproval(req, new AbortController().signal);
+        // an empty Enter re-asks (Q); then Ctrl+D ends the input while the question waits
+        setTimeout(() => stdin.write('\n'), 20);
+        setTimeout(() => stdin.end(), 60);
+        try {
+          answer = await pending;
+        } catch (e) {
+          failure = e;
+        }
+        throw new Error('stop after the approval');
+      },
+    };
+    const code = await runSpecCommandWith(['new', 'my-feature', '--type', 'quick', '--description', 'do it'], ctx, deps);
+    assert.equal(failure, undefined, `${(failure as Error | undefined)?.message}`);
+    assert.deepEqual(answer, { kind: 'cancelled' });
+    assert.equal(out.prompts, 2, 'asked, re-asked after the empty answer, then cancelled at EOF');
     assert.equal(code, 1);
   } finally {
     w.cleanup();

@@ -2306,6 +2306,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         if (this.turnAbort === abort) this.turnAbort = undefined;
         this.turnBusy = false;
       }
+      if (summary!.stopReason === 'cancelled') throw new Error('Merge cancelled — interrupted');
       if (summary!.isError || !summary!.text.trim()) throw new Error(`Merge cancelled — ${summary!.error ?? 'the tangent produced no summary'}`);
       carry = `<tangent-summary${tangent.tangentName ? ` name="${tangent.tangentName}"` : ''}>\nSummary of a side conversation (tangent) the user had:\n${summary!.text.trim()}\n</tangent-summary>`;
     } else if (mode === 'tail' && ownTurns > 0 && this.lastExchange) {

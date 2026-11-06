@@ -261,7 +261,7 @@ test('repl: a second Ctrl+C stops Claude Code when the turn does not end; the ne
   });
   s.trust.trustAll = true;
   const next = new MockSession({ id: s.id }).script({ result: { text: 'second answer' } });
-  run = startRepl({ session: s, input: ['long task'], keepOpen: true, nextSession: () => next, sessionOptions: { trustTools: ['read'] } });
+  run = startRepl({ session: s, input: ['long task'], keepOpen: true, nextSession: () => next, sessionOptions: { trustTools: ['read'], claudePath: '/opt/claude' } });
   await run.waitFor('working...');
   // the record exists on disk (a finished earlier turn): the session is resumed under its id
   const { SessionStore, sessionsDir } = await import('../../src/session/store.js');
@@ -276,7 +276,10 @@ test('repl: a second Ctrl+C stops Claude Code when the turn does not end; the ne
   const o = run.created[1]!;
   assert.deepEqual(o.resume, { sessionId: s.id });
   assert.equal(o.trustAllTools, true, 'trust-all as it was');
-  assert.deepEqual(o.trustTools, ['read'], 'launch options kept');
+  assert.equal(o.claudePath, '/opt/claude', 'launch options kept');
+  // the resumed record holds the per-tool trust, the user's /tools changes included: --trust-tools
+  // is not applied over it again (it would re-trust a tool the user untrusted)
+  assert.deepEqual(o.trustTools, []);
   assert.equal(o.agentName, s.agent.name);
   assert.deepEqual(next.prompts.map((p) => p.text), ['next']);
   run.send('/quit');
@@ -409,6 +412,30 @@ for (const tty of [false, true]) {
     run.t.cleanup();
   });
 }
+
+test('repl: a forced stop without a resumable record carries the per-tool trust and plan mode into the new session (C16)', { timeout: 20_000 }, async () => {
+  let run!: ReturnType<typeof startRepl>;
+  const s = stuckSession(() => run.send('\u0003'));
+  // --trust-tools=read,shell at launch, then /tools untrust shell, /tools trust write, and an
+  // agent-granted tool the user untrusted (revoked)
+  s.trust.allowedTools = ['read', 'write'];
+  s.trust.revokedTools = ['fs_read'];
+  s.planMode = true; // Shift+Tab before the stuck first turn
+  const next = new MockSession().script({ result: { text: 'second answer' } });
+  run = startRepl({ session: s, input: ['long task'], keepOpen: true, nextSession: () => next, sessionOptions: { trustTools: ['read', 'shell'] } });
+  await run.waitFor(/stopping it\.\n[\s\S]*> $/, 5000);
+  run.send('next');
+  await run.waitFor('second answer', 5000);
+  const o = run.created[1]!;
+  assert.equal(o.resume, undefined, 'closing dropped the empty record: a new conversation');
+  assert.deepEqual(o.trustTools, ['read', 'write'], 'the trust as it was, not the launch list');
+  assert.deepEqual(next.called('untrustTools'), [[['fs_read']]], 'revocations re-applied');
+  assert.equal(next.planMode, true, 'still planning: the next prompt must not run with edits allowed');
+  assert.equal(next.prompts.length, 1);
+  run.send('/quit');
+  assert.equal(await run.exit, 0);
+  run.t.cleanup();
+});
 
 test('repl: a failed restart after a forced stop reports it and exits 1 (C16)', { timeout: 20_000 }, async () => {
   let run!: ReturnType<typeof startRepl>;

@@ -777,9 +777,20 @@ export class Repl implements ReplContext {
         } catch {
           resumable = false;
         }
+        // the trust as it was, never the launch `--trust-tools` again (applied over a record it
+        // would re-trust a tool the user untrusted): a resumed record brings its own per-tool
+        // trust; a new conversation gets the stopped one's
+        const revoked = resumable ? [] : (old.trust.revokedTools ?? []);
         let fresh: KiroSession | undefined;
         try {
-          fresh = await this.createSession({ trustAllTools: old.trust.trustAll, ...(resumable ? { resume: { sessionId: old.id } } : {}) });
+          fresh = await this.createSession({
+            trustAllTools: old.trust.trustAll,
+            trustTools: resumable ? [] : [...old.trust.allowedTools],
+            ...(resumable ? { resume: { sessionId: old.id } } : {}),
+          });
+          if (revoked.length) fresh.untrustTools([...revoked]);
+          // plan mode lived in the dropped record: the next prompt must not run with edits allowed
+          if (!resumable && old.planMode) fresh.planMode = true;
           await fresh.start();
         } catch (e) {
           if (fresh) await fresh.close().catch(() => undefined);

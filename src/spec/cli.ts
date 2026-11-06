@@ -252,6 +252,13 @@ class Renderer {
       case 'notice':
         this.err(e.message);
         break;
+      case 'rate_limit':
+        // the session reports a usage limit only as this event (each front end words it)
+        if (e.status === 'rejected') {
+          const when = e.resetsAt ? ` (resets ${new Date(e.resetsAt * (e.resetsAt < 1e12 ? 1000 : 1)).toISOString()})` : '';
+          this.err(`WARNING: Claude Code usage limit reached${when}`);
+        }
+        break;
       default:
         break;
     }

@@ -120,7 +120,7 @@ test('e2e: a free-text answer redirects once (sent by the session, not duplicate
 // ───────────────────── Ctrl+C during commands and stuck turns (C11, C16) ─────────────────────
 
 /** The real runRepl over a live stdin (written step by step) and fake claude. */
-function live(script: unknown, opts: { tty?: boolean; extraEnv?: Record<string, string> } = {}) {
+function live(script: unknown, opts: { tty?: boolean; extraEnv?: Record<string, string>; trustTools?: string[] } = {}) {
   const t = tempEnv();
   const logFile = path.join(t.root, 'fake.log');
   const env = fakeEnv({
@@ -151,7 +151,7 @@ function live(script: unknown, opts: { tty?: boolean; extraEnv?: Record<string, 
     verbosity: 0,
   };
   let ended: { code: number; at: number } | undefined;
-  const exit = runRepl({ ctx, sessionOptions: { env, claudePath: fakeClaudePath() } }).then((code) => {
+  const exit = runRepl({ ctx, sessionOptions: { env, claudePath: fakeClaudePath(), ...(opts.trustTools ? { trustTools: opts.trustTools } : {}) } }).then((code) => {
     ended = { code, at: Date.now() };
     return code;
   });
@@ -336,6 +336,48 @@ test('e2e: Ctrl+C while the stopped Claude Code is restarted cancels that input;
     assert.equal(await r.exit, 0);
     after = r.o().slice(mark);
     assert.ok(!/To exit the CLI/.test(after), after);
+  } finally {
+    r.end();
+    await r.exit.catch(() => undefined);
+    r.t.cleanup();
+  }
+});
+
+test('e2e: the restart after a forced stop keeps the trust as it was: a launch-trusted tool the user untrusted stays untrusted (C16)', { timeout: 60_000 }, async () => {
+  const script = {
+    turns: [
+      { match: '^hello', steps: [{ text: 'hi there' }] },
+      { match: 'slow thing', steps: [{ text: 'working\n\n' }, { sleepMs: 100_000 }] },
+      { match: '^next', steps: [{ text: 'second answer' }] },
+    ],
+  };
+  const r = live(script, { trustTools: ['shell'], extraEnv: { FAKE_CLAUDE_CONTROL_DELAYS: JSON.stringify({ interrupt: 120_000 }) } });
+  const shellLabel = async (): Promise<string> => {
+    const m = r.o().length;
+    r.line('/tools');
+    await r.waitFor(/- shell[^\n]*\n[\s\S]*> $/, 10_000, m);
+    return /- shell +([^\n]*)/.exec(r.o().slice(m))![1]!.trim();
+  };
+  try {
+    await r.waitFor(/> $/);
+    r.line('hello');
+    await r.waitFor(/hi there[\s\S]*> $/);
+    assert.equal(await shellLabel(), 'trusted', '--trust-tools=shell');
+    r.line('/tools untrust shell');
+    const untrusted = await shellLabel();
+    assert.notEqual(untrusted, 'trusted');
+    r.line('run the slow thing');
+    await r.waitFor(/working/);
+    r.ctrlC();
+    await sleepMs(300);
+    r.ctrlC();
+    await r.waitFor(/stopping it\.[\s\S]*> $/, 15_000);
+    const mark = r.o().length;
+    r.line('next');
+    await r.waitFor(/second answer[\s\S]*> $/, 15_000, mark);
+    assert.equal(await shellLabel(), untrusted, 'the launch trust must not come back over the user\'s /tools untrust');
+    r.line('/quit');
+    assert.equal(await r.exit, 0);
   } finally {
     r.end();
     await r.exit.catch(() => undefined);

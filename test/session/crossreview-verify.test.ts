@@ -346,7 +346,7 @@ describe('C11 follow-up: /tangent merge is interruptible before Claude starts th
       merge.catch(() => undefined);
       assert.ok(await waitFor(() => pids().length > before, 10_000), 'the merge respawned claude');
       await s.interrupt();
-      await assert.rejects(merge, /Merge cancelled/);
+      await assert.rejects(merge, /Merge cancelled — interrupted/);
       assert.ok(Date.now() - t0 < 2500, `took ${Date.now() - t0} ms: the summary turn ran to its end`);
       assert.equal(s.record.forkKind, 'tangent', 'still in the tangent');
       // the session is usable afterwards
