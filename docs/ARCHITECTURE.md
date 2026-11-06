@@ -89,6 +89,10 @@ kiro-claude includes all of it by:
 3. `kiro-claude crew …` commands that build KiroCrew from source, point it at a `kiro-cli`
    shim that execs kiro-claude, and manage the gateway lifecycle.
 
+KiroCrew treats `kiro-cli` as signed out without a kiro-cli identity store, which makes it tear
+down backend processes every turn. `crew setup` therefore writes a token-less identity stub,
+**only when no real kiro-cli store exists**, and never modifies an existing one.
+
 KiroCrew itself is untouched; every model call it makes goes through kiro-claude to your
 installed Claude Code.
 
