@@ -72,6 +72,26 @@ or tools mid-session restarts the `claude` child with `--resume <session-id>` an
 `--system-prompt-snapshot off` (when supported), so history is kept and the new appended
 system prompt takes effect. Model changes use the `set_model` control request when possible.
 
+## KiroCrew (persistent pipeline) on Claude Code
+
+[KiroCrew](https://github.com/kirodotdev/KiroCrew) (Apache-2.0) is Kiro's persistent,
+self-hosted agent workspace: persistent sessions, memory and lessons, self-evolving
+skills, checkpointed long-running tasks, schedules and heartbeats, delegation, a web
+dashboard, CLI and messaging channels. Its default agent backend is `kiro-cli` spoken to
+over ACP.
+
+kiro-claude includes all of it by:
+
+1. vendoring KiroCrew unmodified as a git submodule at `vendor/KiroCrew` (pinned commit);
+2. implementing the `kiro-cli` contract KiroCrew relies on (`--version`, `acp --help`,
+   `chat --help` probes, `acp --agent-engine v2 --agent <name>`, the kiro ACP dialect,
+   `~/.kiro/agents` + `~/.kiro/sessions/cli` files) in `kiro-claude acp`;
+3. `kiro-claude crew …` commands that build KiroCrew from source, point it at a `kiro-cli`
+   shim that execs kiro-claude, and manage the gateway lifecycle.
+
+KiroCrew itself is untouched; every model call it makes goes through kiro-claude to your
+installed Claude Code.
+
 ## Compatibility probe
 
 `claude --version` and `claude --help` are parsed once per version and cached, so
