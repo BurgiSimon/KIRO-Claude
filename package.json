@@ -1,0 +1,30 @@
+{
+  "name": "kiro-claude",
+  "version": "0.1.0",
+  "description": "A port of the Kiro CLI that runs on your installed Claude Code (and its subscription) instead of the Kiro backend.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "kiro-claude": "dist/src/bin/kiro-claude.js"
+  },
+  "files": [
+    "dist/src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test --test-reporter=spec \"dist/test/**/*.test.js\"",
+    "test:e2e": "npm run build && KIRO_CLAUDE_E2E=1 node --test --test-reporter=spec \"dist/test/e2e/*.test.js\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3"
+  }
+}
