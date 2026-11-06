@@ -67,7 +67,7 @@ const MASTER: Row[] = [
   { claude: 'mcp__my-srv__get_thing', input: {}, v3Id: 'mcp_my_srv_get_thing', tags: ['@mcp', '@my-srv', '@my-srv/get_thing'], capability: 'mcp', subjects: ['my-srv/get_thing'], kiro2Name: '@my-srv/get_thing', v2Name: '@my-srv/get_thing', display: 'get_thing', mutating: true },
   { claude: 'mcp__srv__a__b', input: {}, v3Id: 'mcp_srv_a__b', tags: ['@mcp', '@srv', '@srv/a__b'], capability: 'mcp', subjects: ['srv/a__b'], kiro2Name: '@srv/a__b', v2Name: '@srv/a__b', display: 'a__b', mutating: true },
   { claude: 'LSP', input: { op: 'x' }, v3Id: undefined, tags: ['@builtin'], capability: 'utility', subjects: [], kiro2Name: 'LSP', v2Name: 'LSP', display: 'LSP', mutating: false },
-  { claude: 'ToolSearch', input: {}, v3Id: undefined, tags: ['@builtin'], capability: 'utility', subjects: [], kiro2Name: 'ToolSearch', v2Name: 'ToolSearch', display: 'ToolSearch', mutating: false },
+  { claude: 'ToolSearch', input: {}, v3Id: undefined, tags: ['@builtin'], capability: 'utility', subjects: [], kiro2Name: 'tool_search', v2Name: 'tool_search', display: 'tool_search', mutating: false },
 ];
 
 describe('toKiroCall: master table (00 §4.1)', () => {
@@ -277,7 +277,9 @@ describe('constants', () => {
     assert.ok(Object.isFrozen(BUILTIN_CLAUDE_TOOLS));
   });
   it('NEVER_EXPOSE_TOOLS', () => {
-    for (const t of ['ToolSearch', 'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode']) assert.ok(NEVER_EXPOSE_TOOLS.includes(t), t);
+    for (const t of ['AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode']) assert.ok(NEVER_EXPOSE_TOOLS.includes(t), t);
+    // ToolSearch is exposed when an agent selects Kiro's tool_search (KiroCrew specs do, 08 KC-SPEC-02)
+    assert.ok(!NEVER_EXPOSE_TOOLS.includes('ToolSearch'));
     for (const t of BUILTIN_CLAUDE_TOOLS) assert.ok(!NEVER_EXPOSE_TOOLS.includes(t), t);
   });
 });
@@ -356,7 +358,11 @@ describe('expandToolSelectors (00 §4.2)', () => {
     { tools: ['@f*'], claudeTools: [], mcpServers: ['fs'], disallowed: ['mcp__fs__delete'], subagents: [] },
     { tools: ['@fs'], claudeTools: [], mcpServers: ['fs'], disallowed: ['mcp__fs__delete'], subagents: [] },
     // unsupported Kiro tools: nothing + warning
-    { tools: ['knowledge', 'introspect', 'code', 'use_aws'], claudeTools: [], mcpServers: [], subagents: [], warnings: 4 },
+    // introspect/code/session/report have no Claude equivalent and are ignored silently (every Kiro and
+    // KiroCrew default spec selects them); knowledge/use_aws still warn
+    { tools: ['knowledge', 'introspect', 'code', 'use_aws'], claudeTools: [], mcpServers: [], subagents: [], warnings: 2 },
+    { tools: ['session', 'report'], claudeTools: [], mcpServers: [], subagents: [], warnings: 0 },
+    { tools: ['fs_read', 'tool_search'], claudeTools: ['Read', 'Glob', 'Grep', 'ToolSearch'], mcpServers: [], subagents: [], warnings: 0 },
     { tools: ['nonsense'], claudeTools: [], mcpServers: [], subagents: [], warnings: 1 },
     { tools: ['@nope'], claudeTools: [], mcpServers: [], subagents: [], warnings: 1 },
     // NEVER_EXPOSE names are not selectors at all

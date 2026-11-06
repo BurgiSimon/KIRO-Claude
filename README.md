@@ -193,6 +193,9 @@ are kept.
   `write`, `shell`, `grep`, `glob`, `web_fetch`, …), its compaction and its subagents. Kiro's
   tool *policy* is applied on top through the permission gate.
 * Claude Code owns MCP connections, so MCP prompts and `/mcp auth` are not available in chat.
+* Kiro's `code`, `introspect`, `session` and `report` tools have no Claude Code equivalent; an
+  agent that selects them simply does not get them. `tool_search` maps to Claude Code's
+  `ToolSearch`.
 * Some REPL conveniences are not implemented: Ctrl+R history search, the Ctrl+S picker, vi
   mode, image paste, and the granular shell-trust menu.
 * Knowledge bases, inline completions, translate and the desktop integrations are not ported.

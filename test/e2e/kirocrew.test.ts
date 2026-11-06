@@ -5,8 +5,10 @@
  *
  * - Stage B (`KIRO_CLAUDE_E2E_KIROCREW=1`): real kiro-claude, fake Claude
  *   (test/fixtures/fake-claude.mjs + test/e2e/kirocrew/fake-script.json); deterministic, no model
- *   cost. setup → contract (KC-CLI-*) → ACP scenarios S1–S13 → crew start → pipeline C1–C14 →
- *   frame-shape parity against KiroCrew's kiro-cli corpus → teardown + leftover check (C18).
+ *   cost. setup → identity-stub rule (09 item 1) → contract (KC-BIN-*, KC-CLI-*, doctor D7–D9) →
+ *   ACP scenarios S1–S17 (S14: auth error + refusal; S15: KiroCrew tool mapping; S16: todo;
+ *   S17: subagent frames) → crew start → pipeline C1–C14 → frame-shape parity against KiroCrew's
+ *   kiro-cli corpus → teardown (C18: leftovers, runtime dirs, shim/stub/real-store stability).
  * - Stage C (`KIRO_CLAUDE_E2E_KIROCREW=1` and `KIRO_CLAUDE_E2E=1`): the same against the real
  *   `claude` (haiku via KIRO_CLAUDE_FORCE_MODEL; costs about 30 model turns on your account).
  *
@@ -174,8 +176,9 @@ async function runStage(t: TestContext, stage: 'B' | 'C'): Promise<void> {
   try {
     const setup = await sh(st, `bash "$KC_TOOLS/setup.sh" --stage ${stage}`, 600_000);
     if (setup.code !== 0) assert.fail(`setup.sh failed (${setup.code}):\n${setup.out.slice(-3000)}`);
+    allOk = (await step(t, st, 'identity stub rule', `bash "$KC_TOOLS/identity.sh"`, 600_000)) && allOk;
     allOk = (await step(t, st, 'contract', `bash "$KC_TOOLS/contract.sh" --stage ${stage}`, 300_000)) && allOk;
-    if (stage === 'B') allOk = (await step(t, st, 'acp scenarios S1-S13', `python3 -I "$KC_TOOLS/acp_scenarios.py" --stage B --bin "$SHIM"`, 900_000)) && allOk;
+    if (stage === 'B') allOk = (await step(t, st, 'acp scenarios S1-S17', `python3 -I "$KC_TOOLS/acp_scenarios.py" --stage B --bin "$SHIM"`, 900_000)) && allOk;
     const start = await sh(st, `"$KC_NODE" "$KC_ENTRY" crew start --port ${port} ${envFlags}`, 240_000);
     if (start.code !== 0) assert.fail(`crew start failed (${start.code}):\n${start.out.slice(-3000)}`);
     allOk = (await step(t, st, 'pipeline C1-C14', `bash "$KC_TOOLS/pipeline.sh" --stage ${stage}`, stage === 'B' ? 1_500_000 : 3_000_000)) && allOk;

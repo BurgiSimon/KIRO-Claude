@@ -167,6 +167,28 @@ test('session/new: missing or broken --agent spec is an error naming the file, n
   await done(s2);
 });
 
+test('a spec with type errors (agent validate rejects it) is refused on session/new and set_mode (08 KC-ACP-02, KC-CLI-09)', async () => {
+  const t = tmpEnv();
+  fs.mkdirSync(path.join(t.work, '.kiro', 'agents'), { recursive: true });
+  fs.writeFileSync(path.join(t.work, '.kiro', 'agents', 'kc-bad.json'), JSON.stringify({ name: 'kc-bad', tools: 5 }));
+  const s1 = setup([], { t, args: ['--agent', 'kc-bad'] });
+  await s1.c.initialize();
+  const r1 = await s1.c.request('session/new', { cwd: t.work, mcpServers: [] });
+  assert.equal(r1.error.code, -32603);
+  assert.match(r1.error.data, /^Failed to load agent 'kc-bad' from .*kc-bad\.json: /);
+  assert.equal(s1.world.created.length, 0, 'no session is created for a broken spec');
+  await done(s1);
+
+  const s2 = setup([], { t, args: [] });
+  await s2.c.initialize();
+  const ok = await s2.c.call('session/new', { cwd: t.work, mcpServers: [] });
+  const r2 = await s2.c.request('session/set_mode', { sessionId: ok.sessionId, modeId: 'kc-bad' });
+  assert.equal(r2.error.code, -32603);
+  assert.match(r2.error.data, /^Failed to load agent 'kc-bad' from .*kc-bad\.json: /);
+  assert.ok(!s2.world.calls.includes('swapAgent:kc-bad'));
+  await done(s2);
+});
+
 test('session/new without --agent uses chat.defaultAgent, else kiro_default; _meta.kiro overrides; bad cwd', async () => {
   const s = setup([], { args: [] });
   await s.c.initialize();

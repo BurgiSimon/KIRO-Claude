@@ -53,15 +53,16 @@ export const TODO_CLAUDE_TOOLS: readonly string[] = Object.freeze(['TaskCreate',
 
 /**
  * Claude tools kiro-claude never passes in `--tools` (they would bypass Kiro semantics: Claude's
- * own plan mode, interactive questions, deferred tool search, worktrees, schedulers, messaging).
+ * own plan mode, interactive questions, worktrees, schedulers, messaging). `ToolSearch` is exposed
+ * only when an agent selects Kiro's `tool_search` (KiroCrew's specs do; 08 KC-SPEC-02).
  */
 export const NEVER_EXPOSE_TOOLS: readonly string[] = Object.freeze([
-  'ToolSearch', 'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode', 'EnterWorktree', 'ExitWorktree',
+  'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode', 'EnterWorktree', 'ExitWorktree',
   'CronCreate', 'CronDelete', 'CronList', 'RemoteTrigger', 'PushNotification', 'SendMessage',
   'TeamCreate', 'TeamDelete',
 ]);
 
-const CANONICAL_ORDER = [...BUILTIN_CLAUDE_TOOLS, SKILL_CLAUDE_TOOL];
+const CANONICAL_ORDER = [...BUILTIN_CLAUDE_TOOLS, SKILL_CLAUDE_TOOL, 'ToolSearch'];
 
 interface Row {
   v3Id?: string;
@@ -85,6 +86,7 @@ const ROWS: Record<string, Row> = {
   WebSearch: { v3Id: 'remote_web_search', tag: 'web', capability: 'web_search', kiro2Name: 'web_search', v2Name: 'web_search', display: 'web_search' },
   Agent: { v3Id: 'invoke_sub_agent', tag: 'subagent', capability: 'subagent', kiro2Name: 'subagent', v2Name: 'use_subagent', display: 'subagent' },
   Task: { v3Id: 'invoke_sub_agent', tag: 'subagent', capability: 'subagent', kiro2Name: 'subagent', v2Name: 'use_subagent', display: 'subagent' },
+  ToolSearch: { capability: 'utility', kiro2Name: 'tool_search', v2Name: 'tool_search', display: 'tool_search' },
   Skill: { v3Id: 'disclose_context', tag: 'context', capability: 'skill', kiro2Name: 'skill', v2Name: 'skill', display: 'skill' },
 };
 
@@ -96,6 +98,14 @@ export const FILE_WRITE_TOOLS: readonly string[] = Object.freeze(['Write', 'Edit
 /** `TaskCreate`, `TaskUpdate`, `TaskList`, `TaskGet`, `TaskStop`, `TaskOutput`, … and the legacy `TodoWrite`. */
 export function isTodoTool(claudeName: string): boolean {
   return /^Task[A-Z][A-Za-z]*$/.test(claudeName) || claudeName === 'TodoWrite';
+}
+
+/**
+ * Tools every agent may use without a permission check: the todo tools and `ToolSearch`
+ * (Kiro `tool_search`), which only loads deferred tool schemas and runs nothing.
+ */
+export function isAlwaysAllowedTool(claudeName: string): boolean {
+  return isTodoTool(claudeName) || claudeName === 'ToolSearch';
 }
 
 /** Claude's MCP name normalization: characters outside `[A-Za-z0-9_-]` become `_` (TYPED). */
@@ -454,6 +464,7 @@ const BUILTIN_SELECTORS: Record<string, readonly string[]> = {
   web_fetch: ['WebFetch'],
   remote_web_search: ['WebSearch'],
   web_search: ['WebSearch'],
+  tool_search: ['ToolSearch'],
   subagent: ['Agent'],
   invoke_sub_agent: ['Agent'],
   use_subagent: ['Agent'],
@@ -470,9 +481,10 @@ const BUILTIN_SELECTORS: Record<string, readonly string[]> = {
 const ALL_SUBAGENT_SELECTORS = new Set(['subagent', 'invoke_sub_agent', 'use_subagent', 'agent_crew']);
 
 /** Kiro tools with no Claude equivalent: selecting them exposes nothing (warn). */
+const IGNORED_SELECTORS = new Set(['code', 'introspect', 'session', 'report']);
 const UNSUPPORTED_SELECTORS = new Set([
-  'knowledge', 'introspect', 'code', 'use_aws', 'aws', 'thinking', 'delegate', 'report', 'report_issue',
-  'gh_issue', 'session', 'goal', 'tool_search', 'spec', '@powers',
+  'knowledge', 'use_aws', 'aws', 'thinking', 'delegate', 'report_issue',
+  'gh_issue', 'goal', 'spec', '@powers',
 ]);
 
 export interface McpServerSelectorInfo {
@@ -563,6 +575,7 @@ function expandSelectors(
       st.allMcp = true;
       return;
     }
+    if (IGNORED_SELECTORS.has(sel)) return;
     if (UNSUPPORTED_SELECTORS.has(sel)) {
       warnings.push(`Tool '${sel}' in ${what} is not available in kiro-claude and was ignored`);
       return;

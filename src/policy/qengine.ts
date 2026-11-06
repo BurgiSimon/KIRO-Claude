@@ -316,6 +316,8 @@ export function evaluateQRaw(
       return evalSubagent(call.subjects[0] ?? '', inAllow('use_subagent'), toolSettings(agent, 'use_subagent'));
     case 'todo_list':
       return allow('todo_list is always allowed');
+    case 'tool_search':
+      return allow('tool_search is always allowed');
     case 'skill':
       return allow('skills are always allowed');
     default:

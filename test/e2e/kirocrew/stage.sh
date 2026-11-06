@@ -4,8 +4,9 @@
 #   KCDIR=<built KiroCrew> KC_DIST=<kiro-claude build dir> test/e2e/kirocrew/stage.sh B|C
 #
 # B: real kiro-claude + fake Claude (deterministic, no model cost):
-#    setup → contract → ACP scenarios S1–S13 → crew start → pipeline C1–C14 → parity → teardown.
-# C: real kiro-claude + real Claude (haiku; costs model turns): setup → contract → crew start →
+#    setup → identity stub rule → contract → ACP scenarios S1–S17 → crew start → pipeline C1–C14 →
+#    parity → teardown.
+# C: real kiro-claude + real Claude (haiku; costs model turns): setup → identity → contract → crew start →
 #    pipeline (nonces) → ACP scenarios S3 S4 S5 S6 S7 S9 S12 (C15) → teardown.
 # Prints every PASS/FAIL/SKIP line, then a summary; exits 1 on any FAIL. The run dir is printed
 # and kept (it holds logs and frame corpora; it never holds credentials beyond the gateway token,
@@ -30,6 +31,7 @@ run() { echo "== $*"; "$@" 2>&1 | tee -a "$LOG"; return "${PIPESTATUS[0]}"; }
 rc=0
 run bash "$KC_TOOLS/setup.sh" --stage "$STAGE" >/dev/null || { echo "FAIL setup see $LOG"; rc=1; }
 if [ $rc = 0 ]; then
+  run bash "$KC_TOOLS/identity.sh" || rc=1
   run bash "$KC_TOOLS/contract.sh" --stage "$STAGE" || rc=1
   [ "$STAGE" = B ] && { run python3 -I "$KC_TOOLS/acp_scenarios.py" --stage B --bin "$SHIM" || rc=1; }
   env_args=(); for kv in $START_ENV; do env_args+=(--env "$kv"); done

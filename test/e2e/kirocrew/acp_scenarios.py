@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""ACP scenarios S1-S13 of 08-kirocrew-integration §5.2 against `kiro-claude acp` (stdlib only).
+"""ACP scenarios S1-S13 of 08-kirocrew-integration §5.2 against `kiro-claude acp` (stdlib only), plus
+the §2 KC-* rows marked (B) that §5.2 does not name: S1-invalid (Guard A2 for an invalid spec),
+S2-mcpjson-control / S2-switch (KC-SPEC-01 control, KC-ACP-03), S4c (permission `cancelled`),
+S5-clear (KC-ACP-05 clear), S6-auto (KC-ACP-14 auto-compaction), S11-frame (KC-ACP-16 10 MiB cap),
+S14 (KC-AUTH-04 auth error, KC-ACP-19 refusal), S15 (KC-SPEC-02 KiroCrew tool mapping), S16
+(KC-ACP-20 todo), S17 (KC-ACP-21 subagent frames), S18 (KC-FS-06 log append + rotation).
+S2 runs Claude as fake-claude-mcp.mjs so MCP servers report tools/status (see that file).
 
 Each scenario is a plain ACP client that speaks to `<bin> acp --agent-engine v2 --agent <name>`
 exactly like KiroCrew does (initialize params of 08b §4.4, spawn env of 08b §4.3), in its own
@@ -292,6 +298,12 @@ class Ctx:
     def workspace(self, n: str, spec_name: str, spec: dict, files: dict | None = None) -> str:
         ws = os.path.join(self.e2e, f"ws-{n.lower()}")
         os.makedirs(os.path.join(ws, ".kiro", "agents"), exist_ok=True)
+        # a re-run in the same run dir must not see the previous run's logs (checks count starts)
+        for old_log in ("fake-claude.jsonl", "kiro-chat.log"):
+            try:
+                os.unlink(os.path.join(ws, old_log))
+            except OSError:
+                pass
         with open(os.path.join(ws, ".kiro", "agents", f"{spec_name}.json"), "w") as f:
             json.dump(spec, f, indent=2)
         for rel, content in (files or {}).items():
@@ -315,6 +327,16 @@ def fake_log(ws: str) -> list[dict]:
             except ValueError:
                 pass
     return out
+
+
+def user_text(rec: dict) -> str:
+    line = rec.get("line") or {}
+    c = (line.get("message") or {}).get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return "".join(b.get("text", "") for b in c if isinstance(b, dict))
+    return ""
 
 
 def stream_starts(log: list[dict]) -> list[dict]:
@@ -395,8 +417,11 @@ def s1(ctx: Ctx) -> None:
         c.ok(caps.get("mcpCapabilities") == {"http": True, "sse": True}, "mcpCapabilities", json.dumps(caps.get("mcpCapabilities")))
         c.ok(res.get("authMethods") == [], "authMethods []")
         info = res.get("agentInfo") or {}
-        c.ok(info.get("name") == "kiro-claude" and info.get("version") == "1.26.0", "agentInfo kiro-claude/1.26.0", json.dumps(info))
+        c.ok(info == {"name": "kiro-claude", "title": "kiro-claude 0.1.0 (Claude Code)", "version": "1.26.0"},
+             "agentInfo exactly {kiro-claude, 'kiro-claude 0.1.0 (Claude Code)', 1.26.0}", json.dumps(info))
         c.ok(not (((res.get("_meta") or {}).get("kiro") or {}).get("extensionMethods")), "no _meta.kiro.extensionMethods")
+        c.ok(set(res) <= {"protocolVersion", "agentCapabilities", "authMethods", "agentInfo", "_meta"}, "no unexpected top-level keys", json.dumps(sorted(res)))
+        extra_caps = sorted(set(caps) - {"loadSession", "promptCapabilities", "mcpCapabilities"})
         c.ok(dt < 1.0, f"initialize {dt*1000:.0f}ms < 1s")
         res, err, _ = ag.new_session()
         c.ok(err is None and isinstance(res, dict), "session/new ok", str(err))
@@ -406,12 +431,25 @@ def s1(ctx: Ctx) -> None:
         modes = res.get("modes") or {}
         c.ok(modes.get("currentModeId") == "kc-probe", "currentModeId==kc-probe", json.dumps(modes)[:200])
         c.ok("kc-probe" in [m.get("id") for m in modes.get("availableModes") or []], "availableModes has kc-probe")
+        # KC-FS-01: KiroCrew's mates agents are never offered as modes.
+        c.ok(not any("mates" in json.dumps(m) for m in modes.get("availableModes") or []), "no ~/.kiro/mates/agents in availableModes")
         models = res.get("models") or {}
         am = models.get("availableModels") or []
-        c.ok(bool(models.get("currentModelId")) and am and all({"modelId", "name"} <= set(m) for m in am), "models shape",
+        c.ok(bool(models.get("currentModelId")) and am and all({"modelId", "name", "description"} <= set(m) for m in am), "models shape {modelId,name,description}",
              json.dumps(models)[:200])
         c.ok("claude-haiku-5.5" in [m.get("modelId") for m in am], "claude-haiku-5.5 advertised")
-        # Guard A2: a missing spec is a JSON-RPC error naming the file, never a silent fallback.
+        # KC-CLI-06: chat --list-models ids are the session/new ids (same source, the model cache).
+        lm = subprocess.run([ctx.bin, "chat", "--list-models", "--format", "json", "--no-interactive"], cwd=ag.ws, env=ag.env,
+                            capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
+        try:
+            lm_ids = sorted(r["model_id"] for r in json.loads(lm.stdout)["models"])
+        except (ValueError, KeyError, TypeError):
+            lm_ids = []
+        c.ok(lm_ids and lm_ids == sorted(m.get("modelId") for m in am), "KC-CLI-06 list-models ids == session/new availableModels",
+             f"list={lm_ids} acp={sorted(m.get('modelId') for m in am)}")
+        cache = os.path.join(ctx.home, ".cache", "kiro-claude", "models.json")
+        c.ok(os.path.exists(cache), "KC-CLI-06 model cache ~/.cache/kiro-claude/models.json written after Claude's initialize")
+        # Guard A2: a missing spec is a JSON-RPC error naming it, never a silent fallback.
         ws2 = ctx.workspace("S1-missing", "kc-other", spec("kc-other"))
         ag2 = Agent(ctx, "S1-missing", ws2, "kc-no-such-agent", label="S1-missing")
         try:
@@ -420,59 +458,149 @@ def s1(ctx: Ctx) -> None:
             c.ok(e2 is not None and "kc-no-such-agent" in json.dumps(e2), "missing --agent spec ⇒ error naming it", json.dumps(r2 or e2)[:200])
         finally:
             ag2.close()
+        # Guard A2 (KC-ACP-02): an INVALID spec is a JSON-RPC error naming the file. Own row.
+        ci = Check("S1-invalid")
+        ws3 = ctx.workspace("S1-invalid", "kc-bad", {"name": "kc-bad", "tools": 5})
+        ag3 = Agent(ctx, "S1-invalid", ws3, "kc-bad", label="S1-invalid")
+        try:
+            ag3.initialize()
+            r3, e3, _ = ag3.new_session()
+            bad_path = os.path.join(ws3, ".kiro", "agents", "kc-bad.json")
+            v = subprocess.run([ctx.bin, "agent", "validate", "--path", bad_path], capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL, env=ag3.env)
+            ci.ok(v.returncode == 1 and "is invalid" in v.stdout, "control: agent validate rejects it", f"rc={v.returncode}")
+            ci.ok(e3 is not None and (bad_path in json.dumps(e3) or "kc-bad.json" in json.dumps(e3)),
+                  "session/new with an invalid spec (tools:5) ⇒ JSON-RPC error naming the file",
+                  "got a session instead: " + json.dumps({"currentModeId": ((r3 or {}).get("modes") or {}).get("currentModeId"),
+                                                          "error": e3})[:200])
+            if not ctx.real:
+                time.sleep(0.3)
+                st3 = stream_starts(fake_log(ws3))
+                if st3:
+                    ci.ok(False, "no Claude child for an invalid spec", f"spawned with --tools {argv_value(st3[0]['argv'], '--tools')!r}")
+        finally:
+            ag3.close()
+        ci.done()
+        # KC-ACP-01: protocolVersion 1 is accepted as well as "2025-08-22".
+        ag4 = Agent(ctx, "S1-v1", ws, "kc-probe", label="S1-v1")
+        try:
+            r4, e4, _ = ag4.request("initialize", dict(INIT_PARAMS, protocolVersion=1), timeout=15)
+            c.ok(e4 is None and (r4 or {}).get("protocolVersion") == 1, "initialize protocolVersion 1 accepted", json.dumps(r4 or e4)[:200])
+        finally:
+            ag4.close()
         c.ok(not ag.bad_lines, "stdout only JSON-RPC (KC-FS-06)", repr(ag.bad_lines[:2]))
     finally:
         ag.close()
-    c.done()
+    c.done(f"agentCapabilities extra keys beyond the 08 answer: {extra_caps}" if extra_caps else "")
+
+
+FAKE_MCP = os.path.join(HERE, "fake-claude-mcp.mjs")
+
+
+def _mcp_configs(argv: list[str]) -> dict:
+    merged: dict = {}
+    for v in argv_value(argv, "--mcp-config"):
+        try:
+            merged.update((json.loads(v if v.strip().startswith("{") else open(v).read()).get("mcpServers")) or {})
+        except (OSError, ValueError):
+            merged["_unreadable"] = v
+    return merged
 
 
 def s2(ctx: Ctx) -> None:
     c = Check("S2")
     sp = spec("kc-mcp", mcpServers={
-        "kc-alpha": {"command": "/bin/true", "args": [], "fakeTools": ["ping"]},
-        "kc-beta": {"command": "/bin/true", "args": ["--x"], "env": {"KC_SPEC_ONLY": "${HOME}"}},
+        "kc-alpha": {"command": "/bin/true", "args": [], "disabledTools": ["pong"]},
+        "kc-beta": {"command": "/bin/true", "args": ["--x"],
+                    "env": {"KC_SPEC_ONLY": "${HOME}", "KC_ENV_PREFIX": "${env:HOME}", "KC_UNSET": "${KC_NO_SUCH_VAR_E2E}"}},
         "kirocrew-core": {"command": "/bin/false", "args": ["spec-version"]},
-    }, tools=["execute_bash", "fs_read", "@kc-alpha", "@kc-beta", "@kirocrew-core", "@kirocrew-computer"])
+        "kc-broken": {"command": "/bin/true", "args": []},
+        "kc-remote": {"url": "http://127.0.0.1:9/mcp", "headers": {"X-Kc-Home": "${HOME}"}},
+        "kc-off": {"command": "/bin/true", "args": [], "disabled": True},
+    }, tools=["execute_bash", "fs_read", "@kc-alpha", "@kc-beta", "@kirocrew-core", "@kc-broken", "@kc-remote", "@kc-off", "@kirocrew-computer"])
     stub = [{"name": "kirocrew-core", "command": "/bin/true", "args": ["mcp-core"], "type": "stdio",
              "env": [{"name": "KIROCREW_STUB_SESSION_TOKEN", "value": "tok-e2e-stub"}, {"name": "KIROCREW_HOME", "value": "/x"}]}]
-    files = {".kiro/steering/kc-marker.md": "KC-STEERING-MARKER-7f3a\n", ".kiro/settings/cli.json": json.dumps({"chat.modelDefaults.auto.output_config.effort": "high"})}
-    ws, ag, sid, idx_new = opener(ctx, "S2", "kc-mcp", sp, files, extra_env={"ASBX_KIRO_MANDATORY_MCPS": "kc-alpha,kirocrew-core"}, mcp=stub)
+    files = {".kiro/steering/kc-marker.md": "KC-STEERING-MARKER-7f3a\n",
+             ".kiro/settings/cli.json": json.dumps({"chat.modelDefaults.auto.output_config.effort": "high"}),
+             # KC-SPEC-01: a server only in the workspace mcp.json; the spec has includeMcpJson:false
+             ".kiro/settings/mcp.json": json.dumps({"mcpServers": {"kc-mcpjson-only": {"command": "/bin/true", "args": []}}})}
+    canaries = {
+        # KC-ENV-01 / 00 §3.2: scrubbed before Claude is spawned
+        "KIRO_API_KEY": "kc-canary", "CLAUDE_CODE_ENTRYPOINT": "kc-canary-entry", "CLAUDE_CODE_SESSION_ID": str(uuid.uuid4()),
+        "CLAUDE_CODE_REMOTE_KC": "1", "CCR_KC_CANARY": "1", "CLAUDE_SESSION_INGRESS_KC": "1", "AI_AGENT": "kc-canary",
+        "DEBUG": "kc-canary", "NODE_OPTIONS": "--no-deprecation",
+        # kept
+        "KIRO_HOME": ctx.kiro_home, "KIROCREW_KC_CANARY": "keep-me",
+    }
+    inject = {"kc-alpha": {"fakeTools": ["ping", "pong"]}, "kirocrew-core": {"fakeTools": ["learn_add"]},
+              "kc-broken": {"fakeStatus": "failed"}}
+    extra = {"ASBX_KIRO_MANDATORY_MCPS": "kc-alpha,kirocrew-core", "KIRO_CLAUDE_BIN": FAKE_MCP, "KC_FAKE_MCP_INJECT": json.dumps(inject)}
+    if ctx.real:
+        extra = {"ASBX_KIRO_MANDATORY_MCPS": "kc-alpha,kirocrew-core"}
+    extra.update(canaries)
+    ws, ag, sid, idx_new = opener(ctx, "S2", "kc-mcp", sp, files, extra_env=extra, mcp=stub)
     try:
         res, err, idx = ag.request("session/set_mode", {"sessionId": sid, "modeId": "kc-mcp"})
         c.ok(err is None and res == {}, "set_mode same id ⇒ {}", json.dumps(res or err))
         cmu = ag.wait_for(lambda m: m.get("method") == "session/update" and (m["params"].get("update") or {}).get("sessionUpdate") == "current_mode_update", 5, idx_new)
         c.ok(cmu is not None and cmu[1]["params"]["update"].get("currentModeId") == "kc-mcp", "current_mode_update")
-        want = {"kc-alpha", "kc-beta", "kirocrew-core"}
+        ok_want = {"kc-alpha", "kc-beta", "kirocrew-core", "kc-remote"}
+        fail_want = {"kc-broken"} if not ctx.real else set()
         t0 = time.time()
-        seen: dict[str, int] = {}
-        while time.time() - t0 < 10 and set(seen) < want:
-            for m in ag.msgs(idx_new):
-                if m.get("method") in ("_kiro.dev/mcp/server_initialized", "_kiro.dev/mcp/server_init_failure"):
-                    seen.setdefault(m["params"].get("serverName"), 0)
+        while time.time() - t0 < 10:
+            got = {m["params"].get("serverName") for m in ag.msgs(idx_new)
+                   if m.get("method") in ("_kiro.dev/mcp/server_initialized", "_kiro.dev/mcp/server_init_failure")}
+            if got >= ok_want | fail_want:
+                break
             time.sleep(0.1)
-        counts = {}
+        time.sleep(1.0)  # late duplicates would show up here
+        counts, fails = {}, {}
         for m in ag.msgs(idx_new):
+            pr = m.get("params") or {}
             if m.get("method") == "_kiro.dev/mcp/server_initialized":
-                counts[m["params"].get("serverName")] = counts.get(m["params"].get("serverName"), 0) + 1
-        c.ok(set(counts) == want and all(v == 1 for v in counts.values()), "one server_initialized per server within 10s", json.dumps(counts))
+                counts[pr.get("serverName")] = counts.get(pr.get("serverName"), 0) + 1
+                c.ok(pr.get("sessionId") == sid, f"server_initialized {pr.get('serverName')} carries sessionId")
+            elif m.get("method") == "_kiro.dev/mcp/server_init_failure":
+                fails[pr.get("serverName")] = pr
+        if ctx.real:
+            c.ok(set(counts) | set(fails) >= {"kc-alpha", "kc-beta"}, "one server_initialized/init_failure per server", json.dumps(counts))
+        else:
+            c.ok(set(counts) == ok_want and all(v == 1 for v in counts.values()), "exactly one server_initialized per connected server within 10s",
+                 json.dumps(counts))
+            f = fails.get("kc-broken") or {}
+            c.ok(set(fails) == {"kc-broken"} and f.get("sessionId") == sid and isinstance(f.get("error"), str) and f.get("error"),
+                 "KC-ACP-04 server_init_failure {sessionId, serverName, error} for the failed server", json.dumps(fails)[:300])
+            c.ok("kc-off" not in counts and "kc-off" not in fails, "disabled server never initialized")
         res, err, _ = ag.request("_kiro.dev/commands/execute", {"sessionId": sid, "command": {"command": "mcp", "args": {}}}, timeout=40)
         servers = ((res or {}).get("data") or {}).get("servers") or []
-        c.ok((res or {}).get("success") is True and {s.get("name") for s in servers} == want and all(s.get("status") == "running" for s in servers),
-             "/mcp data.servers all running", json.dumps(res or err)[:300])
-        c.ok(all(isinstance(s.get("toolCount"), int) for s in servers), "toolCount ints")
+        by = {s.get("name"): s for s in servers}
+        c.ok((res or {}).get("success") is True and str((res or {}).get("message", "")).startswith(f"{len(servers)} MCP server"),
+             "/mcp {success:true, message:'N MCP servers'}", json.dumps({k: (res or {}).get(k) for k in ("success", "message")})[:200])
+        c.ok(all(by.get(n, {}).get("status") == "running" for n in ok_want), "/mcp connected servers status running",
+             json.dumps({n: by.get(n, {}).get("status") for n in sorted(by)}))
+        if not ctx.real:
+            c.ok(by.get("kc-broken", {}).get("status") == "failed", "/mcp failed server status failed", json.dumps(by.get("kc-broken")))
+            c.ok("kc-off" not in by or by["kc-off"].get("status") == "disabled", "/mcp disabled server absent or 'disabled'", json.dumps(by.get("kc-off")))
+            # toolCount is Claude's mcp_status tool count (08 does not say whether disabledTools are
+            # subtracted; kiro-claude counts them, see the evidence).
+            c.ok(by.get("kirocrew-core", {}).get("toolCount") == 1 and (by.get("kc-alpha", {}).get("toolCount") or 0) >= 1,
+                 f"toolCount from Claude's tools (kirocrew-core 1, kc-alpha {by.get('kc-alpha', {}).get('toolCount')} incl. 1 disabledTools entry)",
+                 json.dumps({n: by.get(n, {}).get("toolCount") for n in sorted(by)}))
+        c.ok(all(isinstance(s.get("toolCount"), int) for s in servers if s.get("status") != "disabled"), "toolCount ints (non-disabled servers)",
+             json.dumps({s.get("name"): s.get("toolCount") for s in servers}))
+        c.ok("kc-mcpjson-only" not in by, "KC-SPEC-01 includeMcpJson:false ⇒ mcp.json server not loaded")
         res, err, _ = ag.request("_kiro.dev/commands/execute", {"sessionId": sid, "command": {"command": "tools", "args": {}}}, timeout=40)
         tools = ((res or {}).get("data") or {}).get("tools") or []
-        srcs = sorted({t.get("source") for t in tools})
-        has_mcp = any(str(s).startswith("mcp:") for s in srcs)
-        if ctx.real or has_mcp:
-            c.ok((res or {}).get("success") is True and has_mcp, "/tools has mcp: sources", json.dumps(srcs)[:300])
-        else:
-            # fake-claude lists MCP tools only from a `fakeTools` key inside the --mcp-config entry,
-            # which kiro-claude (like any host) normalises away; the fake has no other way to
-            # declare an MCP server's tools, so the mcp: mapping cannot be shown in stage B.
-            report("S2-mcp-tools", "SKIP", f"fake-claude limitation: no MCP tools reported (sources {srcs}); needs a "
-                   "fake knob that survives host config normalisation, e.g. FAKE_CLAUDE_MCP_TOOLS={server:[tools]}")
+        srcs = sorted({str(t.get("source")) for t in tools})
+        c.ok((res or {}).get("success") is True and str((res or {}).get("message", "")).startswith(f"{len(tools)} tool"),
+             "/tools {success:true, message:'N tools'}", json.dumps({k: (res or {}).get(k) for k in ("success",)}))
         c.ok(any(t.get("source") == "builtin" for t in tools), "/tools has builtin sources")
+        mcp_tools = [(t.get("name"), t.get("source")) for t in tools if str(t.get("source")).startswith("mcp:")]
+        if ctx.real:
+            c.ok(True, f"/tools sources {srcs}")
+        else:
+            c.ok(any(src == "mcp:kc-alpha" and "ping" in str(n) for n, src in mcp_tools) and any(src == "mcp:kirocrew-core" for _, src in mcp_tools),
+                 "/tools data.tools[].source has the mcp:<server> prefix", json.dumps(mcp_tools)[:300])
+            c.ok(not any("pong" in str(n) for n, _ in mcp_tools), "disabledTools pong not offered", json.dumps(mcp_tools)[:200])
         # KC-ACP-22 available_commands_update after session/new
         c.ok(bool(ag.updates(idx_new, kind="available_commands_update")), "available_commands_update")
         if not ctx.real:
@@ -482,25 +610,32 @@ def s2(ctx: Ctx) -> None:
             if starts:
                 st = starts[0]
                 env = st.get("env") or {}
-                c.ok(env.get("KIROCREW_SPAWNED") == "1" and "CLAUDECODE" not in env, "KC-ENV-01 env passed, CLAUDECODE scrubbed",
-                     f"KIROCREW_SPAWNED={env.get('KIROCREW_SPAWNED')} CLAUDECODE={'CLAUDECODE' in env}")
-                cfgs = []
-                for v in argv_value(st["argv"], "--mcp-config"):
-                    try:
-                        cfgs.append(json.loads(v if v.strip().startswith("{") else open(v).read()))
-                    except (OSError, ValueError) as e:
-                        cfgs.append({"_err": str(e)})
-                merged = {}
-                for cf in cfgs:
-                    merged.update(cf.get("mcpServers") or {})
+                scrub = ["CLAUDECODE", "KIRO_API_KEY", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_REMOTE_KC", "CCR_KC_CANARY",
+                         "CLAUDE_SESSION_INGRESS_KC", "AI_AGENT", "DEBUG", "NODE_OPTIONS"]
+                leaked = [k for k in scrub if k in env]
+                c.ok(not leaked and env.get("CLAUDE_CODE_ENTRYPOINT") == "sdk-ts", "KC-ENV-01 scrub list removed (00 §3.2), CLAUDE_CODE_ENTRYPOINT=sdk-ts",
+                     f"leaked={leaked} entrypoint={env.get('CLAUDE_CODE_ENTRYPOINT')!r}")
+                kept = {k: env.get(k) for k in ("KIROCREW_SPAWNED", "KIROCREW_RUNTIME_AGENT", "KIROCREW_KC_CANARY", "KIRO_HOME")}
+                c.ok(kept == {"KIROCREW_SPAWNED": "1", "KIROCREW_RUNTIME_AGENT": "kirocrew", "KIROCREW_KC_CANARY": "keep-me", "KIRO_HOME": ctx.kiro_home},
+                     "KC-ENV-01 KIROCREW_* and KIRO_HOME kept", json.dumps({k: (v is not None) for k, v in kept.items()}))
+                merged = _mcp_configs(st["argv"])
                 core = merged.get("kirocrew-core") or {}
                 c.ok((core.get("env") or {}).get("KIROCREW_STUB_SESSION_TOKEN") == "tok-e2e-stub" and core.get("command") == "/bin/true",
-                     "KC-ENV-02 session stub overrides spec server, env kept", json.dumps(core)[:300])
+                     "KC-ENV-02 session stub overrides spec server, env kept", json.dumps({k: core.get(k) for k in ("command", "args")})[:300])
                 c.ok(merged.get("kc-alpha", {}).get("alwaysLoad") is True and merged.get("kirocrew-core", {}).get("alwaysLoad") is True
                      and not merged.get("kc-beta", {}).get("alwaysLoad"), "KC-ENV-03 alwaysLoad on ASBX_KIRO_MANDATORY_MCPS",
-                     json.dumps({k: v.get("alwaysLoad") for k, v in merged.items()}))
-                c.ok((merged.get("kc-beta", {}).get("env") or {}).get("KC_SPEC_ONLY") == ctx.home, "KC-SPEC-04 ${VAR} expansion",
-                     json.dumps(merged.get("kc-beta"))[:200])
+                     json.dumps({k: v.get("alwaysLoad") for k, v in merged.items() if isinstance(v, dict)}))
+                benv = merged.get("kc-beta", {}).get("env") or {}
+                c.ok(benv.get("KC_SPEC_ONLY") == ctx.home and benv.get("KC_ENV_PREFIX") == ctx.home and benv.get("KC_UNSET") == "${KC_NO_SUCH_VAR_E2E}",
+                     "KC-SPEC-04 ${VAR} and ${env:VAR} expanded, unresolved var stays literal",
+                     json.dumps({k: (v == ctx.home) if k != "KC_UNSET" else v for k, v in benv.items()}))
+                rem = merged.get("kc-remote") or {}
+                c.ok(rem.get("type") in ("http", "sse") and rem.get("url") == "http://127.0.0.1:9/mcp" and (rem.get("headers") or {}).get("X-Kc-Home") == ctx.home,
+                     "KC-SPEC-04 remote {url,headers} ⇒ http entry with expanded headers", json.dumps({k: rem.get(k) for k in ("type", "url")}))
+                c.ok("kc-off" not in merged and "kc-mcpjson-only" not in merged, "KC-SPEC-04 disabled server and (KC-SPEC-01) mcp.json server absent from --mcp-config",
+                     json.dumps(sorted(merged)))
+                dis = ",".join(argv_value(st["argv"], "--disallowedTools"))
+                c.ok("mcp__kc-alpha__pong" in dis, "KC-SPEC-04 disabledTools ⇒ --disallowedTools mcp__kc-alpha__pong", dis[:200])
                 eff = argv_value(st["argv"], "--effort")
                 c.ok(eff == ["high"], "KC-FS-05 cli.json effort ⇒ --effort high", repr(eff))
                 prompt_files = argv_value(st["argv"], "--append-system-prompt-file") + argv_value(st["argv"], "--system-prompt-file")
@@ -514,6 +649,55 @@ def s2(ctx: Ctx) -> None:
                 c.ok("KC-STEERING-MARKER-7f3a" in blob, "KC-FS-07 steering marker in Claude system prompt",
                      f"files={prompt_files} inline={len(blob)}B")
         c.ok(not ag.bad_lines, "stdout only JSON-RPC", repr(ag.bad_lines[:2]))
+    finally:
+        ag.close()
+    c.done()
+    if not ctx.real:
+        s2_mcpjson_control(ctx)
+        s2_switch(ctx)
+
+
+def s2_mcpjson_control(ctx: Ctx) -> None:
+    """KC-SPEC-01 positive control: the same workspace mcp.json IS merged when includeMcpJson is true,
+    so S2's absence check is meaningful."""
+    c = Check("S2-mcpjson-control")
+    files = {".kiro/settings/mcp.json": json.dumps({"mcpServers": {"kc-mcpjson-only": {"command": "/bin/true", "args": []}}})}
+    ws, ag, sid, _ = opener(ctx, "S2j", "kc-json", spec("kc-json", includeMcpJson=True, tools=["fs_read", "@kc-mcpjson-only"]), files)
+    try:
+        time.sleep(0.5)
+        starts = stream_starts(fake_log(ws))
+        merged = _mcp_configs(starts[0]["argv"]) if starts else {}
+        c.ok("kc-mcpjson-only" in merged, "includeMcpJson:true ⇒ workspace mcp.json server in --mcp-config", json.dumps(sorted(merged)))
+    finally:
+        ag.close()
+    c.done()
+
+
+def s2_switch(ctx: Ctx) -> None:
+    """KC-ACP-03 (P1): set_mode with a DIFFERENT id swaps the agent: {} + current_mode_update +
+    _kiro.dev/agent/switched, and the Claude child is respawned with --resume."""
+    c = Check("S2-switch")
+    ws = ctx.workspace("S2s", "kc-one", spec("kc-one"))
+    with open(os.path.join(ws, ".kiro", "agents", "kc-two.json"), "w") as f:
+        json.dump(spec("kc-two", prompt="You are the second agent."), f)
+    ag = Agent(ctx, "S2s", ws, "kc-one")
+    try:
+        ag.initialize()
+        r, e, _ = ag.new_session()
+        sid = (r or {})["sessionId"]
+        ag.prompt(sid, words(ctx, "PING"))
+        start = len(ag.frames)
+        res, err, _ = ag.request("session/set_mode", {"sessionId": sid, "modeId": "kc-two"})
+        c.ok(err is None and res == {}, "set_mode kc-two ⇒ {}", json.dumps(res or err)[:200])
+        cmu = ag.wait_for(lambda m: m.get("method") == "session/update" and (m["params"].get("update") or {}).get("sessionUpdate") == "current_mode_update"
+                          and m["params"]["update"].get("currentModeId") == "kc-two", 10, start)
+        c.ok(cmu is not None, "current_mode_update kc-two")
+        sw = ag.wait_for(lambda m: m.get("method") == "_kiro.dev/agent/switched", 10, start)
+        c.ok(sw is not None and (sw[1].get("params") or {}).get("sessionId") == sid, "_kiro.dev/agent/switched", json.dumps(sw[1] if sw else None)[:200])
+        r2, e2, i2, s2_ = ag.prompt(sid, words(ctx, "PING"))
+        c.ok((r2 or {}).get("stopReason") == "end_turn", "prompt after the switch")
+        starts = stream_starts(fake_log(ws))
+        c.ok(len(starts) >= 2 and argv_value(starts[-1]["argv"], "--resume"), "respawned with --resume", str([argv_value(s["argv"], "--resume") for s in starts]))
     finally:
         ag.close()
     c.done()
@@ -531,7 +715,13 @@ def s3(ctx: Ctx) -> None:
         c.ok(err is None and (res or {}).get("stopReason") == "end_turn", "end_turn", json.dumps(res or err)[:200])
         c.ok(expect_text(ctx, got, "PONG"), "chunks contain PONG", repr(got[:120]))
         meta = ag.wait_for(lambda m: m.get("method") == "_kiro.dev/metadata" and "contextUsagePercentage" in (m.get("params") or {}), 5, start)
-        c.ok(meta is not None, "_kiro.dev/metadata.contextUsagePercentage")
+        c.ok(meta is not None and meta[1]["params"].get("sessionId") == sid and isinstance(meta[1]["params"].get("contextUsagePercentage"), (int, float)),
+             "KC-ACP-13 _kiro.dev/metadata {sessionId, contextUsagePercentage:number}", json.dumps(meta[1]["params"] if meta else None)[:200])
+        mds = [m["params"] for m in ag.msgs() if m.get("method") == "_kiro.dev/metadata"]
+        c.ok(not any("meteringUsage" in json.dumps(x) for x in mds), "KC-ACP-13 no credit meteringUsage")
+        if not ctx.real:
+            sent = [user_text(r) for r in fake_log(ws) if r.get("event") == "stdin" and (r.get("line") or {}).get("type") == "user"]
+            c.ok(text in sent, "KC-ACP-06 the 53 KB prompt reached Claude verbatim", f"{len(sent)} user lines, lengths {[len(x) for x in sent][:3]} vs {len(text)}")
         usage = ag.updates(start, kind="usage_update")
         c.ok(bool(usage) and all({"used", "size"} <= set(u) for u in usage), "KC-ACP-18 usage_update {used,size}", json.dumps(usage[:1]))
         c.ok(isinstance((res or {}).get("usage"), dict), "KC-ACP-18 PromptResponse.usage", json.dumps((res or {}).get("usage"))[:200])
@@ -546,10 +736,33 @@ def s3(ctx: Ctx) -> None:
                 except ValueError:
                     kinds.append("<bad>")
         c.ok("Prompt" in kinds and "AssistantMessage" in kinds and os.path.getsize(jl) >= 10, "KC-FS-03 <sid>.jsonl Prompt+AssistantMessage", repr(kinds))
+        recs = []
+        if os.path.exists(jl):
+            for line in open(jl, encoding="utf-8"):
+                try:
+                    recs.append(json.loads(line))
+                except ValueError:
+                    pass
+        pr = next((r for r in recs if r.get("kind") == "Prompt"), {})
+        am = next((r for r in recs if r.get("kind") == "AssistantMessage"), {})
+        def shape_ok(r, want_text=None):
+            d = r.get("data") or {}
+            cont = d.get("content") or []
+            return (r.get("version") == 1 and isinstance(r.get("timestamp"), str) and isinstance(d.get("message_id"), str)
+                    and cont and cont[0].get("kind") == "text" and isinstance(cont[0].get("data"), str)
+                    and (want_text is None or cont[0]["data"] == want_text))
+        c.ok(shape_ok(pr, text) and shape_ok(am), "KC-FS-03 08a §4.2 record shapes (version 1, timestamp, data.message_id, content[{kind:text,data}]; Prompt = the prompt text)",
+             json.dumps({"Prompt": {k: pr.get(k) for k in ("version", "kind")}, "AssistantMessage": (am.get("data") or {}).get("content")})[:300])
         env = json.load(open(jf)) if os.path.exists(jf) else {}
-        c.ok(env.get("session_id") == sid and (env.get("session_state") or {}).get("agent_name") == "kc-chat"
-             and ((env.get("session_state") or {}).get("permissions") or {}).get("filesystem") is not None
-             and env.get("kind") == "kiro-claude-session", "KC-FS-02 <sid>.json kiro-cli envelope", json.dumps(env)[:200])
+        ss = env.get("session_state") or {}
+        fsp = (ss.get("permissions") or {}).get("filesystem") or {}
+        c.ok(env.get("session_id") == sid and ss.get("agent_name") == "kc-chat" and env.get("cwd") == ws
+             and isinstance(env.get("created_at"), str) and isinstance(env.get("updated_at"), str) and "title" in env
+             and isinstance(ss.get("conversation_metadata"), dict)
+             and isinstance(fsp.get("allowed_read_paths"), list) and isinstance(fsp.get("allowed_write_paths"), list)
+             and env.get("kind") == "kiro-claude-session" and isinstance(env.get("kiro_claude"), dict),
+             "KC-FS-02 <sid>.json kiro-cli envelope (session_id, cwd, created_at, updated_at, title, session_state{agent_name, permissions.filesystem{allowed_read_paths, allowed_write_paths}, conversation_metadata}, kind, kiro_claude)",
+             json.dumps({k: env.get(k) for k in ("session_id", "cwd", "kind")})[:200])
         c.ok(os.path.exists(jf) and (os.stat(jf).st_mode & 0o777) == 0o600, "KC-FS-02 mode 0600",
              oct(os.stat(jf).st_mode & 0o777) if os.path.exists(jf) else "missing")
     finally:
@@ -585,16 +798,19 @@ def _deny_in_fake_log(ws: str) -> bool:
 
 
 def s4(ctx: Ctx, variant: str) -> None:
-    sid_name = {"allow": "S4", "reject": "S4r", "allowed": "S4b"}[variant]
+    sid_name = {"allow": "S4", "reject": "S4r", "allowed": "S4b", "cancel": "S4c"}[variant]
     c = Check(sid_name)
     allowed = ["fs_read", "execute_bash"] if variant == "allowed" else ["fs_read"]
     ws, ag, sid, _ = opener(ctx, sid_name, "kc-tools", spec("kc-tools", allowedTools=allowed))
-    ag.permission_policy = "reject_once" if variant == "reject" else "allow_once"
+    ag.permission_policy = {"reject": "reject_once", "cancel": "cancelled"}.get(variant, "allow_once")
     try:
         res, err, idx, start = ag.prompt(sid, words(ctx, "RUN-ECHO"), timeout=180)
         calls, upd, perm_i, call_i = _tool_frames(ag, start)
         perms = [m for m in ag.msgs(start) if m.get("method") == "session/request_permission"]
-        c.ok(err is None and (res or {}).get("stopReason") == "end_turn", "end_turn", json.dumps(res or err)[:200])
+        if variant == "cancel":
+            c.ok(err is None and (res or {}).get("stopReason") in ("end_turn", "cancelled"), "turn ends (end_turn or cancelled)", json.dumps(res or err)[:200])
+        else:
+            c.ok(err is None and (res or {}).get("stopReason") == "end_turn", "end_turn", json.dumps(res or err)[:200])
         shell = [u for u in calls if ((u.get("_meta") or {}).get("kiro") or {}).get("toolName") == "shell"]
         c.ok(bool(shell), "tool_call _meta.kiro.toolName=shell", json.dumps([(u.get("_meta") or {}) for u in calls])[:300])
         c.ok(all(((u.get("_meta") or {}).get("kiro") or {}).get("toolName") for u in calls), "_meta.kiro.toolName on every tool_call")
@@ -614,10 +830,11 @@ def s4(ctx: Ctx, variant: str) -> None:
                 c.ok(opts == KIRO_OPTIONS, "3 kiro options", json.dumps(p.get("options"))[:300])
                 c.ok(call_i is not None and perm_i is not None and call_i < perm_i, "tool_call precedes request_permission")
                 c.ok((p.get("toolCall") or {}).get("toolCallId") == tcid, "permission names the tool_call")
-        if variant == "reject":
+        if variant in ("reject", "cancel"):
             fm = (final[-1].get("_meta") or {}).get("kiro") if final else {}
-            c.ok(bool(final) and final[-1].get("status") == "failed", "on reject: failed", json.dumps(final)[:300])
-            c.ok((fm or {}).get("toolCallFailureReason") == "permission_denied", "toolCallFailureReason permission_denied", json.dumps(fm)[:200])
+            c.ok(bool(final) and final[-1].get("status") == "failed", f"on {variant}: failed", json.dumps(final)[:300])
+            if variant == "reject":
+                c.ok((fm or {}).get("toolCallFailureReason") == "permission_denied", "toolCallFailureReason permission_denied", json.dumps(fm)[:200])
             if not ctx.real:
                 c.ok(_deny_in_fake_log(ws), "fake log shows a deny answer")
                 ran = any(r.get("event") == "stdin" and "kc-e2e" in json.dumps(r.get("line")) and '"tool_result"' in json.dumps(r.get("line")) for r in fake_log(ws))
@@ -632,6 +849,22 @@ def s4(ctx: Ctx, variant: str) -> None:
             c.ok(bool(final) and final[-1].get("status") == "completed", "completed", json.dumps(final)[-300:])
             c.ok(stdout is not None and "kc-e2e" in stdout, "rawOutput.items[0].Json.stdout has kc-e2e", json.dumps(ro)[:300])
             c.ok(expect_text(ctx, ag.text(start, idx), "DONE"), "reply DONE", repr(ag.text(start, idx)[:100]))
+            time.sleep(0.3)
+            jl = os.path.join(ctx.sessions_dir(), f"{sid}.jsonl")
+            trs = []
+            if os.path.exists(jl):
+                for line in open(jl, encoding="utf-8"):
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    if r.get("kind") == "ToolResults":
+                        trs += (r.get("data") or {}).get("content") or []
+            tr = next((x for x in trs if x.get("kind") == "toolResult"), {})
+            td = tr.get("data") or {}
+            c.ok(str(td.get("toolUseId", "")).startswith("toolu_") and td.get("status") == "success"
+                 and any(b.get("kind") == "text" and "kc-e2e" in str(b.get("data")) for b in td.get("content") or []),
+                 "KC-FS-03 ToolResults record {kind:toolResult, data{toolUseId, content[{kind:text}], status:success}}", json.dumps(trs)[:300])
     finally:
         ag.close()
     c.done()
@@ -645,11 +878,12 @@ def s5(ctx: Ctx) -> None:
         c.ok(err is None and res == {}, "set_model claude-haiku-5.5 ⇒ {}", json.dumps(res or err))
         res, err, _ = ag.request("session/set_model", {"sessionId": sid, "modelId": "bogus"})
         c.ok(err is not None and "Invalid model ID: bogus" in json.dumps(err), "bogus ⇒ error 'Invalid model ID: bogus'", json.dumps(res or err)[:200])
-        res, err, _ = ag.request("_kiro.dev/commands/execute", {"sessionId": sid, "command": {"command": "effort", "args": {"value": "high"}}})
-        if not ((res or {}).get("message") == "Effort set to high"):
-            # tolerate the other args spellings KiroCrew has used
-            res, err, _ = ag.request("_kiro.dev/commands/execute", {"sessionId": sid, "command": {"command": "effort", "args": {"level": "high"}}})
-        c.ok((res or {}).get("success") is True and (res or {}).get("message") == "Effort set to high", "effort high ⇒ 'Effort set to high'", json.dumps(res or err)[:200])
+        # KiroCrew sends BOTH spellings: providers/acp_model_effort.py send_command("/effort", args={"level": l})
+        # and the dashboard slash path parse_slash_command("/effort high") ⇒ args {"value": "high"}.
+        for argk, lvl in (("level", "high"), ("value", "low")):
+            res, err, _ = ag.request("_kiro.dev/commands/execute", {"sessionId": sid, "command": {"command": "effort", "args": {argk: lvl}}})
+            c.ok(err is None and (res or {}).get("success") is True and (res or {}).get("message") == f"Effort set to {lvl}",
+                 f"effort args {{{argk}: {lvl}}} ⇒ 'Effort set to {lvl}'", json.dumps(res or err)[:200])
         res, err, _ = ag.request("_kiro.dev/commands/execute", {"sessionId": sid, "command": {"command": "foo", "args": {}}})
         c.ok(err is None and (res or {}).get("success") is False and (res or {}).get("message") == "Unknown command: /foo", "foo ⇒ {success:false, Unknown command: /foo}", json.dumps(res or err)[:200])
         if not ctx.real:
@@ -658,9 +892,29 @@ def s5(ctx: Ctx) -> None:
             sm = [((r.get("line") or {}).get("request") or {}).get("model") for r in fake_log(ws)
                   if r.get("event") == "stdin" and ((r.get("line") or {}).get("request") or {}).get("subtype") == "set_model"]
             c.ok(any(m in ("haiku", "claude-haiku-5-5") for m in sm), "set_model reached Claude (control set_model)", json.dumps(sm))
+            starts = stream_starts(fake_log(ws))
+            efforts = [argv_value(x["argv"], "--effort") for x in starts]
+            stdin_eff = [user_text(r) for r in fake_log(ws) if r.get("event") == "stdin" and user_text(r).startswith("/effort")]
+            c.ok(any(e == ["low"] for e in efforts) or any("low" in t for t in stdin_eff), "last effort (low) reached Claude",
+                 f"--effort per spawn {efforts}; /effort lines {stdin_eff}")
     finally:
         ag.close()
     c.done()
+    # KC-ACP-05 `clear` ⇒ {success:true} + _kiro.dev/clear/status (P0 per 08 §2.5 KC-ACP-05).
+    cc = Check("S5-clear")
+    ws, ag, sid, _ = opener(ctx, "S5c", "kc-chat", spec("kc-chat"))
+    try:
+        ag.prompt(sid, words(ctx, "PING"))
+        start = len(ag.frames)
+        res, err, _ = ag.request("_kiro.dev/commands/execute", {"sessionId": sid, "command": {"command": "clear", "args": {}}}, timeout=60)
+        cc.ok(err is None and (res or {}).get("success") is True, "clear ⇒ {success:true}", json.dumps(res or err)[:200])
+        cs = ag.wait_for(lambda m: m.get("method") == "_kiro.dev/clear/status", 10, start)
+        cc.ok(cs is not None and (cs[1].get("params") or {}).get("sessionId") == sid, "_kiro.dev/clear/status", json.dumps(cs[1] if cs else None)[:200])
+        r2, e2, i2, s2_ = ag.prompt(sid, words(ctx, "PING"))
+        cc.ok((r2 or {}).get("stopReason") == "end_turn" and expect_text(ctx, ag.text(s2_, i2), "PONG"), "session usable after clear")
+    finally:
+        ag.close()
+    cc.done()
 
 
 def s6(ctx: Ctx) -> None:
@@ -670,7 +924,7 @@ def s6(ctx: Ctx) -> None:
         ag.prompt(sid, words(ctx, "PING"))
         res, err, idx, start = ag.prompt(sid, "/compact", timeout=180)
         c.ok(err is None and (res or {}).get("stopReason") == "end_turn", "end_turn", json.dumps(res or err)[:200])
-        c.ok("Compacting conversation" in ag.text(start, idx), "chunk 'Compacting conversation...'", repr(ag.text(start, idx)[:80]))
+        c.ok(ag.text(start, idx).startswith("Compacting conversation...\n"), "chunk 'Compacting conversation...\\n'", repr(ag.text(start, idx)[:80]))
         done = ag.wait_for(lambda m: m.get("method") == "_kiro.dev/compaction/status" and ((m["params"].get("status") or {}).get("type") in ("completed", "failed")), 60, start)
         cps = [m["params"] for m in ag.msgs(start) if m.get("method") == "_kiro.dev/compaction/status"]
         sts = [(p.get("status") or {}) for p in cps]
@@ -683,11 +937,30 @@ def s6(ctx: Ctx) -> None:
         c.ok(bool(cps) and isinstance(cps[-1].get("summary"), str) and cps[-1]["summary"].strip() != "", "completed + summary", json.dumps(cps[-1:])[:200])
         time.sleep(0.3)
         jl = os.path.join(ctx.sessions_dir(), f"{sid}.jsonl")
-        kinds = [json.loads(l).get("kind") for l in open(jl)] if os.path.exists(jl) else []
-        c.ok("Compaction" in kinds, "Compaction jsonl record", repr(kinds))
+        recs = [json.loads(l) for l in open(jl)] if os.path.exists(jl) else []
+        comp = [r for r in recs if r.get("kind") == "Compaction"]
+        snap = ((comp[-1].get("data") or {}).get("messages_snapshot") or [{}]) if comp else [{}]
+        c.ok(bool(comp) and (snap[0].get("content") or [{}])[0].get("kind") == "text",
+             "Compaction jsonl record {data.messages_snapshot[{content[{kind:text}]}]}", json.dumps(comp[-1:])[:200])
     finally:
         ag.close()
     c.done()
+    if ctx.real:
+        return
+    # KC-ACP-14: also emitted for Claude AUTO-compaction (status compacting → compact_boundary → summary).
+    ca = Check("S6-auto")
+    ws, ag, sid, _ = opener(ctx, "S6a", "kc-chat", spec("kc-chat"))
+    try:
+        res, err, idx, start = ag.prompt(sid, "AUTO-COMPACT", timeout=60)
+        ca.ok((res or {}).get("stopReason") == "end_turn" and "AUTO-DONE" in ag.text(start, idx), "turn ends end_turn with the reply", json.dumps(res or err)[:150])
+        ag.wait_for(lambda m: m.get("method") == "_kiro.dev/compaction/status" and ((m["params"].get("status") or {}).get("type") == "completed"), 10, start)
+        cps = [m["params"] for m in ag.msgs(start) if m.get("method") == "_kiro.dev/compaction/status"]
+        types = [(x.get("status") or {}).get("type") for x in cps]
+        ca.ok(types == ["started", "completed"], "compaction/status started → completed for auto-compaction", json.dumps(types))
+        ca.ok(bool(cps) and "KC-AUTO-SUMMARY-91c2" in str(cps[-1].get("summary")), "completed carries the summary", json.dumps(cps[-1:])[:200])
+    finally:
+        ag.close()
+    ca.done()
 
 
 def s7(ctx: Ctx) -> None:
@@ -786,10 +1059,20 @@ def s10(ctx: Ctx) -> None:
         for _ in range(2):
             r, e, _ = ag.new_session()
             sids.append(r["sessionId"])
-        # 3 concurrent prompts
-        rids = [ag.request_async("session/prompt", {"sessionId": s, "prompt": [{"type": "text", "text": words(ctx, "PING")}]}) for s in sids]
+        # 3 concurrent prompts; in stage B each turn sleeps 1.5 s, so they only finish in < 3 s if they really overlap
+        first = len(ag.frames)
+        t0 = time.time()
+        rids = [ag.request_async("session/prompt", {"sessionId": s, "prompt": [{"type": "text", "text": words(ctx, "DELAY-PING" if not ctx.real else "PING")}]}) for s in sids]
         outs = [ag.wait_response(r, 120) for r in rids]
+        dt = time.time() - t0
         c.ok(all((o[0] or {}).get("stopReason") == "end_turn" for o in outs), "3 concurrent sessions end_turn", json.dumps([o[0] or o[1] for o in outs])[:200])
+        if not ctx.real:
+            c.ok(dt < 3.0, f"the 3 turns overlapped ({dt:.2f}s for 3 × 1.5 s turns)")
+        per = {}
+        for m in ag.msgs(first):
+            if m.get("method") == "session/update" and (m["params"].get("update") or {}).get("sessionUpdate") == "agent_message_chunk":
+                per[m["params"].get("sessionId")] = per.get(m["params"].get("sessionId"), "") + ((m["params"]["update"].get("content") or {}).get("text") or "")
+        c.ok(all(expect_text(ctx, per.get(x, ""), "PONG") for x in sids), "each session's reply arrives under its own sessionId", json.dumps({k[:8]: v[:20] for k, v in per.items()}))
         # 2 helper sessions while the main ones idle: open → prompt → terminate (lite spec, no tools)
         helpers_ok = []
         for _ in range(2):
@@ -934,22 +1217,198 @@ def s13(ctx: Ctx) -> None:
     c.done()
     c2 = Check("S13r")
     files = {"secret/token.txt": "TOP-SECRET-VALUE\n", "notes.txt": "public\n"}
-    sp = spec("kc-ro--readonly", tools=["fs_read", "grep", "glob"], allowedTools=["fs_read", "grep", "glob"],
-              toolsSettings={"fs_read": {"deniedPaths": ["secret/**", os.path.join(ctx.e2e, "ws-s13r", "secret")]}})
-    ws, ag, sid, _ = opener(ctx, "S13r", "kc-ro--readonly", sp, files)
+    # fs_read is deliberately NOT in allowedTools. fs_read trusts the working directory, so the
+    # in-cwd denied read (secret/) shows deniedPaths beating that trust; a read OUTSIDE the cwd
+    # normally asks (control), so the outside denied read shows "refused before any permission".
+    out = os.path.join(ctx.e2e, "s13r-outside")
+    os.makedirs(out, exist_ok=True)
+    for n_, t_ in (("secret.txt", "OUTSIDE-SECRET-VALUE\n"), ("public.txt", "outside public\n")):
+        with open(os.path.join(out, n_), "w") as f:
+            f.write(t_)
+    sp = spec("kc-ro--readonly", tools=["fs_read", "grep", "glob"], allowedTools=["grep", "glob"],
+              toolsSettings={"fs_read": {"deniedPaths": ["secret/**", os.path.join(ctx.e2e, "ws-s13r", "secret"), os.path.join(out, "secret.txt")]}})
+    ws, ag, sid, _ = opener(ctx, "S13r", "kc-ro--readonly", sp, files, extra_env={"KC_S13R_OUT": out})
     try:
         res, err, idx, start = ag.prompt(sid, words(ctx, "READ-DENIED"), timeout=180)
         calls, upd, perm_i, _ = _tool_frames(ag, start)
         final = [u for u in upd if u.get("status") in ("completed", "failed")]
         c2.ok((res or {}).get("stopReason") == "end_turn", "end_turn", json.dumps(res or err)[:150])
-        c2.ok(perm_i is None, "no permission request for the denied read")
+        c2.ok(perm_i is None, "no permission request for the denied read (fs_read not pre-approved)")
         c2.ok(bool(final) and final[-1].get("status") == "failed", "read of a denied path ⇒ failed", json.dumps(final)[:300])
         c2.ok("TOP-SECRET-VALUE" not in json.dumps(ag.msgs(start)), "secret never on the wire")
         if not ctx.real:
             c2.ok(_deny_in_fake_log(ws), "Claude got a deny before the tool ran")
+            # control 1: a non-denied read in the cwd completes without asking (cwd trust)
+            res, err, idx, start = ag.prompt(sid, "READ-PUBLIC", timeout=60)
+            _, upd2, perm2, _ = _tool_frames(ag, start)
+            fin2 = [u for u in upd2 if u.get("status") in ("completed", "failed")]
+            c2.ok(perm2 is None and fin2 and fin2[-1].get("status") == "completed", "control: a non-denied read in the cwd completes (cwd trust)",
+                  f"perm={perm2 is not None} final={[u.get('status') for u in fin2]}")
+            # control 2: a non-denied read OUTSIDE the cwd asks (answered allow_once) and completes
+            res, err, idx, start = ag.prompt(sid, "READ-OUT-PUBLIC", timeout=60)
+            _, upd3, perm3, _ = _tool_frames(ag, start)
+            fin3 = [u for u in upd3 if u.get("status") in ("completed", "failed")]
+            c2.ok(perm3 is not None and fin3 and fin3[-1].get("status") == "completed", "control: a non-denied read outside the cwd asks, then completes",
+                  f"perm={perm3 is not None} final={[u.get('status') for u in fin3]}")
+            # the denied file outside the cwd: refused BEFORE any permission request
+            res, err, idx, start = ag.prompt(sid, "READ-OUT-DENIED", timeout=60)
+            _, upd4, perm4, _ = _tool_frames(ag, start)
+            fin4 = [u for u in upd4 if u.get("status") in ("completed", "failed")]
+            c2.ok(perm4 is None and fin4 and fin4[-1].get("status") == "failed" and "OUTSIDE-SECRET-VALUE" not in json.dumps(ag.msgs(start)),
+                  "denied read outside the cwd ⇒ failed with no permission request", f"perm={perm4 is not None} final={[u.get('status') for u in fin4]}")
     finally:
         ag.close()
     c2.done()
+
+
+def s11f(ctx: Ctx) -> None:
+    """KC-ACP-16: every frame stays under 10 MiB (tool output is truncated)."""
+    c = Check("S11-frame")
+    if ctx.real:
+        return report("S11-frame", "SKIP", "needs a scripted 12 MiB tool result (stage B only)")
+    ws = ctx.workspace("S11f", "kc-tools", spec("kc-tools", allowedTools=["fs_read", "execute_bash"]))
+    big = os.path.join(ws, "big-script.json")
+    with open(big, "w") as f:
+        json.dump({"turns": [{"repeat": True, "match": "BIG", "steps": [
+            {"tool": {"name": "Bash", "input": {"command": "yes kc | head -c 12582912", "description": "big"}, "result": "kc-big-" + ("x" * (12 * 1024 * 1024))}},
+            {"text": "BIG-DONE"}]}]}, f)
+    ag = Agent(ctx, "S11f", ws, "kc-tools", extra_env={"FAKE_CLAUDE_SCRIPT": big})
+    longest = [0]
+    orig = ag._log
+    def sized(direction, obj, _o=orig):
+        if direction == "in":
+            longest[0] = max(longest[0], len(json.dumps(obj)))
+        _o(direction, obj)
+    ag._log = sized
+    try:
+        ag.initialize()
+        r, e, _ = ag.new_session()
+        sid = (r or {})["sessionId"]
+        res, err, idx, start = ag.prompt(sid, "BIG", timeout=120)
+        c.ok((res or {}).get("stopReason") == "end_turn" and "BIG-DONE" in ag.text(start, idx), "turn with a 12 MiB tool result ends end_turn", json.dumps(res or err)[:150])
+        c.ok(0 < longest[0] < 10 * 1024 * 1024, f"largest frame {longest[0]} B < 10 MiB")
+        c.ok(not ag.bad_lines, "only frames on stdout")
+    finally:
+        ag.close()
+    c.done()
+
+
+def s15(ctx: Ctx) -> None:
+    """KC-SPEC-02 tool mapping with KiroCrew's real tool list (kirocrew.json / kirocrew-worker.json):
+    execute_bash, fs_read, fs_write, grep, glob, web_fetch, web_search and tool_search map to Claude
+    tools; code, introspect, session and report are ignored with a debug log only (no WARN)."""
+    c = Check("S15")
+    tools = ["execute_bash", "fs_read", "fs_write", "code", "grep", "glob", "web_fetch", "web_search", "introspect", "session", "report", "tool_search"]
+    sp = spec("kc-map", tools=tools, allowedTools=["web_fetch", "web_search", "introspect", "session", "report", "tool_search"])
+    ws, ag, sid, _ = opener(ctx, "S15", "kc-map", sp)
+    try:
+        res, err, _ = ag.request("_kiro.dev/commands/execute", {"sessionId": sid, "command": {"command": "tools", "args": {}}}, timeout=40)
+        names = sorted({t.get("name") for t in ((res or {}).get("data") or {}).get("tools") or []})
+        c.ok({"shell", "read", "write", "grep", "glob", "web_fetch", "web_search"} <= set(names), "/tools lists shell, read, write, grep, glob, web_fetch, web_search", json.dumps(names))
+        c.ok("tool_search" in names, "/tools lists tool_search (KiroCrew's tool_search selection is honoured)", json.dumps(names))
+        if not ctx.real:
+            time.sleep(0.3)
+            st = stream_starts(fake_log(ws))
+            tv = ",".join(argv_value(st[0]["argv"], "--tools")) if st else ""
+            want = {"Bash", "Read", "Glob", "Grep", "Write", "Edit", "WebFetch", "WebSearch"}
+            c.ok(want <= set(tv.split(",")), "--tools has Bash, Read, Glob, Grep, Write, Edit, WebFetch, WebSearch", tv)
+            c.ok("ToolSearch" in tv.split(","), "tool_search ⇒ --tools has ToolSearch", tv)
+        log = ""
+        try:
+            log = open(os.path.join(ws, "kiro-chat.log"), encoding="utf-8", errors="replace").read()
+        except OSError:
+            pass
+        warned = sorted(set(re.findall(r"WARN[^\n]*Tool '([a-z_]+)' in [a-zA-Z]+ is not available", log)))
+        c.ok(not warned, "no WARN for KiroCrew's tool names (code/introspect/session/report are debug-only, tool_search maps)", f"WARN for {warned}")
+    finally:
+        ag.close()
+    c.done()
+
+
+def s16(ctx: Ctx) -> None:
+    """KC-ACP-20 (P1, B): Claude's todo tools ⇒ kiro `todo_list` tool frames with the snapshot
+    envelope, plus ACP `plan` updates."""
+    c = Check("S16")
+    if ctx.real:
+        return report("S16", "SKIP", "scripted todo tools (stage B only)")
+    ws, ag, sid, _ = opener(ctx, "S16", "kc-todo", spec("kc-todo", tools=["fs_read", "todo_list"], allowedTools=["fs_read", "todo_list"]))
+    try:
+        res, err, idx, start = ag.prompt(sid, "TODO-PLAN", timeout=60)
+        c.ok((res or {}).get("stopReason") == "end_turn" and "TODO-DONE" in ag.text(start, idx), "end_turn + reply", json.dumps(res or err)[:150])
+        calls, upd, perm_i, _ = _tool_frames(ag, start)
+        names = [((u.get("_meta") or {}).get("kiro") or {}).get("toolName") for u in calls]
+        c.ok(names and all(n == "todo_list" for n in names), "tool_call _meta.kiro.toolName todo_list", json.dumps(names))
+        c.ok(perm_i is None, "no permission request (allowed)")
+        fin = [u for u in upd if u.get("status") == "completed"]
+        snap = json.dumps(fin[-1].get("rawOutput")) if fin else ""
+        c.ok(fin and "kc todo one" in snap and "kc todo two" in snap, "completed todo_list rawOutput carries the todo snapshot", snap[:300])
+        plans = ag.updates(start, idx, "plan")
+        last = plans[-1].get("entries") if plans else []
+        c.ok(bool(plans) and len(last or []) == 2 and any(e.get("status") == "completed" for e in last or []), "plan updates: 2 entries, one completed",
+             json.dumps(last)[:300])
+    finally:
+        ag.close()
+    c.done()
+
+
+def s17(ctx: Ctx) -> None:
+    """KC-ACP-21 (P1, B): a Claude subagent's inner tool calls are reported under the PARENT
+    sessionId with _meta.claudeCode.parentToolUseId."""
+    c = Check("S17")
+    if ctx.real:
+        return report("S17", "SKIP", "scripted subagent frames (stage B only)")
+    ws, ag, sid, _ = opener(ctx, "S17", "kc-sub", spec("kc-sub", tools=["execute_bash", "fs_read", "subagent"], allowedTools=["execute_bash", "fs_read", "subagent"]))
+    try:
+        res, err, idx, start = ag.prompt(sid, "SUBAGENT-RUN", timeout=60)
+        c.ok((res or {}).get("stopReason") == "end_turn" and "SUB-DONE" in ag.text(start, idx), "end_turn + reply", json.dumps(res or err)[:150])
+        inner = []
+        for m in ag.msgs(start, idx):
+            if m.get("method") != "session/update":
+                continue
+            u = m["params"].get("update") or {}
+            if u.get("sessionUpdate") == "tool_call" and ((u.get("_meta") or {}).get("claudeCode") or {}).get("parentToolUseId"):
+                inner.append((m["params"].get("sessionId"), u))
+        c.ok(bool(inner), "inner tool_call carries _meta.claudeCode.parentToolUseId",
+             json.dumps([((u.get("_meta") or {})) for _, u in inner])[:300] or json.dumps([u.get("_meta") for u in ag.updates(start, idx, "tool_call")])[:300])
+        c.ok(inner and all(s_ == sid for s_, _ in inner), "inner tool_call is under the parent sessionId")
+        c.ok(inner and ((inner[0][1].get("_meta") or {}).get("claudeCode") or {}).get("parentToolUseId") == "toolu_kcparent01", "parentToolUseId names the Agent call")
+    finally:
+        ag.close()
+    c.done()
+
+
+def s18(ctx: Ctx) -> None:
+    """KC-FS-06: the ACP log goes to $KIRO_CHAT_LOG_FILE in APPEND mode (an existing file is kept)
+    and survives KiroCrew rotating it in place (truncate): later lines start at offset 0, with no
+    NUL-filled hole (which a non-O_APPEND writer leaves after a truncation)."""
+    c = Check("S18")
+    ws = ctx.workspace("S18", "kc-log", spec("kc-log", tools=["fs_read", "@kc-dangling-a"]))
+    with open(os.path.join(ws, ".kiro", "agents", "kc-log2.json"), "w") as f:
+        json.dump(spec("kc-log2", tools=["fs_read", "@kc-dangling-b"]), f)
+    logp = os.path.join(ws, "kiro-chat.log")
+    with open(logp, "w") as f:
+        f.write("KC-PRE-EXISTING-LINE\n")
+    ag = Agent(ctx, "S18", ws, "kc-log")
+    try:
+        ag.initialize()
+        r, e, _ = ag.new_session()
+        sid = (r or {})["sessionId"]
+        time.sleep(0.5)
+        first = open(logp, "rb").read()
+        c.ok(first.startswith(b"KC-PRE-EXISTING-LINE\n") and b"kc-dangling-a" in first, "appends to an existing log (kept the old line, then wrote the WARN)",
+             f"{len(first)} B, starts {first[:40]!r}")
+        with open(logp, "r+b") as f:  # KiroCrew-style in-place rotation
+            f.truncate(0)
+        ag.request("session/set_mode", {"sessionId": sid, "modeId": "kc-log2"}, timeout=30)
+        time.sleep(0.8)
+        after = open(logp, "rb").read()
+        c.ok(after and not after.startswith(b"\0") and b"\0" not in after[:4096], "after an in-place truncation the next lines start at offset 0 (O_APPEND; no NUL hole)",
+             f"{len(after)} B, starts {after[:24]!r}")
+        c.ok(b"kc-dangling-b" in after, "logging continues after the rotation", f"{len(after)} B")
+        c.ok(not ag.bad_lines, "nothing but frames on stdout")
+    finally:
+        ag.close()
+    c.done()
 
 
 def s14(ctx: Ctx) -> None:
@@ -976,8 +1435,9 @@ def s14(ctx: Ctx) -> None:
 
 SCENARIOS = {
     "S1": s1, "S2": s2, "S3": s3,
-    "S4": lambda c: s4(c, "allow"), "S4r": lambda c: s4(c, "reject"), "S4b": lambda c: s4(c, "allowed"),
-    "S5": s5, "S6": s6, "S7": s7, "S8": s8, "S9": s9, "S10": s10, "S11": s11, "S12": s12, "S13": s13, "S14": s14,
+    "S4": lambda c: s4(c, "allow"), "S4r": lambda c: s4(c, "reject"), "S4b": lambda c: s4(c, "allowed"), "S4c": lambda c: s4(c, "cancel"),
+    "S5": s5, "S6": s6, "S7": s7, "S8": s8, "S9": s9, "S10": s10, "S11": s11, "S11f": s11f, "S12": s12, "S13": s13, "S14": s14,
+    "S15": s15, "S16": s16, "S17": s17, "S18": s18,
 }
 
 

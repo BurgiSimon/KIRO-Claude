@@ -185,10 +185,17 @@ describe('preToolUse: outputs (00 §3.5)', () => {
     assert.deepEqual(await decide('mcp__git__push', {}), { kind: 'deny', reason: forbiddenMessage('mcp_git_push') });
   });
   it('tools kiro-claude never exposes are denied', async () => {
-    for (const t of ['ToolSearch', 'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode']) {
+    for (const t of ['AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode']) {
       const d = await decide(t, {});
       assert.equal(d.kind, 'deny', t);
     }
+  });
+
+  it('ToolSearch (Kiro tool_search) is always allowed, like the todo tools (V2 and V3)', async () => {
+    H.state.agent = makeAgent({ name: 'main', tools: ['tool_search'], allowedTools: [] });
+    assert.equal((await decide('ToolSearch', { query: 'select:mcp__x__y' })).kind, 'allow');
+    H.state.agent = makeAgent({ name: 'main', dialect: 'v3', permissions: [{ capability: 'all', effect: 'ask' }] });
+    assert.equal((await decide('ToolSearch', { query: 'select:mcp__x__y' })).kind, 'allow');
   });
 });
 
@@ -723,7 +730,7 @@ describe('describeTool (/tools permission labels)', () => {
     assert.equal(H.gate.describeTool(c('Bash')), 'not trusted');
     assert.equal(H.gate.describeTool(c('TaskCreate')), 'trusted');
     assert.equal(H.gate.describeTool(c('mcp__git__status')), 'not trusted');
-    assert.equal(H.gate.describeTool(c('ToolSearch')), 'denied');
+    assert.equal(H.gate.describeTool(c('ToolSearch')), 'trusted');
     H.state.agent = makeAgent({ name: 'main', allowedTools: ['read', '@git'], toolsSettings: { shell: { autoAllowReadonly: true } } });
     assert.equal(H.gate.describeTool(c('Read')), 'trusted');
     assert.equal(H.gate.describeTool(c('Grep')), 'trusted');

@@ -12,6 +12,18 @@
     },
     {
       "repeat": true,
+      "match": "DELAY-PING\\s*$",
+      "steps": [
+        {
+          "sleepMs": 1500
+        },
+        {
+          "text": "PONG"
+        }
+      ]
+    },
+    {
+      "repeat": true,
       "match": "PING\\s*$",
       "steps": [
         {
@@ -73,7 +85,7 @@
     },
     {
       "repeat": true,
-      "match": "READ-DENIED\\s*$",
+      "match": "(?<!OUT-)READ-DENIED\\s*$",
       "steps": [
         {
           "tool": {
@@ -128,6 +140,237 @@
           "result": {
             "stop_reason": "refusal"
           }
+        }
+      ]
+    },
+    {
+      "repeat": true,
+      "match": "(?<!OUT-)READ-PUBLIC\\s*$",
+      "steps": [
+        {
+          "tool": {
+            "name": "Read",
+            "input": {
+              "file_path": "{{cwd}}/notes.txt"
+            }
+          }
+        },
+        {
+          "text": "READ-DONE {{lastToolResult}}"
+        }
+      ]
+    },
+    {
+      "repeat": true,
+      "match": "TODO-PLAN\\s*$",
+      "steps": [
+        {
+          "tool": {
+            "name": "TaskCreate",
+            "input": {
+              "subject": "kc todo one",
+              "description": "first step",
+              "activeForm": "Doing one"
+            },
+            "result": "Task #1 created successfully: kc todo one",
+            "tool_use_result": {
+              "task": {
+                "id": "1",
+                "subject": "kc todo one"
+              }
+            }
+          }
+        },
+        {
+          "tool": {
+            "name": "TaskCreate",
+            "input": {
+              "subject": "kc todo two",
+              "description": "second step",
+              "activeForm": "Doing two"
+            },
+            "result": "Task #2 created successfully: kc todo two",
+            "tool_use_result": {
+              "task": {
+                "id": "2",
+                "subject": "kc todo two"
+              }
+            }
+          }
+        },
+        {
+          "tool": {
+            "name": "TaskUpdate",
+            "input": {
+              "taskId": "1",
+              "status": "completed"
+            },
+            "result": "Updated task #1 status"
+          }
+        },
+        {
+          "text": "TODO-DONE"
+        }
+      ]
+    },
+    {
+      "repeat": true,
+      "match": "SUBAGENT-RUN\\s*$",
+      "steps": [
+        {
+          "frame": {
+            "type": "assistant",
+            "parent_tool_use_id": null,
+            "message": {
+              "id": "msg_kc_parent",
+              "type": "message",
+              "role": "assistant",
+              "model": "claude-opus-5-5",
+              "content": [
+                {
+                  "type": "tool_use",
+                  "id": "toolu_kcparent01",
+                  "name": "Agent",
+                  "input": {
+                    "description": "kc inner work",
+                    "prompt": "Run echo inner",
+                    "subagent_type": "general-purpose"
+                  }
+                }
+              ],
+              "stop_reason": null,
+              "stop_sequence": null,
+              "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1
+              }
+            }
+          }
+        },
+        {
+          "tool": {
+            "name": "Bash",
+            "input": {
+              "command": "echo kc-inner",
+              "description": "inner echo"
+            },
+            "result": "kc-inner",
+            "parent_tool_use_id": "toolu_kcparent01",
+            "agent_id": "kc-agent-1",
+            "agent_type": "general-purpose"
+          }
+        },
+        {
+          "frame": {
+            "type": "user",
+            "parent_tool_use_id": null,
+            "message": {
+              "role": "user",
+              "content": [
+                {
+                  "type": "tool_result",
+                  "tool_use_id": "toolu_kcparent01",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "inner done"
+                    }
+                  ]
+                }
+              ]
+            },
+            "tool_use_result": {
+              "status": "completed",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "inner done"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "text": "SUB-DONE"
+        }
+      ]
+    },
+    {
+      "repeat": true,
+      "match": "AUTO-COMPACT\\s*$",
+      "steps": [
+        {
+          "frame": {
+            "type": "system",
+            "subtype": "status",
+            "status": "compacting"
+          }
+        },
+        {
+          "frame": {
+            "type": "system",
+            "subtype": "compact_boundary",
+            "compact_metadata": {
+              "trigger": "auto",
+              "pre_tokens": 150000,
+              "post_tokens": 9000
+            }
+          }
+        },
+        {
+          "frame": {
+            "type": "user",
+            "isSynthetic": true,
+            "parent_tool_use_id": null,
+            "message": {
+              "role": "user",
+              "content": "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\nKC-AUTO-SUMMARY-91c2"
+            }
+          }
+        },
+        {
+          "frame": {
+            "type": "system",
+            "subtype": "status",
+            "status": null
+          }
+        },
+        {
+          "text": "AUTO-DONE"
+        }
+      ]
+    },
+    {
+      "repeat": true,
+      "match": "READ-OUT-PUBLIC\\s*$",
+      "steps": [
+        {
+          "tool": {
+            "name": "Read",
+            "input": {
+              "file_path": "{{env:KC_S13R_OUT}}/public.txt"
+            }
+          }
+        },
+        {
+          "text": "READ-DONE"
+        }
+      ]
+    },
+    {
+      "repeat": true,
+      "match": "READ-OUT-DENIED\\s*$",
+      "steps": [
+        {
+          "tool": {
+            "name": "Read",
+            "input": {
+              "file_path": "{{env:KC_S13R_OUT}}/secret.txt"
+            }
+          }
+        },
+        {
+          "text": "READ-DONE {{lastToolResult}}"
         }
       ]
     }

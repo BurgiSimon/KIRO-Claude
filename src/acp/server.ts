@@ -709,7 +709,11 @@ export class AcpServer {
     const settings = openSettings(ws);
     const loaded = loadAgents(ws, { settings });
     if (requested) {
-      if (loaded.agents.has(requested)) return { name: requested, loaded };
+      const found = loaded.agents.get(requested);
+      // a type error (`agent validate` rejects it, KC-CLI-09) is a broken spec too
+      const typeError = found?.warnings.find((w) => w.code === 'invalid-field' || w.code === 'invalid-agent');
+      if (found && typeError) throw internalError(`Failed to load agent '${requested}'${found.path ? ` from ${found.path}` : ''}: ${typeError.message}`);
+      if (found) return { name: requested, loaded };
       const failed = loaded.failed.get(requested);
       if (failed) {
         throw internalError(`Failed to load agent '${requested}'${failed.path ? ` from ${failed.path}` : ''}: ${failed.message}`);
@@ -1049,7 +1053,11 @@ export class AcpServer {
 
   private async swapTo(st: AcpSessionState, modeId: string): Promise<void> {
     const agents = loadAgents(st.ws, { settings: openSettings(st.ws) });
-    if (!agents.agents.has(modeId)) throw internalError(`Mode '${modeId}' not found`);
+    const target = agents.agents.get(modeId);
+    if (!target) throw internalError(`Mode '${modeId}' not found`);
+    // a spec with type errors is rejected here too, like on session/new (`agent validate`, KC-CLI-09)
+    const typeError = target.warnings.find((w) => w.code === 'invalid-field' || w.code === 'invalid-agent');
+    if (typeError) throw internalError(`Failed to load agent '${modeId}'${target.path ? ` from ${target.path}` : ''}: ${typeError.message}`);
     const switched = modeId !== st.session.agent.name;
     if (switched) {
       try {
@@ -2053,9 +2061,15 @@ export async function runAcp(args: string[], ctx: CliContext, opts: RunAcpOption
     exitCode = 130;
     server.stop();
   };
+  // a closed terminal or a parent that hangs up: shut down cleanly (sessions closed, runtime dirs removed)
+  const onHup = (): void => {
+    exitCode = 129;
+    server.stop();
+  };
   if (realProcess) {
     process.once('SIGTERM', onTerm);
     process.once('SIGINT', onInt);
+    if (process.platform !== 'win32') process.once('SIGHUP', onHup);
   }
   opts.onServer?.(server);
   try {
@@ -2064,6 +2078,7 @@ export async function runAcp(args: string[], ctx: CliContext, opts: RunAcpOption
     if (realProcess) {
       process.removeListener('SIGTERM', onTerm);
       process.removeListener('SIGINT', onInt);
+      process.removeListener('SIGHUP', onHup);
       // after SIGTERM the parent may keep our stdin open: release it so the process can exit (05 §2.5)
       try {
         process.stdin.destroy();

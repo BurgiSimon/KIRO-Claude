@@ -310,6 +310,21 @@ class Pipeline:
         except OSError:
             pass
         c.ok("outdated" not in err, "gateway.err has no 'outdated'")
+        code, ab = self.gw.call("GET", "/api/acp-backends")
+        blob = json.dumps(ab)
+        c.ok(code == 200 and isinstance(ab, (dict, list)), "GET /api/acp-backends 200", f"{code} {blob[:200]}")
+        rows = {r.get("id"): r for r in ((ab or {}).get("backends") or []) if isinstance(r, dict)} if isinstance(ab, dict) else {}
+        inst = lambda r: (r or {}).get("installed") is True or str((r or {}).get("installed")).lower() == "installed"
+        c.ok(inst(rows.get("kiro")) and inst(rows.get("claude")), "/api/acp-backends: kiro (main) and claude (members) installed",
+             json.dumps({k: (rows.get(k) or {}).get("installed") for k in ("kiro", "claude", "kas")}))
+        dj = crew("doctor", "--json", timeout=300)
+        try:
+            drows = {r.get("id"): r for r in json.loads(dj.stdout).get("rows", [])}
+        except ValueError:
+            drows = {}
+        c.ok((drows.get("D11") or {}).get("status") == "ok", "crew doctor D11 (gateway: prerequisite ready, main = kiro, members = claude)",
+             json.dumps(drows.get("D11"))[:300])
+        c.ok((drows.get("D12") or {}).get("status") == "ok", "crew doctor D12 (Kiro Crew's own doctor rows)", json.dumps(drows.get("D12"))[:300])
         _ = pre
         c.done()
 
@@ -418,7 +433,87 @@ class Pipeline:
             c.ok(self.n in lr.stdout, "learn list contains the nonce (KC-ENV-02, SPEC-04)", lr.stdout[-200:])
         else:
             c.ok(meta.get("done") is True and "error" not in json.dumps(meta).lower(), "learn_add ran without error (fake result)", json.dumps(meta)[:200])
-            report("C7-lesson", "SKIP", "fake-claude limitation: MCP tools are simulated (the fake never calls kirocrew-core), so no lesson is stored; stage C checks learn list")
+            self.c7_lesson()
+        c.done()
+
+    def c7_lesson(self):
+        """Stage B KC-ENV-02 / KC-SPEC-04 for real: fake-claude only simulates MCP calls, so do what
+        Claude would do with the main session's --mcp-config: start the kirocrew-core server with the
+        live Claude child's own environment plus the entry's env (which must carry the gateway's
+        per-session KIROCREW_STUB_SESSION_TOKEN), call learn_add over MCP stdio, then read it back
+        with `kirocrew learn list`."""
+        c = Check("C7-lesson")
+        ws_dir = os.path.join(KC_HOME, "workspace")
+        starts = [r for r in self.flog() if r.get("event") == "start" and "-p" in (r.get("argv") or []) and r.get("cwd") == ws_dir]
+        live = [r for r in starts if os.path.exists(f"/proc/{r['pid']}")]
+        if not live:
+            return report("C7-lesson", "FAIL", f"no live main-session Claude child ({len(starts)} main starts in the fake log)")
+        st = live[-1]
+        argv = st["argv"]
+        cfg = {}
+        for i, a_ in enumerate(argv[:-1]):
+            if a_ == "--mcp-config":
+                v = argv[i + 1]
+                try:
+                    cfg.update((json.loads(v if v.strip().startswith("{") else open(v).read()).get("mcpServers")) or {})
+                except (OSError, ValueError) as e:
+                    c.ok(False, "main session --mcp-config readable", str(e))
+        core = cfg.get("kirocrew-core") or {}
+        tok = (core.get("env") or {}).get("KIROCREW_STUB_SESSION_TOKEN")
+        c.ok(bool(core.get("command")) and bool(tok), "KC-ENV-02 main session --mcp-config has kirocrew-core with a KIROCREW_STUB_SESSION_TOKEN",
+             json.dumps({"command": core.get("command"), "args": core.get("args"), "env_keys": sorted((core.get("env") or {}).keys())})[:300])
+        if not core.get("command"):
+            return c.done()
+        try:
+            raw = open(f"/proc/{st['pid']}/environ", "rb").read().split(b"\0")
+            env = dict(x.decode("utf-8", "replace").split("=", 1) for x in raw if b"=" in x)
+        except OSError as e:
+            return report("C7-lesson", "FAIL", f"cannot read the Claude child's environment: {e}")
+        env.update(core.get("env") or {})
+        lesson = f"kc-e2e lesson {os.urandom(4).hex()}"
+        p = subprocess.Popen([core["command"], *(core.get("args") or [])], cwd=st.get("cwd") or ws_dir, env=env,
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(os.path.join(E2E, "logs", "c7-mcp-core.stderr"), "wb"), text=True)
+        def rpc(i, method, params, timeout=60.0):
+            p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": i, "method": method, "params": params}) + "\n")
+            p.stdin.flush()
+            t_end = time.time() + timeout
+            while time.time() < t_end:
+                line = p.stdout.readline()
+                if not line:
+                    return None
+                try:
+                    m = json.loads(line)
+                except ValueError:
+                    continue
+                if m.get("id") == i:
+                    return m
+            return None
+        try:
+            init = rpc(1, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "claude-code", "version": "2.1.318"}})
+            c.ok(init is not None and "result" in init, "kirocrew-core MCP initialize", json.dumps(init)[:200])
+            p.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+            p.stdin.flush()
+            tl = rpc(2, "tools/list", {}) or {}
+            tools = {t.get("name"): t for t in ((tl.get("result") or {}).get("tools") or [])}
+            c.ok("learn_add" in tools, "kirocrew-core lists learn_add", json.dumps(sorted(tools))[:300])
+            props = ((tools.get("learn_add") or {}).get("inputSchema") or {}).get("properties") or {}
+            key = next((k for k in ("rule", "lesson", "text") if k in props), None)
+            args = {key: lesson} if key else {}
+            if "category" in props:
+                args["category"] = "knowledge"
+            res = rpc(3, "tools/call", {"name": "learn_add", "arguments": args}, timeout=90) or {}
+            r = res.get("result") or {}
+            text = " ".join(str(b.get("text", "")) for b in r.get("content") or [] if isinstance(b, dict))
+            c.ok("result" in res and not r.get("isError") and not text.lstrip().lower().startswith("error"),
+                 f"tools/call learn_add {json.dumps(sorted(args))} succeeded (stub token accepted)", json.dumps(res)[:300])
+        finally:
+            try:
+                p.stdin.close()
+                p.wait(10)
+            except (OSError, subprocess.TimeoutExpired):
+                p.kill()
+        lr = crew("exec", "--", "learn", "list", timeout=120)
+        c.ok(lesson in lr.stdout, "kirocrew learn list contains the lesson", (lr.stdout + lr.stderr)[-200:])
         c.done()
 
     # C8
@@ -598,7 +693,11 @@ class Pipeline:
             if self.real:
                 c.ok(a_ok and b_ok, "a.txt=A and b.txt=B")
             else:
-                report("C13-files", "SKIP", "fake-claude limitation: tool calls are simulated (Write/Bash never touch disk), so a.txt/b.txt cannot appear in stage B")
+                # stage-B substitute: both step-execution prompts went through kiro-claude to Claude
+                execs = [user_text(r) for r in self.flog() if r.get("event") == "stdin" and "Execute this task" in user_text(r)]
+                c.ok(any("single letter A." in t for t in execs) and any("single letter B." in t for t in execs),
+                     "both step prompts (a.txt, b.txt) reached Claude through kiro-claude", f"{len(execs)} step-execution prompts")
+                report("C13-files", "SKIP", "fake-claude limitation: tool calls are simulated (Write/Bash never touch disk), so a.txt/b.txt cannot appear in stage B; stage C checks them")
         c.done()
 
     # C14

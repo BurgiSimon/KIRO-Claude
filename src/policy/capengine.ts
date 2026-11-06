@@ -49,7 +49,7 @@ import type { KiroToolCall, PermissionRule, PolicyVerdict, RuleEffect, Workspace
 import { globMatch, wildcardMatch } from '../util/glob.js';
 import { normalizeCommand, shlexSplit } from '../util/shlex.js';
 import { canonicalizePath, canonicalizePattern } from './pathmatch.js';
-import { isTodoTool } from './toolmap.js';
+import { isAlwaysAllowedTool } from './toolmap.js';
 
 /** Deny text for shell commands that cannot be split into simple commands (00 §5.1). */
 export const SHELL_PARSE_DENY = 'Command could not be parsed; rewrite it as simple commands.';
@@ -343,7 +343,7 @@ export function collectRules(scopes: CapScopes): PermissionRule[] {
 
 /** Capability-engine decision for one call (see module doc). */
 export function evaluateCap(call: KiroToolCall, scopes: CapScopes, ws: WorkspaceContext): PolicyVerdict {
-  if (isTodoTool(call.claudeName)) return { kind: 'allow', reasons: ['utility tools are always allowed'] };
+  if (isAlwaysAllowedTool(call.claudeName)) return { kind: 'allow', reasons: ['utility tools are always allowed'] };
   const rules = collectRules(scopes).filter((r) => ruleAppliesTo(r, call));
   if (call.capability === 'shell' && !call.parseable) {
     if (!rules.some((r) => r.effect === 'allow' && isUnconditional(r))) return { kind: 'deny', reasons: [SHELL_PARSE_DENY] };

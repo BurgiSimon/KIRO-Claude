@@ -76,7 +76,7 @@ import {
   claudeMcpName,
   isMcpToolSelected,
   isSubagentSelected,
-  isTodoTool,
+  isAlwaysAllowedTool,
   normalizeV2Name,
   toKiroCall,
 } from './toolmap.js';
@@ -137,6 +137,7 @@ export function buildInitializeHooks(): InitializeRequest['hooks'] {
 const NATIVE_TOOL_NAMES = new Set([
   'fs_read', 'fs_write', 'execute_bash', 'execute_cmd', 'use_aws', 'gh_issue', 'knowledge', 'thinking', 'todo_list',
   'delegate', 'introspect', 'glob', 'grep', 'web_fetch', 'web_search', 'use_subagent', 'skill', 'report_issue', 'code',
+  'tool_search',
 ]);
 
 // ───────────────────────────── deps ─────────────────────────────
@@ -620,6 +621,7 @@ export class Gate {
       case 'use_aws':
         return inAllow(q) ? 'trusted' : 'trust read-only commands';
       case 'todo_list':
+      case 'tool_search':
       case 'skill':
         return 'trusted';
       default:
@@ -628,7 +630,7 @@ export class Gate {
   }
 
   private describeV3(call: KiroToolCall, agent: KiroAgent): string {
-    if (isTodoTool(call.claudeName)) return 'trusted';
+    if (isAlwaysAllowedTool(call.claudeName)) return 'trusted';
     const t = this.trustFor(call);
     const scopes = this.safeV3Scopes();
     const rules = collectRules({ agentRules: agent.permissions, ...scopes, sessionRules: t.rules, trustAll: t.trustAll }).filter(
