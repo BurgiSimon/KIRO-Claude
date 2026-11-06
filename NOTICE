@@ -16,3 +16,16 @@ under the Apache License 2.0 and the MIT License:
 kiro-claude does not contain the Kiro CLI, which is closed source, and it does
 not contain Claude Code. It runs the Claude Code CLI that you install and log
 in to yourself.
+
+KiroCrew
+--------
+kiro-claude can fetch, build and run KiroCrew (https://github.com/kirodotdev/KiroCrew),
+referenced unmodified as the git submodule vendor/KiroCrew at commit
+665a0e4e4a6507de0f3e7cffd3160c9359900c7c (kirocrew 0.13.0). KiroCrew is
+Copyright Amazon.com, Inc. or its affiliates and is licensed under the Apache
+License, Version 2.0; see vendor/KiroCrew/LICENSE, vendor/KiroCrew/NOTICE and
+vendor/KiroCrew/THIRD-PARTY-NOTICES. kiro-claude does not include KiroCrew in its
+npm package.
+
+`kiro-claude crew setup` installs @agentclientprotocol/claude-agent-acp
+(Apache License 2.0) from npm for Kiro Crew's Bot sessions.

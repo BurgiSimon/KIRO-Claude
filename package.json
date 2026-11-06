@@ -18,10 +18,12 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "prepare": "tsc -p tsconfig.json",
     "clean": "rm -rf dist",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test --test-reporter=spec \"dist/test/**/*.test.js\"",
-    "test:e2e": "npm run build && KIRO_CLAUDE_E2E=1 node --test --test-reporter=spec \"dist/test/e2e/*.test.js\""
+    "test:e2e": "npm run build && KIRO_CLAUDE_E2E=1 node --test --test-reporter=spec \"dist/test/e2e/*.test.js\"",
+    "crew:fetch": "git submodule update --init --depth 1 vendor/KiroCrew"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",
