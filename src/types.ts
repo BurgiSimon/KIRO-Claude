@@ -465,6 +465,8 @@ export type SessionEvent =
       /** Short text rendering of the result (truncated). */
       output: string;
       durationMs?: number;
+      /** Structured Claude tool_use_result / tool_response when available (ACP rawOutput). */
+      response?: unknown;
     }
   | { type: 'todo_update'; todos: TodoItem[] }
   | { type: 'compaction'; state: 'started' | 'finished'; preTokens?: number; postTokens?: number }
@@ -548,6 +550,13 @@ export interface KiroSessionOptions {
   specPhase?: { name: string; allowedWritePaths: string[] };
   /** Additional `--add-dir` directories. */
   additionalDirectories?: string[];
+  /**
+   * MCP servers supplied by the client (ACP session/new.mcpServers). Merged over the agent's own
+   * servers; on a name clash the client's entry wins (research 08 §2.5).
+   */
+  extraMcpServers?: McpServerConfig[];
+  /** Environment for the claude child and its MCP servers (default process.env; scrubbed by claude/env). */
+  env?: NodeJS.ProcessEnv;
   /** Explicit claude binary path (else discovery). */
   claudePath?: string;
   /** Allow ANTHROPIC_API_KEY etc. to reach the child (default false = subscription). */

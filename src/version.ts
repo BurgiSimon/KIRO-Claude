@@ -10,7 +10,10 @@
 export const KIRO_CLAUDE_VERSION = '0.1.0';
 export const KIRO_CLI_COMPAT_VERSION = '1.26.0';
 
-/** `kiro-claude --version` output. The last whitespace-separated token is the kiro-cli compat version (KiroCrew parses it). */
+/**
+ * `kiro-claude --version` output: `kiro-claude 0.1.0 (kiro-cli 1.26.0)` (research 08 §0 item 3,
+ * verified against KiroCrew's parser). ACP `initialize.agentInfo.version` uses KIRO_CLI_COMPAT_VERSION.
+ */
 export function versionLine(): string {
-  return `kiro-claude ${KIRO_CLAUDE_VERSION} kiro-cli-compat ${KIRO_CLI_COMPAT_VERSION}`;
+  return `kiro-claude ${KIRO_CLAUDE_VERSION} (kiro-cli ${KIRO_CLI_COMPAT_VERSION})`;
 }

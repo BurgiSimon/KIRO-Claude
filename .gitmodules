@@ -1,0 +1,5 @@
+[submodule "vendor/KiroCrew"]
+	path = vendor/KiroCrew
+	url = https://github.com/kirodotdev/KiroCrew.git
+	shallow = true
+	ignore = dirty
