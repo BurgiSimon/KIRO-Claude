@@ -20,13 +20,15 @@
  *   The gateway's pid is the one `gateway-pid` names; for a `held` lock (KiroCrew cannot name its
  *   holder) it is `ready.json`'s only while that file provably still names the gateway `crew start`
  *   recorded there (same boot and start time; {@link gatewayRecord}). Otherwise nothing is
- *   signalled: stop waits for the lock to be released, or for `gateway-pid` to name the holder.
+ *   signalled: stop waits for the lock to be released, or for `gateway-pid` to name the holder,
+ *   which is signalled only when it provably ran before the stop (not a gateway restarted since).
  * - `--approval auto` is passed as KiroCrew's `yolo` (its choices are reads|yolo|interactive).
  * - Every command uses one gateway env (context.gatewayEnvFor): a `--kiro-bin` given to the
  *   start that launched the running gateway is used by exec/stop/status/doctor too.
  * - status: `gateway-pid` plus cookie-authenticated `/api/status`, `/api/kiro-prerequisite`,
- *   `/api/acp-backends`. Exit 0 running and ready, 3 stopped, 4 running but not ready. The pid and
- *   port shown come from `ready.json` only while it is the running gateway's (as for stop).
+ *   `/api/acp-backends`. Exit 0 running and ready, 3 stopped, 4 running but not ready. A pid is
+ *   shown from `ready.json` only while it provably is the running gateway's (as for stop), and its
+ *   port is not used once it provably is not ({@link gatewayRecord}).
  * - open: `kirocrew token --port <p> --ttl <ttl>` → open with `xdg-open`/`open` unless `--print`;
  *   warns `This link signs you in; do not share it.`; not running: exit 3.
  * - logs: tail `$CS/run/gateway.err` and `$KIROCREW_HOME/gateway.log` (`--acp`: the newest
@@ -425,6 +427,21 @@ export function gatewayRecord(c: CrewCtx, state: CrewState, holder: GatewayHolde
   };
 }
 
+/**
+ * Whether the holder `pid` that `gateway-pid` names during a stop's wait is a process that ran
+ * before the stop (`before`, listed then): `before` with its start time, `after` (provably started
+ * since: a gateway restarted by a supervisor, holding the lock the stopped one released), or
+ * `unknown` (no /proc, an unreadable stat). Only a `before` holder may be signalled.
+ */
+function ranBeforeStop(c: CrewCtx, before: readonly ProcessInfo[], pid: number): { when: 'before'; startTime: number } | { when: 'after' | 'unknown' } {
+  const st = c.deps.sys.startTime(pid);
+  if (st === undefined || before.length === 0) return { when: 'unknown' };
+  const prior = before.find((p) => p.pid === pid);
+  if (!prior) return { when: 'after' };
+  if (prior.startTime === undefined) return { when: 'unknown' };
+  return prior.startTime === st ? { when: 'before', startTime: st } : { when: 'after' };
+}
+
 async function waitGone(c: CrewCtx, alive: () => boolean, ms: number): Promise<boolean> {
   const deadline = c.deps.sys.now() + ms;
   while (alive()) {
@@ -501,13 +518,17 @@ export async function crewStop(c: CrewCtx, o: StopOptions = {}): Promise<number>
   // the gateway and its own children, seen while it still runs (they are re-parented once it exits)
   let snap = pid !== undefined ? snapshotGateway(c, pid, gwEnv.env, rec.startTime) : undefined;
   const alive = (): boolean => snap !== undefined && gatewayAlive(c, snap);
+  // With no pid to watch: what runs before the stop, to tell the held gateway from a later holder.
+  const before = snap ? [] : c.deps.sys.listProcesses();
   const stopRun = await kc.stop();
   if (stopRun.code !== 0 && c.cli.verbosity > 0) c.err(`kirocrew stop: ${(stopRun.stderr || stopRun.stdout).trim()}`);
   const deadline = c.deps.sys.now() + (o.timeoutSec ?? 30) * 1000;
   let gone = false;
+  let unproven: number | undefined;
   if (!snap) {
     // Nothing names the gateway's pid: signal nothing, and wait for the lock to be released, or for
-    // `gateway-pid` to name its holder (then that pid is watched, and signalled after the timeout).
+    // `gateway-pid` to name its holder. That pid is watched (and signalled after the timeout) only
+    // when it already ran before the stop; one started since holds a lock the held gateway released.
     for (;;) {
       const h = await kc.gatewayPid();
       if (!gatewayRunning(h)) {
@@ -515,9 +536,17 @@ export async function crewStop(c: CrewCtx, o: StopOptions = {}): Promise<number>
         break;
       }
       if (h.holder === 'process') {
-        pid = h.pid;
-        snap = snapshotGateway(c, pid, gwEnv.env);
-        break;
+        const seen = ranBeforeStop(c, before, h.pid);
+        if (seen.when === 'before') {
+          pid = h.pid;
+          snap = snapshotGateway(c, pid, gwEnv.env, seen.startTime);
+          break;
+        }
+        if (seen.when === 'after') {
+          gone = true;
+          break;
+        }
+        unproven = h.pid;
       }
       if (c.deps.sys.now() >= deadline) break;
       await c.deps.sys.sleep(c.deps.pollMs);
@@ -538,7 +567,9 @@ export async function crewStop(c: CrewCtx, o: StopOptions = {}): Promise<number>
   removeRunSecrets(c);
   if (!exited) {
     if (snap) c.err(`kiro-claude: the Kiro Crew gateway (pid ${pid}) did not exit.`);
-    else {
+    else if (unproven !== undefined) {
+      c.err(`kiro-claude: the Kiro Crew gateway did not exit. kirocrew gateway-pid named pid ${unproven} only after the stop, and crew stop cannot tell it from a gateway started since, so nothing was signalled. To stop it, run: kiro-claude crew stop`);
+    } else {
       const stale = rec.verdict === 'other' && rec.record?.pid !== undefined ? `; run/ready.json named pid ${rec.record.pid}, which is no longer that gateway` : '';
       c.err(`kiro-claude: the Kiro Crew gateway did not exit. Nothing names its pid (kirocrew gateway-pid: ${holder.holder}${stale}), so nothing was signalled.`);
     }

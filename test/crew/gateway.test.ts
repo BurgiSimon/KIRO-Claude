@@ -10,7 +10,7 @@ import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { readState, writeState } from '../../src/crew/state.js';
-import { defaultSys, type CrewSys, type ProcessInfo } from '../../src/crew/runner.js';
+import { defaultRunner, defaultSys, type CrewRunner, type CrewSys, type ProcessInfo } from '../../src/crew/runner.js';
 import { cloneFakeEnv, crew, freePort, makeFakeEnv, realPython, type FakeEnv } from './helpers.js';
 
 const PY = realPython();
@@ -805,6 +805,94 @@ describe('crew stop / status with a held lock: run/ready.json pid identity (W1)'
       assert.equal(stillRuns(u.pid, u.start), true);
     } finally {
       u?.stop();
+      fe.cleanup();
+    }
+  });
+
+  /** The real runner, except that once `kirocrew stop` returned, `gateway-pid` names `named()` (when set). */
+  function namingRunner(onStop: () => Promise<void>, named: () => number | undefined): CrewRunner {
+    return {
+      ...defaultRunner,
+      async run(file, args, opts) {
+        const n = args[0] === 'gateway-pid' ? named() : undefined;
+        if (n !== undefined) return { code: 0, signal: null, stdout: `${JSON.stringify({ holder: 'process', pid: n, alive: true, source: 'lock' })}\n`, stderr: '', timedOut: false, durationMs: 1 };
+        const r = await defaultRunner.run(file, args, opts);
+        if (args[0] === 'stop') await onStop();
+        return r;
+      },
+    };
+  }
+
+  it('stop, held: a holder gateway-pid names only after the stop, started after it (a supervisor restarting the gateway), is not signalled; the held gateway is gone', { skip: linux }, async () => {
+    const fe = await setUp();
+    let u: Awaited<ReturnType<typeof bystander>> | undefined;
+    let g2: Awaited<ReturnType<typeof bystander>> | undefined;
+    try {
+      const g = await startGateway(fe);
+      holdLock(fe);
+      u = await bystander(fe, { HOME: path.join(fe.root, 'other-home') });
+      staleRecord(fe, u, g.port, 'none');
+      const runner = namingRunner(
+        async () => {
+          // kirocrew stop stopped G; a new gateway G2 of this crew takes the lock at once
+          for (let i = 0; i < 100 && stillRuns(g.pid, g.start); i++) await new Promise((res) => setTimeout(res, 20));
+          g2 = await bystander(fe, { HOME: fe.home, KIROCREW_KIRO_BIN: shimOf(fe) });
+        },
+        () => g2?.pid,
+      );
+      const r = await crew(fe, ['stop', '--timeout', '2'], { deps: { runner } });
+      assert.ok(g2, 'the restarted gateway ran');
+      assert.equal(g2.terms(), 0, `crew stop sent SIGTERM to pid ${g2.pid}, a gateway started after the stop`);
+      assert.equal(stillRuns(g2.pid, g2.start), true, `crew stop killed pid ${g2.pid}, a gateway started after the stop`);
+      assert.equal(u.terms(), 0);
+      assert.equal(stillRuns(g.pid, g.start), false);
+      assert.deepEqual({ code: r.code, stderr: r.stderr, stdout: r.stdout }, { code: 0, stderr: '', stdout: 'Stopped (pid unknown); 0 orphan agent process(es) reaped\n' });
+    } finally {
+      u?.stop();
+      g2?.stop();
+      fe.cleanup();
+    }
+  });
+
+  it('stop, held: a holder gateway-pid names after the stop that this process cannot tell from a later one (no /proc) is not signalled; exit 1 says so', async () => {
+    const fe = await setUp({ FAKE_STOP_IGNORE: '1' });
+    try {
+      const g = await startGateway(fe);
+      holdLock(fe);
+      let stopped = false;
+      const runner = namingRunner(
+        async () => {
+          stopped = true;
+        },
+        () => (stopped ? g.pid : undefined),
+      );
+      const signals: Array<[number, string]> = [];
+      const blind = { ...defaultSys, startTime: () => undefined, listProcesses: () => [], bootId: () => undefined, kill: (pid: number, s: NodeJS.Signals) => (signals.push([pid, s]), false) } as CrewSys;
+      const r = await crew(fe, ['stop', '--timeout', '1'], { deps: { runner, sys: blind } });
+      assert.deepEqual(signals, [], 'a pid named only after the stop, unverifiable, was signalled');
+      assert.equal(defaultSys.isAlive(g.pid), true);
+      assert.equal(r.code, 1, r.stdout);
+      assert.equal(r.stdout, '');
+      assert.match(r.stderr, new RegExp(`the Kiro Crew gateway did not exit\\. kirocrew gateway-pid named pid ${g.pid} only after the stop`));
+      assert.match(r.stderr, /nothing was signalled/);
+    } finally {
+      fe.cleanup();
+    }
+  });
+
+  it('stop, held: a proven record → the gateway tree is retired as for a named holder (a stubborn child does not outlive the stop)', { skip: linux }, async () => {
+    const fe = await setUp({ FAKE_GATEWAY_CHILD: 'stubborn' });
+    let child: number | undefined;
+    try {
+      const g = await startGateway(fe);
+      child = (JSON.parse(fs.readFileSync(path.join(kcHome(fe), 'fake-gateway-child.json'), 'utf8')) as { pid: number }).pid;
+      const childStart = procStart(child);
+      holdLock(fe);
+      const r = await crew(fe, ['stop']);
+      assert.deepEqual({ code: r.code, stderr: r.stderr, stdout: r.stdout }, { code: 0, stderr: '', stdout: `Stopped (pid ${g.pid}); 0 orphan agent process(es) reaped\n` });
+      assert.equal(stillRuns(child, childStart), false, 'the stubborn gateway child outlived crew stop');
+    } finally {
+      if (child !== undefined && running(child)) process.kill(child, 'SIGKILL');
       fe.cleanup();
     }
   });

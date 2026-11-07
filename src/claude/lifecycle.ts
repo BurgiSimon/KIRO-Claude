@@ -45,7 +45,12 @@
  * whose members all started after the exit is not signalled (it may be a reuse). Without
  * /proc, the POSIX `ps -A -o pid=,pgid=` listing is used for the first two checks; if neither
  * is available the post-exit kill is skipped. `child.kill()` is a no-op after the reap (Node
- * closed the handle), so the leader itself is never signalled by number.
+ * closed the handle), so the leader itself is never signalled by number. Node's view lags: libuv
+ * reaps every exited child (waitpid) before it reports any of them, so in one child's `'exit'`
+ * handler and the microtasks after it (a `process.exit()` that runs the exit hook below,
+ * shutdownTrackedChildren() after main() resolved) a sibling may be reaped while its exitCode is
+ * still null. On Linux, signalChild therefore also treats a child as reaped when /proc no longer
+ * shows the process it saw at {@link trackChild} (gone, or another start time).
  */
 import { spawnSync, type ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
@@ -89,8 +94,9 @@ export function childReaped(child: ChildProcess): boolean {
 export function signalChild(child: ChildProcess, signal: NodeJS.Signals, group: boolean = PROCESS_GROUPS): boolean {
   const pid = child.pid;
   if (pid === undefined) return false;
-  if (childReaped(child)) {
-    if (!(group && PROCESS_GROUPS) || !exitedGroupIsOurs(child, pid)) return false;
+  const unreported = !childReaped(child) && reapedUnreported(child, pid);
+  if (unreported || childReaped(child)) {
+    if (!(group && PROCESS_GROUPS) || !exitedGroupIsOurs(child, pid, unreported)) return false;
     try {
       process.kill(-pid, signal);
       return true;
@@ -121,6 +127,12 @@ export function signalChild(child: ChildProcess, signal: NodeJS.Signals, group: 
  */
 export function trackChild(child: ChildProcess, group: boolean = PROCESS_GROUPS, opts: { graceful?: boolean } = {}): void {
   if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
+  // Who holds the pid now (it cannot have been reaped yet: libuv reaps in the event loop), so a
+  // reap Node has not reported yet can be told from a live child (reapedUnreported).
+  if (process.platform === 'linux' && procfsState().ok) {
+    const start = procStartTicks(child.pid);
+    if (start !== undefined && start !== null) spawnTicks.set(child, start);
+  }
   // When the leader exits, before any other 'exit' listener: members that started by then
   // prove a later group kill still targets our group (ownsExitedGroup).
   if (group && PROCESS_GROUPS && process.platform === 'linux') {
@@ -236,6 +248,42 @@ const USER_HZ = 100;
 
 /** When each tracked group leader exited, in clock ticks since boot (Linux). */
 const exitTicks = new WeakMap<ChildProcess, number>();
+
+/** Raw /proc start time of each tracked child, read when it was tracked (Linux). */
+const spawnTicks = new WeakMap<ChildProcess, number>();
+
+/** Raw `/proc/<pid>/stat` start time; null when no such process (ENOENT/ESRCH); undefined when unknown. */
+function procStartTicks(pid: number): number | null | undefined {
+  let text: string;
+  try {
+    text = fs.readFileSync(`/proc/${pid}/stat`, 'latin1');
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    return code === 'ENOENT' || code === 'ESRCH' ? null : undefined;
+  }
+  return parseProcStat(text)?.startTicks;
+}
+
+/**
+ * Whether `child`, which Node still shows running, was already reaped by libuv (module doc): its
+ * pid is gone (from /proc and for kill(pid, 0); /proc may hide a process, e.g. a setuid one
+ * under hidepid), or held by a process that started at another time than the one seen at
+ * {@link trackChild}. False when unknown (not tracked on Linux, /proc unreadable).
+ */
+function reapedUnreported(child: ChildProcess, pid: number): boolean {
+  const start = spawnTicks.get(child);
+  if (start === undefined) return false;
+  const now = procStartTicks(pid);
+  if (now === null) {
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (e) {
+      return (e as NodeJS.ErrnoException).code === 'ESRCH';
+    }
+  }
+  return now !== undefined && now !== start;
+}
 
 /** Current time in clock ticks since boot (`/proc/uptime`), or undefined. */
 function bootTicksNow(): number | undefined {
@@ -357,7 +405,12 @@ export function ownsExitedGroup(pgid: number, table: readonly ProcInfo[], exitTi
   return members.some((p) => p.startTicks === undefined || (exitTick !== undefined && p.startTicks <= exitTick));
 }
 
-function exitedGroupIsOurs(child: ChildProcess, pgid: number): boolean {
+/**
+ * `unreported`: libuv reaped the leader but its 'exit' (which records the exit time) has not run
+ * yet; the reap happened before now, so now bounds the exit time.
+ */
+function exitedGroupIsOurs(child: ChildProcess, pgid: number, unreported = false): boolean {
   const table = readProcessTable('auto', pgid);
-  return table !== undefined && ownsExitedGroup(pgid, table, exitTicks.get(child));
+  const exitTick = exitTicks.get(child) ?? (unreported ? bootTicksNow() : undefined);
+  return table !== undefined && ownsExitedGroup(pgid, table, exitTick);
 }
