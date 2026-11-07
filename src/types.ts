@@ -495,6 +495,17 @@ export interface SessionRecord {
    * in records written before this field existed (they resume `claudeSessionId`).
    */
   pendingFork?: { from: string; at?: string };
+  /**
+   * The `<kiro-restored-history>` block this conversation's next user line carries: Claude Code
+   * lost the conversation's transcript (a resume / fork fell back to a fresh Claude session, a
+   * `/chat load` without a usable transcript), so the saved history (the journal) is sent as
+   * context. Kept on the record until that line is written to Claude, like `pendingContext`: a
+   * quit, a local command (Claude writes the fresh session's transcript for `/effort`, so a later
+   * resume or fork of it succeeds without the history), a tangent or a fork of this conversation
+   * (each gets a copy) before then do not lose it. One copy: a later fallback for the same record
+   * keeps it rather than adding a second block. `/clear` drops it.
+   */
+  pendingHistory?: string;
 }
 
 // ───────────────────────────── Models ─────────────────────────────
@@ -705,6 +716,14 @@ export interface KiroSession extends EventEmitter {
    * empty `from`) when the session has no Claude session to fork. Used by the spec driver.
    */
   forkSource(): { from: string; at?: string } | undefined;
+  /**
+   * The session id `chat --resume-id` reopens this conversation with once {@link close} has run
+   * (the REPL's exit hint): this session's id, or, when closing dropped its record (a chat that
+   * never had a message; an untouched spec-phase copy), the record that still holds the
+   * conversation, or undefined when nothing is left to resume. Before close: this session's id.
+   * Optional for test doubles; the REPL falls back to `id`.
+   */
+  resumeId?(): string | undefined;
 
   /** Tool listing for /tools. */
   toolListing(): ToolListingEntry[];

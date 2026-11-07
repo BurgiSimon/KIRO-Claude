@@ -308,6 +308,29 @@ export function journalSize(dir: string, sid: string): number {
   }
 }
 
+/**
+ * `rec` (in the index directory `dir`) is a chat that never had a message, which Q never saves
+ * (it saves a conversation only after a reply, 06 §6.1): a main record of the user's own (not a
+ * tangent or rewind, not an ACP / KiroCrew session) with no turns, no message and no `Prompt` in
+ * its journal. A chat cleared after a conversation keeps its record (its journal holds the prompts,
+ * K4); one whose only action was `/clear` or `/compact` journals only a compaction marker.
+ * KiroSession's close drops such a record (unusedRecord); the session index skips one left behind
+ * by a process that died before its close (store.ts `list`, r4 #4).
+ */
+export function recordNeverUsed(dir: string, rec: SessionRecord): boolean {
+  if (rec.forkKind !== 'main' || rec.origin === 'acp') return false;
+  if (rec.turns.length > 0 || rec.messageCount > 0) return false;
+  let text: string;
+  try {
+    const file = journalPath(dir, rec.sessionId);
+    if (!fs.existsSync(file)) return true;
+    text = fs.readFileSync(file, 'utf8');
+  } catch {
+    return false; // an unsafe id or an unreadable journal: keep what may be a conversation
+  }
+  return !parseJournal(text).some((j) => j.kind === 'Prompt');
+}
+
 /** Records up to (excluding) the `(prompts + 1)`-th `Prompt` record. */
 export function journalPrefix(records: readonly JournalRecord[], prompts: number): JournalRecord[] {
   const out: JournalRecord[] = [];

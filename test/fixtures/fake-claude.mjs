@@ -807,8 +807,24 @@ function main() {
     if (!Array.isArray(content)) return '';
     return content.map((b) => (b && b.type === 'text' ? b.text : b && b.type === 'image' ? '[image]' : b && b.type === 'document' ? '[document]' : '')).join('');
   };
+  // the conversation's user messages: tool results and the entries of a local command (see
+  // recordLocalCommand) are not listed
   const historyUserTexts = () =>
-    historyLines.filter((l) => l.type === 'user' && l.message && !(Array.isArray(l.message.content) && l.message.content.some((b) => b && b.type === 'tool_result'))).map((l) => userTextOf(l.message.content));
+    historyLines
+      .filter((l) => l.type === 'user' && l.message && !l.localCommand && !(Array.isArray(l.message.content) && l.message.content.some((b) => b && b.type === 'tool_result')))
+      .map((l) => userTextOf(l.message.content));
+  // Local commands whose line becomes part of the session transcript, like the real claude 2.1.319
+  // (VERIFIED for /effort, /compact, /model, /cost and /context as the only line of a new session,
+  // of a resumed one and of a fork that had no line yet: the transcript, a fork's copied history
+  // included, is written, and `--resume <id>` / a fork of it then find a conversation). /clear
+  // (a new session) and /help are not recorded.
+  const LOCAL_RECORDED = new Set(['effort', 'compact', 'model', 'cost', 'usage', 'context']);
+  /** The transcript entries of a local command line (VERIFIED 2.1.319 shapes, abridged). */
+  function recordLocalCommand(msg, cmd, args) {
+    appendTranscript({ type: 'user', uuid: uuid(), isMeta: true, localCommand: true, message: { role: 'user', content: '<local-command-caveat>The command below was run directly in Claude Code, not sent to you as a request, and its output goes straight to the user. It\'s recorded here as context for later messages.</local-command-caveat>' } });
+    // the command entry carries the uuid of the line the host sent (VERIFIED)
+    appendTranscript({ type: 'user', uuid: msg.uuid || uuid(), localCommand: true, message: { role: 'user', content: `<command-name>/${cmd}</command-name>\n            <command-message>${cmd}</command-message>\n            <command-args>${args}</command-args>` } });
+  }
 
   /* --- frames ---------------------------------------------------------------------------- */
   const SLASH = ['clear', 'compact', 'context', 'cost', 'effort', 'model', 'usage', 'init', 'review', 'security-review'];
@@ -1415,8 +1431,12 @@ function main() {
       const slash = /^\/([A-Za-z][\w:-]*)(?:\s+([\s\S]*))?$/.exec(text.trim());
       let done = false;
       if (slash) {
-        const r = await runLocal(t, slash[1], (slash[2] || '').trim());
+        const args = (slash[2] || '').trim();
+        const recorded = LOCAL_RECORDED.has(slash[1]);
+        if (recorded) recordLocalCommand(msg, slash[1], args);
+        const r = await runLocal(t, slash[1], args);
         done = r !== undefined;
+        if (recorded && r) appendTranscript({ type: 'system', subtype: 'local_command', uuid: uuid(), content: `<local-command-stdout>${typeof r.result === 'string' ? r.result : ''}</local-command-stdout>` });
       }
       if (!done) {
         appendTranscript({ type: 'user', uuid: msg.uuid || uuid(), message: { role: 'user', content } });

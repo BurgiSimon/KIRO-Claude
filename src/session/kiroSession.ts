@@ -56,7 +56,9 @@
  * Turn text (00 §6.2): `/name args` / `@name args` prompt files (config/prompts), `/<skill> args`
  * inlined (config/skills), userPromptSubmit hooks, `@` and `#` references (context/refs),
  * conditional steering (context/userTurn SteeringActivator), pending context (first-turn hook
- * prompts; the restored history of a record whose transcript was lost, kept per record (G2); a
+ * prompts; the restored history of a record whose transcript was lost, kept on that record
+ * (`SessionRecord.pendingHistory`, G2: saved with it across a quit, copied into a tangent or a
+ * `create({ fork })` of the whole conversation, R4 #1); a
  * tangent tail/merge carry queued on the record it returned into, `SessionRecord.pendingContext`,
  * copied into any fork of that record made before it spoke again: a tangent (F9), a spec-phase
  * session or continuation (G1)), the plan-mode block, then composeUserTurn. The restored history
@@ -65,6 +67,11 @@
  * never gets the line (cancelled or failed before the send), and all of it when Claude dropped
  * the line before starting it, or when the child died with the line unread (no `started`, no
  * output, not in its transcript: S4). A dropped line is no turn (no turn record, no journal, S2).
+ * A child that died since the last turn is respawned before a line is composed, and a line whose
+ * child died while it was composed is composed again with the block that respawn's fallback
+ * queued, so the restored history always goes with the line it is context for (R4 #6). While it
+ * is pending, a `/effort` is queued for that line (only in that record) and a `/compact`, which
+ * summarizes none of the conversation, journals no `Compaction`.
  * `prompt()`'s result carries the usage of all its Claude turns (redirects, continuations).
  *
  * Streaming: `text_delta` / `thinking_delta` from `stream_event`s (top level only); a complete
@@ -217,6 +224,7 @@ import {
   promptRecord,
   readJournal,
   readJournalText,
+  recordNeverUsed,
   toolResultsRecord,
   writeJournalText,
   type JournalBlock,
@@ -512,30 +520,41 @@ function restoredHistoryBlock(history: string): string {
 }
 
 /**
+ * The turn of `turns` a fork at `at` ends with: the one whose assistant uuid `at` is (a rewind
+ * point, a fork point), or a turn cancelled before any answer whose user uuid `at` is (the point
+ * {@link forkPointFor} pins such a last turn at, r4 #10: Claude keeps the history through that
+ * line). -1 when `at` is none of them.
+ */
+function forkCutIndex(turns: readonly SessionTurnRecord[], at: string): number {
+  return turns.findIndex((t) => t.assistantUuid === at || (!isClaudeUuid(t.assistantUuid) && t.userUuid === at));
+}
+
+/**
  * The journal of a new fork of `parent`'s conversation (`KiroSessionOptions.fork`, S1): all of it,
- * or, for a fork at a rewind point (`at` = a turn's assistant uuid), the records up to that turn.
- * An `at` that is none of the parent's turns copies nothing: the cut is unknown, and rewound turns
- * must not come back as history (G2).
+ * or, for a fork at a rewind point (`at` = a turn's assistant uuid; {@link forkCutIndex}), the
+ * records up to that turn. An `at` that is none of the parent's turns copies nothing: the cut is
+ * unknown, and rewound turns must not come back as history (G2).
  */
 function copyForkJournal(dir: string, parent: SessionRecord, toSid: string, at: string | undefined): void {
   if (at === undefined) {
     if (journalSize(dir, parent.sessionId) > 0) copyJournal(dir, parent.sessionId, toSid);
     return;
   }
-  const i = parent.turns.findIndex((t) => t.assistantUuid === at);
+  const i = forkCutIndex(parent.turns, at);
   if (i >= 0) copyJournalThroughTurn(dir, parent.sessionId, toSid, parent.turns, i);
 }
 
 /**
  * The history a new fork of `parent`'s conversation carries on its record
  * (`KiroSessionOptions.fork`, K1), as a tangent / rewind record does: all its turns and its
- * message count, or, for a fork at a rewind point (`at` = a turn's assistant uuid), the turns up to
- * that one. An `at` that is none of the parent's turns carries none, like the journal copy
- * ({@link copyForkJournal}): the cut is unknown, and rewound turns must not come back.
+ * message count, or, for a fork at a rewind point (`at` = a turn's assistant uuid; {@link
+ * forkCutIndex}), the turns up to that one. An `at` that is none of the parent's turns carries
+ * none, like the journal copy ({@link copyForkJournal}): the cut is unknown, and rewound turns must
+ * not come back.
  */
 function forkHistory(parent: SessionRecord, at: string | undefined): Pick<SessionRecord, 'turns' | 'messageCount' | 'lastPreview'> | undefined {
   if (at === undefined) return { turns: parent.turns, messageCount: parent.messageCount, lastPreview: parent.lastPreview };
-  const i = parent.turns.findIndex((t) => t.assistantUuid === at);
+  const i = forkCutIndex(parent.turns, at);
   if (i < 0) return undefined;
   return { turns: parent.turns.slice(0, i + 1), messageCount: i + 1, lastPreview: parent.turns[i]!.preview };
 }
@@ -546,28 +565,34 @@ function forkHistory(parent: SessionRecord, at: string | undefined): Pick<Sessio
  * transcript, K2): its own last turn's assistant message. Its source can have been resumed and
  * continued since (main after a quit inside a fresh tangent; the original of a copy, which
  * KiroCrew copied record and journal of at one moment, may have run on or be mid-turn; the
- * session an export was made of): a fork of the whole source would lend it those later turns.
- * Undefined (the whole source) when that turn has no assistant message (or no UUID: an argv value
- * from a copied file), or when the record's history (`journal`) ends with a compaction (the
- * source's compacted state is where it starts; a fork at the turn before it would be
- * uncompacted). A source that does not hold the message falls back on the journal (spawn).
+ * session an export was made of): a fork of the whole source would lend it those later turns, so
+ * a record with turns never forks it (r4 #10). A last turn cancelled before any answer (ACP
+ * `session/cancel`: the turn has only its user line) is pinned at that line, whose uuid Claude
+ * stamps on its user entry; a fork at a user entry keeps the history through that unanswered line
+ * (both VERIFIED 2.1.319); else at the newest earlier answer. A record whose
+ * history ends with a compaction is pinned at its last turn too (no uuid of the compaction is
+ * recorded): Claude loads a transcript from its last compact boundary and refuses that older uuid
+ * (`No message found`, VERIFIED 2.1.319), so the fork falls back on the record's journal (its
+ * conversation as restored history), never on the source's later turns.
+ * Undefined (the whole source) only for a record with no turn holding a UUID (an argv value from
+ * a copied file must be one). A source that does not hold the message (Claude: `No message
+ * found`) falls back on the journal (spawn).
  */
-function forkPointFor(turns: readonly SessionTurnRecord[], journal: () => JournalRecord[]): string | undefined {
-  const at = turns[turns.length - 1]?.assistantUuid;
-  if (!isClaudeUuid(at)) return undefined;
-  let last: JournalRecord | undefined;
-  try {
-    const recs = journal();
-    last = recs[recs.length - 1];
-  } catch {
-    /* unreadable: no compaction known */
+function forkPointFor(turns: readonly SessionTurnRecord[]): string | undefined {
+  const last = turns[turns.length - 1];
+  if (!last) return undefined;
+  if (isClaudeUuid(last.assistantUuid)) return last.assistantUuid;
+  if (isClaudeUuid(last.userUuid)) return last.userUuid;
+  for (let i = turns.length - 2; i >= 0; i--) {
+    const at = turns[i]!.assistantUuid;
+    if (isClaudeUuid(at)) return at;
   }
-  return last?.kind === 'Compaction' ? undefined : at;
+  return undefined;
 }
 
 /** {@link forkPointFor} of a record in the session index. */
-function recordForkPoint(dir: string, rec: SessionRecord): string | undefined {
-  return forkPointFor(rec.turns, () => readJournal(dir, rec.sessionId));
+function recordForkPoint(rec: SessionRecord): string | undefined {
+  return forkPointFor(rec.turns);
 }
 
 /**
@@ -661,14 +686,20 @@ export interface KiroSessionInternalOptions extends KiroSessionOptions {
 }
 
 interface Preset {
+  /** The record to open (its `pendingHistory`: an import without a usable transcript). */
   rec: SessionRecord;
   mode: LaunchMode;
-  /** `<kiro-restored-history>` block for `rec` (an import without a usable transcript). */
-  restoredHistory?: string;
 }
 
 /** The queued context one composed user line carries (composeTurn → runTurn). */
 interface QueuedContext {
+  /**
+   * Right before the line is written (the child is up): the line composed again when the record's
+   * pending restored history is no longer the one it carries (the child died while the line was
+   * composed and its respawn fell back to a fresh Claude session, R4 #6); undefined otherwise.
+   * `sent` / `unsent` then settle the block the new line carries.
+   */
+  recompose(): string | UserContentBlock[] | undefined;
   /** The line was written to Claude: the context it carries leaves its queues. */
   sent(): void;
   /** Claude never got the line, or dropped it before starting it: the context is queued again. */
@@ -722,17 +753,21 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
 
   private spawnOutputs: string[] = [];
   private firstTurnPrompts: string[] = [];
-  /**
-   * `<kiro-restored-history>` blocks by Kiro session id: a record whose Claude transcript is gone
-   * (a resume / fork fell back to a fresh Claude session, an import without a usable transcript)
-   * sends its saved history with its next line. It belongs to that record's conversation (G2):
-   * `/clear` drops it, a tangent / rewind fork (a record of its own, with its own fallback)
-   * never sends it, a respawn's fallback for the same record replaces it (one copy).
-   */
-  private readonly restoredHistory = new Map<string, string>();
+  // A record whose Claude transcript is gone (a resume / fork fell back to a fresh Claude session,
+  // an import without a usable transcript) sends its saved history with its next line: the
+  // `<kiro-restored-history>` block is kept on the record (`SessionRecord.pendingHistory`, saved
+  // with it, R4 #1) until that line is written. It belongs to that record's conversation (G2):
+  // `/clear` drops it, a tangent / `create({ fork })` of the whole conversation gets a copy (a
+  // fork at a rewind point never: its own fallback cuts the journal), a respawn's fallback for the
+  // same record keeps it (one copy).
   private queuedSteer: string[] = [];
   private redirects: string[] = [];
-  private pendingEffort: string | undefined;
+  /**
+   * A `/effort` level setEffort queued for the next prompt line, and the record it was set in: a
+   * record left since (a tangent, a rewind, its parent) never gets it (its child starts with its
+   * own saved `--effort`), so a tangent's level stays the tangent's.
+   */
+  private pendingEffort: { rec: SessionRecord; level: string } | undefined;
 
   private startPromise: Promise<void> | undefined;
   private closed = false;
@@ -757,6 +792,8 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
    * does not.
    */
   private untouchedFork: SessionRecord | undefined;
+  /** close() dropped the record (unusedRecord); `copyOf`: the parent of an untouched copy ({@link resumeId}). */
+  private droppedOnClose: { copyOf: string | undefined } | undefined;
   /** SessionStart (agentSpawn) hooks in flight: interrupt() / close() abort them (K3). */
   private hookAbort: AbortController | undefined;
   /** The creator's start signal (startSignal.ts): cancels the start only. */
@@ -802,7 +839,6 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     agents: Map<string, KiroAgent>;
     agent: KiroAgent;
     mode: LaunchMode;
-    restoredHistory?: string;
     /** The record was created by this call (deleted again if starting fails). */
     fresh?: boolean;
     /** `rec` is a fork `create({ fork })` made ({@link untouchedFork}). */
@@ -826,7 +862,6 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     if (init.forkCopy) this.untouchedFork = init.rec;
     this.startSignal = init.startSignal;
     this.historyKnown = init.mode.kind !== 'new';
-    if (init.restoredHistory) this.restoredHistory.set(init.rec.sessionId, init.restoredHistory);
     this.trustState = this.rec.trust;
     this.announcedClaudeId = this.rec.claudeSessionId;
     // unique per object: a second in-process session for the same id (the lock lets this process
@@ -907,7 +942,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         // `already in use` (Claude did write it) resumes it, a lost source falls back (spawn); at
         // the record's own last turn, not wherever the source has moved since (recordForkPoint)
         if (rec.pendingFork) {
-          const at = rec.pendingFork.at ?? recordForkPoint(store.dir, rec);
+          const at = rec.pendingFork.at ?? recordForkPoint(rec);
           mode = { kind: 'fork', from: rec.pendingFork.from, ...(at ? { at } : {}) };
         } else mode = rec.turns.length > 0 || rec.messageCount > 0 ? { kind: 'resume' } : { kind: 'new' };
       }
@@ -921,7 +956,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       rec.claudeSessionId = randomUUID();
       // at the copied record's last turn: the original may have run on since it was copied
       if (mode.kind === 'resume') {
-        const at = recordForkPoint(store.dir, rec);
+        const at = recordForkPoint(rec);
         mode = { kind: 'fork', from, ...(at ? { at } : {}) };
       }
       log.debug(`session ${rec.sessionId} is a copy of ${store.copiedFrom(rec.sessionId)}; forking Claude session ${from}`);
@@ -1013,6 +1048,13 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         // of its Claude transcript: this fork (a spec phase / continuation, SpecSessionDriver)
         // gets its own copy, like a tangent (F9); the parent keeps its copy, delivered once (G1)
         ...(parent?.pendingContext?.length ? { pendingContext: [...parent.pendingContext] } : {}),
+        // so is the parent's restored history still waiting for its next line (R4 #1): the fork
+        // source may have a transcript by now that lacks it (Claude writes a fresh session's
+        // transcript for a local command), so the fork succeeds without a fallback; a fork that
+        // falls back keeps this copy (one block). Not for a fork at a rewind point (an `at` other
+        // than the parent's own fork point): the history runs past it, and that fork's fallback
+        // restores its own cut journal (G2)
+        ...(parent?.pendingHistory !== undefined && (opts.fork.at === undefined || opts.fork.at === parent.pendingFork?.at) ? { pendingHistory: parent.pendingHistory } : {}),
       });
       mode = { kind: 'fork', from: opts.fork.fromClaudeSessionId, ...(opts.fork.at ? { at: opts.fork.at } : {}) };
     }
@@ -1073,7 +1115,6 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         fresh,
         ...(!preset && opts.fork ? { forkCopy: true } : {}),
         ...(startSignal ? { startSignal } : {}),
-        ...(preset?.restoredHistory ? { restoredHistory: preset.restoredHistory } : {}),
       });
     } catch (e) {
       // config that throws while wiring the session must not leave the lock (or a new record) behind
@@ -1405,10 +1446,12 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         ) {
           const history = journalHistoryText(readJournal(this.store.dir, this.rec.sessionId));
           if (mode.kind === 'fork') this.rec.claudeSessionId = this.rec.claudeSessionId || randomUUID();
-          if (history) {
-            // this record's (G2); replaces the block of an earlier fallback of the same record
-            // (a respawn before the first line), so the history is sent once
-            this.restoredHistory.set(this.rec.sessionId, restoredHistoryBlock(history));
+          // this record's (G2), saved with it until its line is written (R4 #1). A block still
+          // pending from an earlier fallback of the same record (a respawn before the first line,
+          // a reopen, a copy a tangent / fork got) is kept: one copy, and it holds at least what
+          // the journal does (a `/compact` meanwhile summarized a Claude session that never had it)
+          if (history && this.rec.pendingHistory === undefined) this.rec.pendingHistory = restoredHistoryBlock(history);
+          if (this.rec.pendingHistory !== undefined) {
             this.uiNotice('warn', 'Claude Code could not find the saved conversation; starting a new one with the saved history as context.');
           }
           this.historyKnown = false;
@@ -1846,7 +1889,11 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       t.compactPending = false;
       t.compactSummary = text;
       this.flushAssistant(t);
-      t.journal.push(compactionRecord(text));
+      // a compaction of a Claude session that does not hold the conversation yet (its restored
+      // history is still pending: a `/compact` right after a fallback, R4 #1) summarizes none of
+      // it: no marker, so the journal keeps the conversation the pending block delivers with the
+      // next line, and a later fallback restores it (not the summary of nothing)
+      if (this.rec.pendingHistory === undefined) t.journal.push(compactionRecord(text));
       t.lastToolBatch = undefined;
       return;
     }
@@ -2121,13 +2168,20 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     let touched: SessionRecord | undefined;
     try {
       await this.ensureProcess();
-      if (this.pendingEffort && kind !== 'local') {
-        const lvl = this.pendingEffort;
+      const effort = this.pendingEffort;
+      if (effort && kind !== 'local') {
         this.pendingEffort = undefined;
-        await this.runLocal(`/effort ${lvl}`).catch((e: unknown) => this.uiNotice('warn', `Failed to set effort: ${errText(e)}`));
+        // only in the record it was set in (another one's child runs at its own saved level)
+        if (effort.rec === this.rec) {
+          await this.runLocal(`/effort ${effort.level}`).catch((e: unknown) => this.uiNotice('warn', `Failed to set effort: ${errText(e)}`));
+        }
       }
       await this.waitIdle();
       proc = this.proc!;
+      // the child is up for the line now: a restored-history block its respawn's fallback queued
+      // after the line was composed (the child died meanwhile) goes into this line (R4 #6)
+      const recomposed = queued?.recompose();
+      if (recomposed !== undefined) content = recomposed;
       t = this.newTurnState(kind, userText);
       if (queued) t.queued = queued;
       if (kind === 'prompt') t.journal.push(promptRecord(userText, { ...(images?.length ? { images } : {}), messageId: t.userUuid }));
@@ -2324,20 +2378,35 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       ...(verbatim ? [] : this.activator.forPrompt(text)),
     ];
     // Queued context for this line (runTurn settles it, F1). First-turn prompts are taken now and
-    // given back by `unsent` when Claude never gets the line. The record's restored history (G2)
-    // and tangent carry stay queued until the line is written (`sent`): a prompt cancelled, or a
-    // session closed (the REPL's forced stop: close() saves the record, G5), before that keeps
-    // them; a respawn's fallback for this record meanwhile replaces the same block, not a copy.
+    // given back by `unsent` when Claude never gets the line. The record's restored history (G2,
+    // `pendingHistory`) and tangent carry stay queued on the record until the line is written
+    // (`sent`): a prompt cancelled, or a session closed (the REPL's forced stop: close() saves the
+    // record, G5), before that keeps them; a block a respawn's fallback queued for this record
+    // while the line was composed is put into it before it is written (`recompose`, R4 #6).
     const rec = this.rec;
     const firstTurn = this.firstTurnPrompts.splice(0);
-    const restored = this.restoredHistory.get(rec.sessionId);
+    let restored = rec.pendingHistory;
     const carried = [...(rec.pendingContext ?? [])];
     let state: 'composed' | 'sent' | 'settled' = 'composed';
     const queued: QueuedContext = {
+      recompose: () => {
+        if (state !== 'composed' || rec.pendingHistory === restored) return undefined;
+        // the line's block (where composeUserTurn puts it: after the first-turn prompts) becomes
+        // the record's current one
+        const i = restored !== undefined ? extraContext.indexOf(restored) : -1;
+        const now = rec.pendingHistory;
+        extraContext.splice(i >= 0 ? i : firstTurn.length, i >= 0 ? 1 : 0, ...(now !== undefined ? [now] : []));
+        restored = now;
+        return composeUserTurn(turnInput);
+      },
       sent: () => {
         if (state !== 'composed') return;
         state = 'sent';
-        if (restored !== undefined && this.restoredHistory.get(rec.sessionId) === restored) this.restoredHistory.delete(rec.sessionId);
+        let save = false;
+        if (restored !== undefined && rec.pendingHistory === restored) {
+          delete rec.pendingHistory;
+          save = true;
+        }
         if (carried.length) {
           const left = [...(rec.pendingContext ?? [])];
           for (const c of carried) {
@@ -2346,9 +2415,11 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
           }
           if (left.length) rec.pendingContext = left;
           else delete rec.pendingContext;
-          // saved now: a fork of this record (spec driver, G1) must not get a delivered carry
-          if (rec === this.rec) this.persist();
+          save = true;
         }
+        // saved now: a fork of this record (spec driver, G1) must not get a delivered carry or
+        // history, nor a reopen of it the history again (R4 #1)
+        if (save && rec === this.rec) this.persist();
       },
       unsent: () => {
         if (state === 'settled') return;
@@ -2357,11 +2428,16 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         this.firstTurnPrompts.unshift(...firstTurn);
         if (!wasSent) return; // the rest never left its queue
         // Claude dropped the line before starting it: the model never read any of it
-        if (restored !== undefined && !this.restoredHistory.has(rec.sessionId)) this.restoredHistory.set(rec.sessionId, restored);
+        let save = false;
+        if (restored !== undefined && rec.pendingHistory === undefined) {
+          rec.pendingHistory = restored;
+          save = true;
+        }
         if (carried.length) {
           rec.pendingContext = [...carried, ...(rec.pendingContext ?? [])];
-          if (rec === this.rec) this.persist();
+          save = true;
         }
+        if (save && rec === this.rec) this.persist();
       },
     };
     const extraContext: string[] = [
@@ -2372,7 +2448,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       ...(input.extraContext ?? []),
     ];
     const images = [...(input.images ?? []), ...at.images.map((i) => ({ mediaType: i.mediaType, dataBase64: i.dataBase64 }))];
-    const content = composeUserTurn({
+    const turnInput = {
       text,
       hookOutputs,
       agentPrompts: hookPrompts,
@@ -2380,12 +2456,24 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       refBlocks: [...at.blocks, ...hash.blocks],
       extraContext,
       images,
-    });
+    };
+    const content = composeUserTurn(turnInput);
     if (content === '' || (Array.isArray(content) && content.length === 0)) {
       queued.unsent();
       throw new Error('Cannot send an empty prompt');
     }
     return { content, userText: input.text, images, queued };
+  }
+
+  /**
+   * Compose a line of `prompt()` (the first one, a redirect, a Stop-hook continuation) for the
+   * child that will get it: a child that died since the last turn is respawned FIRST, so the
+   * restored history its fallback queues (the transcript is gone too) goes into this very line,
+   * the one it is context for, and the line's steering / skills are those of that child (R4 #6).
+   */
+  private async composeLine(input: PromptInput, signal: AbortSignal): ReturnType<KiroSessionImpl['composeTurn']> {
+    await this.ensureProcess();
+    return this.composeTurn(input, signal);
   }
 
   async *prompt(input: PromptInput, opts: { signal?: AbortSignal } = {}): AsyncGenerator<SessionEvent, TurnResult> {
@@ -2401,7 +2489,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     const join = { tail: '', pending: false };
     this.textJoin = join;
     try {
-      let composed = await this.composeTurn(input, abort.signal);
+      let composed = await this.composeLine(input, abort.signal);
       let res = yield* this.runTurn(composed.content, 'prompt', composed.userText, composed.images, composed.queued);
       // the prompt's result covers every Claude turn it ran (F6, like ClaudeProcess mergeResults
       // for a steer answered in a turn of its own); text and stop reason are the last turn's
@@ -2411,7 +2499,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         if (abort.signal.aborted || this.closed) break;
         const redirect = this.redirects.shift();
         if (redirect !== undefined) {
-          composed = await this.composeTurn({ text: redirect }, abort.signal);
+          composed = await this.composeLine({ text: redirect }, abort.signal);
           join.pending = join.tail !== '';
           res = yield* this.runTurn(composed.content, 'prompt', composed.userText, composed.images, composed.queued);
           total = mergeTurnResults(total, res);
@@ -2422,7 +2510,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         const cont = await this.runStopHooks(res.text, continuations, abort.signal);
         if (cont === undefined || abort.signal.aborted) break;
         continuations++;
-        composed = await this.composeTurn({ text: cont, skipPromptHooks: true }, abort.signal);
+        composed = await this.composeLine({ text: cont, skipPromptHooks: true }, abort.signal);
         join.pending = join.tail !== '';
         res = yield* this.runTurn(composed.content, 'prompt', composed.userText, composed.images, composed.queued);
         total = mergeTurnResults(total, res);
@@ -2577,8 +2665,12 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     }
     this.rec.effort = l;
     this.persist();
-    if (this.turnBusy || !this.proc?.running) {
-      this.pendingEffort = l;
+    // queued for the next prompt line (runTurn writes it right before that line) while a turn
+    // runs, while the child is down (a respawn gets `--effort` anyway) and while a restored
+    // history is pending: Claude writes a fresh session's transcript for a local command line, so
+    // the history's own line stays the conversation's first (R4 #1)
+    if (this.turnBusy || !this.proc?.running || this.rec.pendingHistory !== undefined) {
+      this.pendingEffort = { rec: this.rec, level: l };
       return;
     }
     const r = await this.runLocal(`/effort ${l}`);
@@ -2689,7 +2781,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     // conversation and its message count describe, K4); the record stays in the index (unusedRecord)
     this.rec.messageCount = 0;
     delete this.rec.pendingContext; // a tangent carry for the conversation just cleared
-    this.restoredHistory.delete(this.rec.sessionId); // and its restored history (G2)
+    delete this.rec.pendingHistory; // and its restored history (G2; saved below)
     this.todoMap.clear();
     this.activator.reset();
     this.lastExchange = undefined;
@@ -2758,6 +2850,11 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       // 01 §5.11; Q re-appends the tail entry, 06 §6.4), which this fork does not contain yet:
       // the tangent's first turn gets its own copy; the parent keeps its copy, delivered once (F9)
       ...(parent.pendingContext?.length ? { pendingContext: [...parent.pendingContext] } : {}),
+      // so is the parent's restored history still waiting for its next line (R4 #1): the fork
+      // source may have a transcript without it by now (Claude writes a fresh session's
+      // transcript for a local command), so the fork succeeds without a fallback; a fork that
+      // falls back keeps this copy (one block); the parent keeps its own copy
+      ...(parent.pendingHistory !== undefined ? { pendingHistory: parent.pendingHistory } : {}),
     });
     let lock: SessionLock | undefined;
     try {
@@ -2780,7 +2877,6 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       this.lock = parentLock;
       lock.release();
       this.dropRecord(tangent.sessionId);
-      this.restoredHistory.delete(tangent.sessionId);
       await this.restart().catch(() => undefined);
       throw e;
     }
@@ -2832,7 +2928,8 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     this.lock = top.lock;
     this.rec.trust = this.trustState;
     lock?.release();
-    this.restoredHistory.delete(tangent.sessionId); // the tangent is left: never sent from here
+    // a restored history still pending in the tangent stays on its record (saved above: a reopen
+    // of the tangent by id sends it); it is never sent from here (the record is left)
     this.lastExchange = undefined;
     if (carry) {
       // the parent's own queue, saved with its record: it reaches THIS conversation even after a
@@ -2887,16 +2984,13 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       this.lock = oldLock;
       lock.release();
       this.dropRecord(rec.sessionId);
-      this.restoredHistory.delete(rec.sessionId);
       await this.restart().catch(() => undefined);
       throw e;
     }
     // the old session stays on disk untouched; it is no longer active here (unless it is a tangent
-    // parent); its restored history (the turns rewound away included) is never sent (G2)
-    if (!this.tangentStack.some((s) => s.rec === old)) {
-      oldLock?.release();
-      this.restoredHistory.delete(old.sessionId);
-    }
+    // parent); its restored history (the turns rewound away included) is never sent from here
+    // (G2): it stays pending on the old record only (a reopen of that record by id sends it)
+    if (!this.tangentStack.some((s) => s.rec === old)) oldLock?.release();
     this.todoMap.clear();
   }
 
@@ -3090,20 +3184,28 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
    * turns, no messages and no prompt in its journal: a cleared one keeps its record, K4, a chat
    * whose only action was `/clear` or `/compact` does not), or a copy `create({ fork })` made that
    * never got anything of its own (its turns are its parent's, K1).
-   * Tangents, rewinds and ACP / KiroCrew sessions are always kept.
+   * Tangents, rewinds and ACP / KiroCrew sessions are always kept. So is the continuation a
+   * `/spec` flow hands to the chat (origin `repl`, SpecSessionDriver.finish): it is the user's
+   * conversation, spec turns included, and `chat --resume` must reach it after a quit (r4 #5); only
+   * a spec-phase copy (origin `spec`) is the duplicate.
    */
   private unusedRecord(): boolean {
     const r = this.rec;
     if (r.forkKind !== 'main' || r.origin === 'acp') return false;
-    if (this.untouchedFork === r) return true;
-    if (r.turns.length > 0 || r.messageCount > 0) return false;
-    if (journalSize(this.store.dir, r.sessionId) === 0) return true;
-    try {
-      // a /clear or /compact of nothing journals only its compaction marker
-      return !readJournal(this.store.dir, r.sessionId).some((j) => j.kind === 'Prompt');
-    } catch {
-      return false; // unreadable: keep what may be a conversation
-    }
+    if (this.untouchedFork === r && r.origin === 'spec') return true;
+    return recordNeverUsed(this.store.dir, r);
+  }
+
+  /**
+   * The id `chat --resume-id` reopens this conversation with (KiroSession.resumeId): this
+   * record's, unless close() dropped it (unusedRecord) — then the parent record of an untouched
+   * spec-phase copy (it holds the same conversation) while that still exists, else undefined
+   * (a chat that never had a message leaves nothing to resume).
+   */
+  resumeId(): string | undefined {
+    const d = this.droppedOnClose;
+    if (!d) return this.rec.sessionId;
+    return d.copyOf && this.store.read(d.copyOf) ? d.copyOf : undefined;
   }
 
   /** Release everything without SessionEnd hooks (failed creation). */
@@ -3174,6 +3276,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     if (this.turn) this.settleUnreadLine(this.turn);
     if (this.unusedRecord() && this.tangentStack.length === 0) {
       // Q saves a conversation only after a reply: never leave an empty chat in the index
+      this.droppedOnClose = { copyOf: this.untouchedFork === this.rec ? (this.rec.parentId ?? undefined) : undefined };
       this.dropRecord(this.rec.sessionId);
     } else {
       this.persist();
@@ -3211,9 +3314,11 @@ export async function createSession(opts: KiroSessionOptions): Promise<KiroSessi
  * fork's transcript only with its first message) forks its source again, at its own point or the
  * record's last turn ({@link forkPointFor}); otherwise the exported Claude session, when it still
  * exists, is forked at the record's last turn (it may have run on since the export); otherwise a
- * fresh session gets the exported journal as context. The record keeps its turns in every case
- * (a reopen does too): the journal is their history when Claude has none. Trust is not carried
- * over (V3 behaviour); session context rules are.
+ * fresh session gets the exported journal as context. An exported restored history still pending
+ * (`pendingHistory`) is kept in every case (instead of the journal's, R4 #1). The record keeps
+ * its turns in every case (a reopen does too): the journal is their history when Claude has none.
+ * Trust is not carried
+ * over (V3 behaviour); session context rules and plan mode are.
  */
 export async function importSessionExport(p: string, opts: Omit<KiroSessionOptions, 'resume' | 'fork'>): Promise<KiroSession> {
   const ws = opts.ws;
@@ -3248,10 +3353,14 @@ export async function importSessionExport(p: string, opts: Omit<KiroSessionOptio
   const claudeId = randomUUID();
   let mode: LaunchMode;
   let writtenTranscript: string | undefined;
-  let restoredHistory: string | undefined;
+  // the exported record's restored history still waiting for its next line (R4 #1): in neither
+  // the exported transcript (which may hold only local commands of the fresh Claude session) nor
+  // a fork of its Claude session, so the import keeps it; with no transcript at all it is the
+  // history (one block: it holds at least what the journal does, see spawn's fallback)
+  let pendingHistory = exported.pendingHistory;
   // (ids come from an untrusted file: only a UUID may name a transcript path)
   const hasTranscript = (id: string | undefined): id is string => !!id && UUID_RE.test(id) && !!findTranscript(id, { cwd: exported.cwd || ws.cwd, env });
-  const pin = (): string | undefined => forkPointFor(exported.turns, () => parseJournal(journal));
+  const pin = (): string | undefined => forkPointFor(exported.turns);
   if (transcript.trim() !== '') {
     const dest = transcriptPath(claudeId, ws.cwd, env);
     mkdirp(path.dirname(dest), 0o700);
@@ -3268,8 +3377,8 @@ export async function importSessionExport(p: string, opts: Omit<KiroSessionOptio
     mode = { kind: 'fork', from: exported.claudeSessionId, ...(at ? { at } : {}) };
   } else {
     mode = { kind: 'new' };
-    const history = journalHistoryText(parseJournal(journal));
-    if (history) restoredHistory = restoredHistoryBlock(history);
+    const history = pendingHistory === undefined ? journalHistoryText(parseJournal(journal)) : undefined;
+    if (history) pendingHistory = restoredHistoryBlock(history);
   }
   const cleanup = (sid?: string): void => {
     try {
@@ -3297,9 +3406,12 @@ export async function importSessionExport(p: string, opts: Omit<KiroSessionOptio
       lastPreview: exported.lastPreview,
       turns: exported.turns,
       messageCount: exported.messageCount,
+      // a session saved in plan mode comes back in it: the gate keeps denying mutating tools (r4 #0)
+      planMode: exported.planMode,
       // a tangent carry still waiting for this conversation's next prompt (F8): it is in neither
       // the transcript nor the journal; in mode 'new' it follows the restored-history block
       ...(exported.pendingContext?.length ? { pendingContext: exported.pendingContext } : {}),
+      ...(pendingHistory !== undefined ? { pendingHistory } : {}),
     });
   } catch (e) {
     cleanup();
@@ -3315,7 +3427,7 @@ export async function importSessionExport(p: string, opts: Omit<KiroSessionOptio
   try {
     return await KiroSessionImpl.create(
       { ...opts, ...(opts.agentName ? {} : { agentName: rec.agent }) },
-      { rec, mode, ...(restoredHistory ? { restoredHistory } : {}) },
+      { rec, mode },
     );
   } catch (e) {
     // nothing of a failed import stays behind: index file, journal, re-keyed transcript

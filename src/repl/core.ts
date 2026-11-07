@@ -3,9 +3,12 @@
  * 06 §2 / §5 / §6, 00 §2.3–§2.5).
  *
  * Flow: create + start the KiroSession (`origin: 'repl'`, interactive, this REPL as its
- * SessionUI) → greeting → optional initial input → read/dispatch loop → on exit print
- * `To resume this session: <prog> chat --resume-id <id>` and close the session (exit 0;
- * 1 when the session could not start or Claude reported an auth failure).
+ * SessionUI) → greeting → optional initial input → read/dispatch loop → on exit close the
+ * session and print `To resume this session: <prog> chat --resume-id <id>` for the record the
+ * close kept (`KiroSession.resumeId`; none for a chat that never had a message) (exit 0;
+ * 1 when the session could not start or Claude reported an auth failure). SIGHUP / SIGTERM,
+ * and Ctrl+C while the session starts, close it before kiro-claude dies of the signal
+ * ({@link ExitSignals}).
  *
  * Input handling order (01 §4.3): empty ⇒ re-prompt; `/…` ⇒ built-in command, else a file
  * prompt (`/<prompt> args`, prompts take precedence, 00 §2.2), else a skill (inlined with
@@ -62,6 +65,7 @@ import { loadPrompts, findPrompt, expandPrompt, parsePromptInvocation } from '..
 import { discoverSkills, expandSkillInvocation, pluginSkillName } from '../config/skills.js';
 import { loadSteering } from '../config/steering.js';
 import { findModelEntry } from '../models/models.js';
+import { withStartSignal } from '../session/startSignal.js';
 import { SessionStore, previewText, sessionsDir } from '../session/store.js';
 import type {
   ApprovalRequest,
@@ -1052,21 +1056,32 @@ export class Repl implements ReplContext {
   }
 
   async run(): Promise<number> {
+    // SIGHUP / SIGTERM, and Ctrl+C until the prompt is up: close the session, then die of the
+    // signal (ExitSignals, r4 #4)
+    const exits = this.deps.installSignalHandlers && process.platform !== 'win32'
+      ? new ExitSignals(() => this.current as KiroSession | undefined, [this.ctx.stdin, this.ctx.stdout, this.ctx.stderr])
+      : undefined;
     try {
-      this.current = await this.deps.createSession({
-        ...this.opts.sessionOptions,
-        ws: this.ws,
-        origin: 'repl',
-        interactive: true,
-        ui: this.ui,
-      });
+      this.current = await withStartSignal(exits?.startSignal, () =>
+        this.deps.createSession({
+          ...this.opts.sessionOptions,
+          ws: this.ws,
+          origin: 'repl',
+          interactive: true,
+          ui: this.ui,
+        }),
+      );
       await this.current.start();
     } catch (e) {
+      if (exits?.received) return exits.die();
+      exits?.dispose();
       this.write(`${c.red(errText(e))}\n`);
       // a half-started session may own a claude child and the session lock
       if (this.current) await this.current.close().catch(() => undefined);
       return 1;
     }
+    if (exits?.received) return exits.die();
+    exits?.ready();
     this.setupReader();
     try {
       const rnd = this.deps.random ?? Math.random;
@@ -1093,15 +1108,129 @@ export class Repl implements ReplContext {
     } finally {
       this.spinner.stop();
       if (this.sigHandler) process.off('SIGINT', this.sigHandler);
-      this.write(`\n${resumeHint(this.progName, this.current.id)}\n`);
+      // a SIGHUP / SIGTERM is closing the session: the signal ends the process (the terminal may be gone)
+      if (exits?.received) await exits.die();
+      const s = this.current;
       try {
-        await this.current.close();
+        await s.close();
       } catch {
         // best effort
       }
+      // the record close() kept, never one it dropped (r4 #5/#9): an untouched spec-phase copy
+      // names the record holding its conversation, a chat that never had a message none
+      const id = s.resumeId ? s.resumeId() : s.id;
+      this.write(id !== undefined ? `\n${resumeHint(this.progName, id)}\n` : '\n');
+      exits?.dispose();
       this.reader.close();
     }
     return this.exitCode;
+  }
+}
+
+/**
+ * How long a SIGHUP / SIGTERM (or a Ctrl+C while the chat starts) waits for the session to close
+ * before the signal is re-raised anyway ({@link ExitSignals}).
+ */
+export const SIGNAL_CLOSE_GRACE_MS = 2000;
+/** After the re-raise: exit with the signal's status if the process is somehow still alive. */
+const SIGNAL_EXIT_FALLBACK_MS = 5000;
+
+/**
+ * SIGHUP / SIGTERM during the whole chat (a closed terminal tab, `kill`), and SIGINT while its
+ * session starts (Claude Code initializing, agentSpawn hooks; the line reader takes Ctrl+C over
+ * once the prompt is up). Without this, claude/lifecycle.ts's forwarder kills kiro-claude before
+ * the session's close(), which drops a chat that never had a message (Q saves a conversation only
+ * after a reply, r4 #4) and runs SessionEnd hooks. Here the current session is closed (a start
+ * still running is cancelled through its start signal, startSignal.ts: agentSpawn hooks are
+ * killed and nothing of it stays), then the signal is re-raised with these listeners removed, so
+ * kiro-claude still dies of it (the forwarder ends any child left). The wait is bounded by
+ * {@link SIGNAL_CLOSE_GRACE_MS}; a second signal re-raises at once. A record left anyway (the
+ * grace ran out, SIGKILL, a crash) is skipped by the session index (store.ts `list`).
+ */
+class ExitSignals {
+  /** The first signal received. */
+  received: NodeJS.Signals | undefined;
+  private readonly startAbort = new AbortController();
+  private readonly listeners = new Map<NodeJS.Signals, () => void>();
+  private started = false;
+  private reraised = false;
+  private grace: NodeJS.Timeout | undefined;
+  private dying: Promise<never> | undefined;
+
+  constructor(
+    /** The session to close (undefined while the first one is created). */
+    private readonly current: () => KiroSession | undefined,
+    /** stdin / stdout / stderr: a hung-up terminal fails their reads and writes (EIO). */
+    private readonly streams: readonly unknown[],
+  ) {
+    for (const sig of ['SIGHUP', 'SIGTERM', 'SIGINT'] as const) {
+      const l = (): void => this.onSignal(sig);
+      this.listeners.set(sig, l);
+      process.on(sig, l);
+    }
+  }
+
+  /** Cancels the first session's start when a signal comes in. */
+  get startSignal(): AbortSignal {
+    return this.startAbort.signal;
+  }
+
+  /** The chat is up: Ctrl+C is the line reader's from now on; a signal closes the current session. */
+  ready(): void {
+    this.started = true;
+    this.off('SIGINT');
+  }
+
+  /** Remove the listeners (the chat ended). */
+  dispose(): void {
+    for (const sig of [...this.listeners.keys()]) this.off(sig);
+    if (this.grace) clearTimeout(this.grace);
+    this.grace = undefined;
+  }
+
+  /**
+   * Close the current session (bounded), then re-raise the signal received. Never resolves: the
+   * signal ends the process.
+   */
+  die(): Promise<never> {
+    this.dying ??= (async () => {
+      const s = this.current();
+      if (s) await withTimeout(s.close().catch(() => undefined), SIGNAL_CLOSE_GRACE_MS);
+      this.reraise();
+      return new Promise<never>(() => undefined);
+    })();
+    return this.dying;
+  }
+
+  private onSignal(sig: NodeJS.Signals): void {
+    if (this.received) {
+      this.reraise(); // a second signal: stop waiting
+      return;
+    }
+    this.received = sig;
+    const noop = (): void => undefined;
+    for (const st of this.streams) (st as { on?: (e: string, f: () => void) => void } | undefined)?.on?.('error', noop);
+    this.startAbort.abort();
+    this.grace = setTimeout(() => this.reraise(), SIGNAL_CLOSE_GRACE_MS);
+    // while the first session is created, run() closes it once its creation settles
+    if (this.started) void this.die();
+  }
+
+  private off(sig: NodeJS.Signals): void {
+    const l = this.listeners.get(sig);
+    if (l) process.off(sig, l);
+    this.listeners.delete(sig);
+  }
+
+  private reraise(): void {
+    const sig = this.received;
+    if (this.reraised || !sig) return;
+    this.reraised = true;
+    this.dispose();
+    // claude/lifecycle.ts's forwarder (while children are tracked) or the default disposition ends
+    // the process; should anything else swallow the signal, exit with its status
+    setTimeout(() => process.exit(128 + (os.constants.signals[sig] ?? 15)), SIGNAL_EXIT_FALLBACK_MS);
+    process.kill(process.pid, sig);
   }
 }
 

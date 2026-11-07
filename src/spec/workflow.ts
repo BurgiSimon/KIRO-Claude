@@ -20,7 +20,16 @@
  *    transcript only with its first message (VERIFIED 2.1.319), so a session forked from one that
  *    never got a message would start empty: the driver forks from the last session a turn reached
  *    (main when none did), and when no spec turn reached Claude (e.g. Ctrl+C while the phase
- *    session started) the REPL keeps its original session.
+ *    session started) the REPL keeps its original session. A fork's parent RECORD (whose turns,
+ *    journal, context rules and merged carry the fork's record copies) is the session the user is
+ *    in, also a continuation an earlier flow handed over that has no message yet (its fork point is
+ *    still its source's). The continuation takes the plan mode of the session it replaces (also
+ *    plan mode the user turned on during the flow, e.g. Shift+Tab at a checkpoint); the phase
+ *    sessions run without plan mode (they write the spec documents). The REPL runtime creates
+ *    every session (phase sessions, the continuation, task sessions) under the command's Ctrl+C as
+ *    its start signal (session/startSignal.ts): a press while one runs its agentSpawn hooks cancels
+ *    that start (phase turn not sent, continuation not made: the chat keeps its session, task
+ *    `interrupted`).
  *  - Analyze Requirements (03 §1.8): turn A with no writable paths, JSON findings, questions
  *    `Question i/N`, turn B applies all answers to the phase-1 document, then re-lint.
  *  - Task execution (03 §1.7): planned from tasks.md (model.planRun: waves, checkpoints as
@@ -30,6 +39,12 @@
  *    `[ ]` and the run stops (03 §1.7.2, KI:#11786); PostTaskExec hooks (agent prompts ⇒ follow-up
  *    turn in the task session before it closes). Concurrency per wave = runtime.maxParallelTasks
  *    (REPL 1; CLI `kiroClaude.spec.maxParallelTasks`, ≤ 4 — documented deviation 03 §1.7.2).
+ *    The run's signal (Ctrl+C) stops scheduling, interrupts running task sessions, kills running
+ *    task hook commands (with their process groups, also with timeout 0) and cancels a task
+ *    session start whose agentSpawn hooks run. A press during PreTaskExec ⇒ the task is
+ *    `interrupted` before its box or a session is touched (no PostTaskExec). The PostTaskExec of
+ *    an interrupted task still runs (status `interrupted`), without the already aborted signal, so
+ *    it cannot be cancelled (known gap: a host signal for a LATER press does not exist).
  *
  * The workflow talks to its host only through {@link SpecRuntime}; {@link createReplRuntime}
  * adapts a ReplHost (slash commands) and spec/cli.ts builds a headless one.
@@ -51,6 +66,7 @@ import type {
   WorkspaceContext,
 } from '../types.js';
 import { HookRunner } from '../hooks/runner.js';
+import { isSessionStartCancelled, withStartSignal } from '../session/startSignal.js';
 import { writeFileAtomic } from '../util/fsx.js';
 import { shlexSplit } from '../util/shlex.js';
 import {
@@ -219,16 +235,29 @@ const unwritten = new WeakMap<
     point: ForkPoint | undefined;
     turns: number;
     claudeSessionId: string | undefined;
+    /** {@link forkSourceKey} when it was made. */
+    source: string;
     /** The conversation it was forked from had history (its own record starts with none). */
     history: boolean;
   }
 >();
 
-/** `s`'s entry in {@link unwritten}, until a turn reaches it or its conversation changes (/clear, a tangent). */
+/** What `s.forkSource()` answers, as a comparable key. */
+function forkSourceKey(s: KiroSession): string {
+  const f = s.forkSource();
+  return JSON.stringify(f?.from ? [f.from, f.at ?? null] : null);
+}
+
+/**
+ * `s`'s entry in {@link unwritten}, until a turn reaches it or its conversation changes (/clear, a
+ * tangent), or the session itself no longer forks from where it started: its own Claude session
+ * got a transcript without a recorded turn (a `/compact` in it: KiroSession.forkSource then answers
+ * that session, and a fork from the old point would drop the compaction).
+ */
 function unwrittenEntry(s: KiroSession): ReturnType<typeof unwritten.get> {
   const u = unwritten.get(s);
   if (!u) return undefined;
-  if (recordedTurns(s) <= u.turns && s.claudeSessionId === u.claudeSessionId) return u;
+  if (recordedTurns(s) <= u.turns && s.claudeSessionId === u.claudeSessionId && forkSourceKey(s) === u.source) return u;
   unwritten.delete(s);
   return undefined;
 }
@@ -271,6 +300,12 @@ export class SpecSessionDriver {
   private replacedOriginal = false;
   /** A turn of this flow reached Claude in a session this driver created. */
   private reached = false;
+  /**
+   * The user turned plan mode on in a session this driver created while it was the chat's
+   * (Shift+Tab at a question of the flow, e.g. a checkpoint: the prompt showed `[plan]`). Phase
+   * sessions start without plan mode, so plan mode on one of them is the user's.
+   */
+  private planTurnedOn = false;
 
   constructor(
     private readonly port: SessionPort,
@@ -295,7 +330,14 @@ export class SpecSessionDriver {
     }
     const key = phaseKey(phase);
     if (!s || !this.restricted || this.restricted.session !== s || this.restricted.key !== key) {
-      s = await this.fork(s, { ...this.opts.phaseOptions, specPhase: { name: phase.name, allowedWritePaths: [...phase.allowedWritePaths] } });
+      try {
+        s = await this.fork(s, { ...this.opts.phaseOptions, specPhase: { name: phase.name, allowedWritePaths: [...phase.allowedWritePaths] } });
+      } catch (e) {
+        // Ctrl+C while the phase session ran its agentSpawn hooks (the host's start signal,
+        // session/startSignal.ts): that start was cancelled and nothing changed, the turn is not sent
+        if (isSessionStartCancelled(e)) return notSent();
+        throw e;
+      }
       this.restricted = { session: s, key };
     }
     // Ctrl+C while the phase session started: nothing is sent (the session gets no message)
@@ -308,17 +350,29 @@ export class SpecSessionDriver {
     }
   }
 
-  private async fork(prev: KiroSession | undefined, extra: Partial<KiroSessionOptions>): Promise<KiroSession> {
+  /**
+   * A new session forking `prev`'s conversation, made active. `planMode`: it starts in plan mode
+   * (set before the host sees it).
+   */
+  private async fork(prev: KiroSession | undefined, extra: Partial<KiroSessionOptions>, init: { planMode?: boolean } = {}): Promise<KiroSession> {
     const o: Partial<KiroSessionOptions> = { ...extra };
     // never from a session without a transcript yet (its fork would start empty): from its source
     const p = forkPointOf(prev);
-    if (p) o.fork = { fromClaudeSessionId: p.claudeSessionId, ...(p.at ? { at: p.at } : {}), kind: 'main', parentId: p.parentId };
+    // The parent RECORD (create({fork}) builds the fork's record from it: turns, journal, title,
+    // context rules, a merged carry) is the session the user is in when it is not one of this
+    // driver's: also a continuation an earlier flow handed over that has no message yet, whose fork
+    // point is its source's but whose record holds what the user added since (a `/tangent merge`
+    // carry, `/context add` rules, r4 #8). A phase session of this flow that got no message is
+    // skipped: the fork's parent is its source (G0).
+    if (p) o.fork = { fromClaudeSessionId: p.claudeSessionId, ...(p.at ? { at: p.at } : {}), kind: 'main', parentId: prev && !this.created.has(prev) ? prev.id : p.parentId };
     const history = !!p && conversationHasHistory(prev);
     const next = await this.port.create(o);
-    unwritten.set(next, { point: p, turns: recordedTurns(next), claudeSessionId: next.claudeSessionId, history });
+    unwritten.set(next, { point: p, turns: recordedTurns(next), claudeSessionId: next.claudeSessionId, source: forkSourceKey(next), history });
+    if (init.planMode) next.planMode = true;
     if (prev && !this.created.has(prev) && this.original === undefined) this.original = prev;
     this.port.activate(next);
     if (prev && this.created.has(prev)) {
+      if (prev.planMode) this.planTurnedOn = true;
       this.created.delete(prev);
       await prev.close().catch(() => undefined);
     } else if (prev) {
@@ -332,23 +386,34 @@ export class SpecSessionDriver {
    * End of a flow. `keep`: when a restricted session is active, fork an unrestricted continuation
    * (keeps the spec conversation, 03 §1.7.2) from the last session a turn reached, and close the
    * restricted one and the replaced original; when no turn of the flow reached Claude the original
-   * stays (nothing to carry). Then, and for `close`, close every session this driver created, the
-   * host never left on one of them.
+   * stays (nothing to carry). The continuation takes the plan mode of the session it replaces (the
+   * phase sessions run without it: they write the spec documents; r4 #0), or plan mode when the
+   * user turned it on during the flow (in a phase session); so does an original the host gets
+   * back. Then, and for `close`, close every session this driver created, the host never left on
+   * one of them.
    */
   async finish(mode: 'keep' | 'close'): Promise<void> {
     const active = this.port.active();
+    if (active && this.created.has(active) && active.planMode) this.planTurnedOn = true;
+    // never out of plan mode the chat was in, or that the user turned on during the flow (the
+    // prompt showed `[plan]`); a phase session in plan mode is the user's doing (they start without)
+    const planMode = this.original?.planMode === true || this.planTurnedOn;
+    const giveBack = (s: KiroSession): void => {
+      if (planMode && !s.planMode) s.planMode = true;
+      this.port.activate(s);
+    };
     if (mode === 'keep' && active && this.restricted && this.restricted.session === active && (this.reached || !this.original)) {
       this.restricted = undefined;
       try {
-        const next = await this.fork(active, { ...this.opts.finalOptions });
+        const next = await this.fork(active, { ...this.opts.finalOptions }, { planMode });
         this.created.delete(next); // handed over to the host
         if (this.replacedOriginal && this.original) await this.original.close().catch(() => undefined);
       } catch {
         // could not fork a continuation: give the host its original session back
-        if (this.original) this.port.activate(this.original);
+        if (this.original) giveBack(this.original);
       }
     } else if (active && this.created.has(active) && this.original) {
-      this.port.activate(this.original);
+      giveBack(this.original);
     }
     for (const s of this.created) await s.close().catch(() => undefined);
     this.created.clear();
@@ -356,6 +421,7 @@ export class SpecSessionDriver {
     this.original = undefined;
     this.replacedOriginal = false;
     this.reached = false;
+    this.planTurnedOn = false;
   }
 }
 
@@ -1028,7 +1094,9 @@ async function executeTask(
   const file = specDocPath(spec.dir, 'tasks');
   const info = { specName: spec.name, taskId: t.id, title: t.title, specDir: spec.dir, optional };
   const hooks = rt.taskHooks();
-  const hctx = hooks ? { ws: rt.ws, sessionId: hooks.sessionId } : undefined;
+  // the run's Ctrl+C kills a task hook's command with its process group (also with timeout 0 or a
+  // command that ignores SIGTERM: hooks/runner.ts), as for `/hooks run` and agentSpawn hooks
+  const hctx = hooks ? { ws: rt.ws, sessionId: hooks.sessionId, ...(signal ? { signal } : {}) } : undefined;
   rt.print(`▶ Task ${taskLabel(t)}`);
   let hookPrompts: string[] = [];
   if (hooks && hctx) {
@@ -1042,6 +1110,12 @@ async function executeTask(
       return { id: t.id, title: t.title, status: 'failed', reason };
     }
     printWarnings(rt, pre.warnings);
+    // Ctrl+C while the PreTaskExec hooks ran (a killed hook reports neither a block nor a
+    // warning): the task never started, so no box change, no task session, no PostTaskExec
+    if (signal?.aborted) {
+      rt.print(`✗ Task ${t.id} interrupted`);
+      return { id: t.id, title: t.title, status: 'interrupted' };
+    }
     if (pre.blocked) {
       const reason = (pre.blockReason ?? '').trim() || 'blocked by a PreTaskExec hook';
       rt.print(`⏭ Task ${t.id} skipped: PreTaskExec hook blocked it: ${reason}`);
@@ -1056,7 +1130,11 @@ async function executeTask(
         const postInfo = { ...info, status: hookStatus(o.status) };
         let post: Awaited<ReturnType<HookRunnerLike['runTaskHook']>> | undefined;
         try {
-          post = await hooks.runner.runTaskHook(hctx, 'PostTaskExec', postInfo);
+          // A press during the hook kills it. One that already came (it interrupted the task) is
+          // not passed on: the hook is meant to run with status `interrupted`, and an aborted
+          // signal would skip it before it starts. Such a hook cannot be cancelled (known gap:
+          // the REPL exposes no signal for a later press, only the command's, which stays aborted).
+          post = await hooks.runner.runTaskHook(signal?.aborted ? { ws: hctx.ws, sessionId: hctx.sessionId } : hctx, 'PostTaskExec', postInfo);
         } catch (e) {
           rt.print(`⚠ PostTaskExec hooks for task ${t.id} failed: ${e instanceof Error ? e.message : String(e)}`);
         }
@@ -1085,8 +1163,13 @@ async function executeTask(
   if (!setBox(rt, file, t, '-')) return { id: t.id, title: t.title, status: 'failed', reason: 'task is no longer in tasks.md' };
   let session: TaskSessionHandle;
   try {
-    session = await rt.openTaskSession(`task ${t.id}`);
+    // the run's Ctrl+C is the start signal of the task session (session/startSignal.ts, K3): a
+    // press while it runs its agentSpawn hooks (which may never end with timeout 0) kills them and
+    // cancels the start; a host whose sessions take no start signal just ignores it
+    session = await withStartSignal(signal && !signal.aborted ? signal : undefined, () => rt.openTaskSession(`task ${t.id}`));
   } catch (e) {
+    // that start was cancelled: the task is interrupted, it did not fail
+    if (isSessionStartCancelled(e)) return finishTask({ id: t.id, title: t.title, status: 'interrupted' });
     return finishTask({ id: t.id, title: t.title, status: 'failed', reason: `could not start a session: ${e instanceof Error ? e.message : String(e)}` });
   }
   running.add(session);
@@ -1242,13 +1325,26 @@ function commandSignalOf(host: ReplHost): AbortSignal | undefined {
 /**
  * SpecRuntime over a ReplHost: questions through ask/confirm/choose, turns through runTurn (full
  * REPL rendering and y/n/t approvals), task sessions via host.createSession + replaceSession
- * (restored afterwards), one task at a time; the REPL command's Ctrl+C signal stops task runs
- * and cancels a spec turn whose phase session is still starting.
+ * (restored afterwards), one task at a time; the REPL command's Ctrl+C signal stops task runs,
+ * cancels a spec turn whose phase session is still starting, and is the start signal of every
+ * session this runtime creates (a press while one runs its agentSpawn hooks cancels that start).
  */
 export function createReplRuntime(host: ReplHost, deps: ReplRuntimeDeps = {}): SpecRuntime & { readonly driver: SpecSessionDriver } {
+  /**
+   * Create a session under the command's Ctrl+C as its start signal (K3, session/startSignal.ts):
+   * a press while it runs its agentSpawn hooks (which may never end with timeout 0) kills them and
+   * cancels the start. Not a press an earlier step of the command handled (the signal stays
+   * aborted; it would cancel every later start at once).
+   */
+  const createUnderPress = (o: Partial<KiroSessionOptions>): Promise<KiroSession> => {
+    const sig = commandSignalOf(host);
+    return withStartSignal(sig && !sig.aborted ? sig : undefined, () => host.createSession(o));
+  };
   const port: SessionPort = {
     active: () => host.session,
-    create: (o) => host.createSession(o),
+    // phase sessions and the continuation (a cancelled continuation start gives the chat its own
+    // session back, SpecSessionDriver.finish)
+    create: createUnderPress,
     activate: (s) => host.replaceSession(s),
     run: (_s, input) => host.runTurn(input),
   };
@@ -1278,6 +1374,7 @@ export function createReplRuntime(host: ReplHost, deps: ReplRuntimeDeps = {}): S
     },
     async openTaskSession(): Promise<TaskSessionHandle> {
       const prev = host.session;
+      // created under the run's start signal (executeTask), the command's Ctrl+C by default
       const child = await host.createSession({ origin: 'spec' });
       let closed = false;
       return {

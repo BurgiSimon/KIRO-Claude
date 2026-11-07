@@ -295,6 +295,13 @@ export class MockSession extends EventEmitter implements KiroSession {
     return this.claudeSessionId ? { from: this.claudeSessionId } : undefined;
   }
 
+  /** What {@link resumeId} answers once closed (KiroSession.resumeId); `'self'`: this session's id. */
+  resumeIdAfterClose: string | undefined | 'self' = 'self';
+  resumeId(): string | undefined {
+    if (!this.closed || this.resumeIdAfterClose === 'self') return this.id;
+    return this.resumeIdAfterClose;
+  }
+
   toolListing(): ToolListingEntry[] {
     return this.listing;
   }

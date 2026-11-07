@@ -34,6 +34,8 @@ import * as path from 'node:path';
 import type { AgentTrust, SessionRecord, SessionTurnRecord, WorkspaceContext } from '../types.js';
 import { mkdirp, writeJsonAtomic } from '../util/fsx.js';
 import { expandTilde, realpathSafe } from '../util/paths.js';
+// (kiroFiles.ts imports this module too: both only call each other's functions, never at load)
+import { recordNeverUsed } from './kiroFiles.js';
 
 export const SESSION_KIND = 'kiro-claude-session';
 /** Title length cap (00 §7: "first prompt ≤60 chars"). */
@@ -186,6 +188,8 @@ export function fromDiskJson(raw: unknown, id: string): SessionRecord | undefine
   if (byAgent) rec.trust.byAgent = byAgent;
   const pending = strArr(raw.pendingContext).filter((s) => s.trim() !== '');
   if (pending.length) rec.pendingContext = pending;
+  // context text like pendingContext (sent to Claude with the next line, R4 #1): a non-blank string
+  if (typeof raw.pendingHistory === 'string' && raw.pendingHistory.trim() !== '') rec.pendingHistory = raw.pendingHistory;
   // ids that become `--resume` / `--resume-session-at` argv values: UUIDs only (a copied record
   // file is not trusted to name a flag)
   const pf = raw.pendingFork;
@@ -381,6 +385,7 @@ export class SessionStore {
     const byAgent = copyByAgent(init.trust?.byAgent);
     if (byAgent) rec.trust.byAgent = byAgent;
     if (init.pendingContext?.length) rec.pendingContext = [...init.pendingContext];
+    if (init.pendingHistory !== undefined && init.pendingHistory.trim() !== '') rec.pendingHistory = init.pendingHistory;
     if (init.effort !== undefined) rec.effort = init.effort;
     this.persist(rec);
     return rec;
@@ -433,7 +438,10 @@ export class SessionStore {
 
   /**
    * All records (foreign files ignored), newest `updatedAt` first. With `cwd`, only records
-   * whose cwd has the same realpath.
+   * whose cwd has the same realpath. A chat that never had a message and was left behind by a
+   * process that died before closing it ({@link leftBehindUnused}) is no saved session: it is
+   * removed instead of listed, so `chat --resume`, `--list-sessions` and the `/chat resume`
+   * picker never offer it over the last real conversation (r4 #4).
    */
   list(opts: { cwd?: string } = {}): SessionRecord[] {
     let names: string[];
@@ -450,9 +458,39 @@ export class SessionStore {
       const rec = this.read(id);
       if (!rec) continue;
       if (want !== undefined && rec.cwd !== want && realpathSafe(rec.cwd) !== want) continue;
+      if (this.leftBehindUnused(rec)) {
+        this.removeLeftBehind(id);
+        continue;
+      }
       out.push(rec);
     }
     return out.sort(compareSessionsNewestFirst);
+  }
+
+  /**
+   * `rec` is a chat that never had a message (kiroFiles.ts {@link recordNeverUsed}: never an ACP
+   * session, a tangent, or a record with turns, messages or a journaled prompt) whose lock is
+   * still on disk but names a process of this host that is gone. Its process died before its
+   * close(), which drops such a record (a Ctrl+C / SIGHUP / SIGTERM the lifecycle forwarder
+   * turned into a death, SIGKILL, a crash). A record with no lock (closed, or one another
+   * process is creating) or a live lock (a chat starting or waiting at its first prompt) is kept.
+   */
+  private leftBehindUnused(rec: SessionRecord): boolean {
+    if (rec.turns.length > 0 || rec.messageCount > 0 || rec.forkKind !== 'main' || rec.origin === 'acp') return false;
+    const text = readText(this.lockPathFor(rec.sessionId));
+    if (text === undefined) return false;
+    const l = parseLock(text);
+    if (!l || l.pid === process.pid || heldByOther(l)) return false;
+    return recordNeverUsed(this.dir, rec);
+  }
+
+  /** Remove a {@link leftBehindUnused} record: index file, its stale lock and its journal. */
+  private removeLeftBehind(id: string): void {
+    try {
+      if (this.delete(id)) fs.rmSync(path.join(this.dir, `${id}.jsonl`), { force: true });
+    } catch {
+      /* best effort: it is skipped either way */
+    }
   }
 
   /**

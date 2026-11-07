@@ -406,6 +406,9 @@ export class MockSession extends EventEmitter implements KiroSession {
   forkSource(): { from: string; at?: string } | undefined {
     return this.claudeSessionId ? { from: this.claudeSessionId } : undefined;
   }
+  resumeId(): string | undefined {
+    return this.id;
+  }
   toolListing() {
     return [];
   }

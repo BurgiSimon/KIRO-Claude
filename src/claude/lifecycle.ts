@@ -25,6 +25,19 @@
  *     headless runner, crew runner) it owns the shutdown and (2) still applies at exit.
  *     Listeners are installed only while at least one child is tracked.
  *
+ * Survivors include members of a group whose leader died of the signal while they handle or
+ * ignore it (a hook program with a cleanup handler under runShell's shell, a trap, a nohup'd
+ * command, a stuck MCP server in claude's group; review r4 #11): the leader's exit untracks
+ * it, yet its members would otherwise run on with no timeout, re-parented to init. So the group
+ * of every entry the signal reached is SIGKILLed with the survivors, through
+ * {@link signalChild}, i.e. only while it is provably still ours (L1 below). Members share the
+ * leaders' grace but get none of their own: once every leader is gone kiro-claude dies at once,
+ * because until it dies the rest of it keeps running and reacts to the dead children (runShell
+ * resolves after its pipe grace, the session respawns the claude child and sends it the prompt,
+ * errors are reported). The process-'exit' sweep (2) also covers the signalled groups, should an
+ * exit cut the grace short. {@link shutdownTrackedChildren} SIGKILLs such members too, and, as
+ * main() has resolved by then, gives them the rest of its grace first.
+ *
  * {@link shutdownTrackedChildren} is the graceful variant for the executable entry (src/bin):
  * after main() resolved, a child still running was abandoned (e.g. a probe left behind by
  * whoami's 20 s cap) and must neither hold the process open nor survive it.
@@ -54,12 +67,16 @@
  */
 import { spawnSync, type ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
+import { performance } from 'node:perf_hooks';
 
 /** POSIX: spawn children in their own process group and signal the group. */
 export const PROCESS_GROUPS = process.platform !== 'win32';
 
 /** SIGTERM → SIGKILL grace for probes, forwarded signals and shutdown. */
 export const KILL_GRACE_MS = 1_000;
+
+/** How often members left in a reaped leader's group are checked during the grace. */
+const MEMBER_POLL_MS = 25;
 
 const FORWARDED_SIGNALS: readonly NodeJS.Signals[] = ['SIGTERM', 'SIGHUP', 'SIGINT'];
 
@@ -75,6 +92,8 @@ const tracked = new Set<Tracked>();
 const signalListeners = new Map<NodeJS.Signals, () => void>();
 let exitHookInstalled = false;
 let dying: NodeJS.Signals | undefined;
+/** The entries a fatal signal was forwarded to: SIGKILLed with the survivors (r4 #11). */
+let forwarded: readonly Tracked[] = [];
 
 /** Extra `spawn()` options for a tracked child (`detached` on POSIX). */
 export function groupSpawnOptions(): { detached?: boolean } {
@@ -161,19 +180,21 @@ export function trackedChildCount(): number {
 
 /**
  * SIGTERM every tracked child group (SIGKILL for probes), wait up to `graceMs` for them to
- * exit, SIGKILL the rest and wait (bounded) for their exit events. Resolves immediately when
- * nothing is tracked.
+ * exit (leaders, and members a leader that died of the SIGTERM left in its group), SIGKILL the
+ * rest and wait (bounded) for their exit events. Resolves immediately when nothing is tracked.
  */
 export async function shutdownTrackedChildren(graceMs: number = KILL_GRACE_MS): Promise<void> {
   if (tracked.size === 0) return;
   const entries = [...tracked];
   for (const t of entries) signalChild(t.child, t.graceful ? 'SIGTERM' : 'SIGKILL', t.group);
-  if (await settleWithin(entries, graceMs)) return;
-  for (const t of entries) if (tracked.has(t)) signalChild(t.child, 'SIGKILL', t.group);
+  if (await settleGroupsWithin(entries, graceMs)) return;
+  // Every entry, not only those still tracked: a reaped leader's group is signalled only while
+  // it is provably still ours (signalChild, L1), i.e. it holds members that survived.
+  for (const t of entries) signalChild(t.child, 'SIGKILL', t.group);
   await settleWithin(entries, graceMs);
 }
 
-function settleWithin(entries: Tracked[], ms: number): Promise<boolean> {
+function settleWithin(entries: readonly Tracked[], ms: number): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     const timer = setTimeout(() => resolve(false), ms);
     void Promise.all(entries.map((t) => t.exited)).then(() => {
@@ -183,11 +204,45 @@ function settleWithin(entries: Tracked[], ms: number): Promise<boolean> {
   });
 }
 
+/**
+ * {@link settleWithin}, then (within the same `ms`) until no group of `entries` holds members
+ * left behind by its leader ({@link membersLeft}). True when both happened in time.
+ */
+async function settleGroupsWithin(entries: readonly Tracked[], ms: number): Promise<boolean> {
+  const deadline = performance.now() + ms;
+  if (!(await settleWithin(entries, ms))) return false;
+  for (;;) {
+    if (!entries.some(membersLeft)) return true;
+    const left = deadline - performance.now();
+    if (left <= 0) return false;
+    await new Promise<void>((resolve) => setTimeout(resolve, Math.min(MEMBER_POLL_MS, left)));
+  }
+}
+
+/**
+ * Whether the process group of `t`, whose leader Node has reaped, still holds live members of
+ * ours. `kill(-pid, 0)` delivers nothing (harmless even for a reused number) and answers
+ * whether any process of that group exists that we may signal; one that does must still be
+ * provably ours ({@link ownsExitedGroup}, L1). False for a leader not reaped yet (its own exit
+ * is what {@link settleWithin} waits for) and without process groups.
+ */
+function membersLeft(t: Tracked): boolean {
+  const pid = t.child.pid;
+  if (pid === undefined || !(t.group && PROCESS_GROUPS) || !childReaped(t.child)) return false;
+  try {
+    process.kill(-pid, 0);
+  } catch {
+    return false; // ESRCH: empty; EPERM: nothing we could SIGKILL either
+  }
+  return exitedGroupIsOurs(t.child, pid);
+}
+
 function installHooks(): void {
   if (!exitHookInstalled) {
     exitHookInstalled = true;
     process.on('exit', () => {
-      for (const t of tracked) signalChild(t.child, 'SIGKILL', t.group);
+      // `forwarded` is empty unless a fatal signal's grace was cut short by an exit.
+      for (const t of new Set([...forwarded, ...tracked])) signalChild(t.child, 'SIGKILL', t.group);
     });
   }
   // Only POSIX children escape the terminal's signals; on Windows they share the console.
@@ -216,12 +271,17 @@ function onSignal(sig: NodeJS.Signals): void {
   if (process.listenerCount(sig) > 1) return;
   dying = sig;
   const entries = [...tracked];
+  forwarded = entries;
   for (const t of entries) signalChild(t.child, sig, t.group);
+  // Leaders only: members get no grace of their own (module doc; the rest of kiro-claude would
+  // react to the dead leaders meanwhile). die() SIGKILLs those left.
   void settleWithin(entries, KILL_GRACE_MS).then(() => die(sig));
 }
 
 function die(sig: NodeJS.Signals): void {
-  for (const t of tracked) signalChild(t.child, 'SIGKILL', t.group);
+  // Every group the signal reached, not only leaders still tracked: a reaped leader's group is
+  // SIGKILLed only while provably still ours (signalChild, L1), so survivors die, reuses do not.
+  for (const t of new Set([...forwarded, ...tracked])) signalChild(t.child, 'SIGKILL', t.group);
   removeSignalListeners();
   // Re-raise with the default disposition (Node's own handler resets the terminal, then exits).
   process.kill(process.pid, sig);

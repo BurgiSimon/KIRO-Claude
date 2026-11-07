@@ -174,7 +174,7 @@ Template variables, substituted in every string of `text`, `thinking`, tool spec
 `{{lastHookContext}}` (last `additionalContext` from a hook callback), `{{lastControlResponse}}`,
 `{{turnIndex}}` (user messages processed by this process, local commands included),
 `{{historyCount}}` / `{{historyUserTexts}}` (user messages in the session history — includes resumed
-history when persistence is on; joined with ` | `), `{{env:NAME}}`.
+history when persistence is on, not the entries of local commands; joined with ` | `), `{{env:NAME}}`.
 
 ### Persistence (opt-in): `FAKE_CLAUDE_PERSIST=1` + `CLAUDE_CONFIG_DIR=<temp dir>`
 
@@ -202,7 +202,16 @@ including that line, and, like the real claude 2.1.319, a uuid the resumed trans
 (with or without `--fork-session`) fails: stderr `No message found with message.uuid of: <uuid>`, an
 `error_during_execution` result on stdout (`errors: [that text]`), exit 1, nothing written (a
 missing transcript still reports `No conversation found` first); `--continue` picks the newest
-transcript of the cwd (with `--fork-session` too: the fake does not fork a continued session); `/clear` starts a new transcript. Without persistence any `--resume` id is
+transcript of the cwd (with `--fork-session` too: the fake does not fork a continued session); `/clear` starts a new transcript.
+A local command line (`/effort`, `/compact`, `/model`, `/cost`, `/usage`, `/context`) is part of the
+transcript, as in the real claude 2.1.319 (VERIFIED for `/effort`, `/compact`, `/model`, `/cost` and
+`/context` as the only line of a new session, of a resumed one and of a fork that had no line yet):
+it appends a meta `<local-command-caveat>` user entry, a `<command-name>/x</command-name>…` user
+entry carrying the uuid of the line the host sent, and a `system`/`local_command`
+`<local-command-stdout>` entry (shapes abridged; the fake marks them `localCommand: true` so
+`{{historyUserTexts}}` skips them), so a new session or a pending fork then HAS a transcript:
+`--resume <id>` and a fork of it find a conversation. `/clear` and `/help` write nothing (the real
+2.1.319 writes a file for `/clear`'s new session; not modeled). Without persistence any `--resume` id is
 accepted with empty history (and `--resume-session-at` cuts nothing). Never point
 `CLAUDE_CONFIG_DIR` at a real config dir.
 
