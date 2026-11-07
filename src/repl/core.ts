@@ -8,7 +8,12 @@
  * close kept (`KiroSession.resumeId`; none for a chat that never had a message) (exit 0;
  * 1 when the session could not start or Claude reported an auth failure). SIGHUP / SIGTERM,
  * and Ctrl+C while the session starts, close it before kiro-claude dies of the signal
- * ({@link ExitSignals}).
+ * ({@link ExitSignals}): every session the REPL and its spec runtime opened that is still open,
+ * the user's chat first (during a `/spec` flow the current session is a phase or task session;
+ * the chat is the one the command started from), then its record is made the newest, so
+ * `chat --resume` reaches the user's conversation ({@link Repl.closeOnSignal}, r5 P3). From the
+ * signal on no session is created and no turn is sent; a running command's signal is aborted and
+ * what it still prints (ReplHost.print) is dropped.
  *
  * Input handling order (01 §4.3): empty ⇒ re-prompt; `/…` ⇒ built-in command, else a file
  * prompt (`/<prompt> args`, prompts take precedence, 00 §2.2), else a skill (inlined with
@@ -40,15 +45,19 @@
  * the session is closed (stdin EOF, SIGTERM after 2 s, then SIGKILL; 00 §2.3 / 04 §8.4), the REPL
  * returns to its prompt and the next input re-creates the session with `--resume` (a conversation
  * without a finished turn, which closing drops, starts afresh; a tangent continues as its own
- * conversation; a Ctrl+C while it restarts cancels that input). A command is stopped that way only
+ * conversation; a Ctrl+C while it restarts cancels that input, and one while the restarted session
+ * runs its agentSpawn hooks cancels the restart itself: the hooks are killed, the stopped session
+ * stays, and the next input restarts it again, r5 P2). A command is stopped that way only
  * while the session still has work of its own in flight ({@link KiroSession.busy}): a command
  * waiting on another session (a `/spec run` task session or `/chat new` starting) or on Claude
  * Code (re)starting is neither stopped nor abandoned; one waiting on a process of kiro-claude's
  * own (`/hooks run`, `/chat *-via-script`) or on Claude Code's answer to a control request of the
  * idle session (`/usage`, `/mcp`, `/tools`, `/model`, which `busy` does not count; K9,
  * commands/cancellable.ts) ends through the command signal; `$EDITOR` and
- * `!cmd` get the terminal and its SIGINT themselves. At the idle prompt the first Ctrl+C / Ctrl+D
- * prints Q's hint, the second exits.
+ * `!cmd` get the terminal and its SIGINT themselves. A command signal stays aborted after its first
+ * press; work a command starts after that (an interrupted `/spec run` task's PostTaskExec hooks,
+ * the `/spec` continuation's start) takes {@link ReplContext.nextPressSignal}, which the next press
+ * aborts (r5 P1). At the idle prompt the first Ctrl+C / Ctrl+D prints Q's hint, the second exits.
  *
  * Slash commands are shlex-split; unbalanced quotes fall back to a whitespace split so free-text
  * commands (`/plan I don't …`) work. `/<steering>` sends `#steering:<name> …` with
@@ -65,7 +74,7 @@ import { loadPrompts, findPrompt, expandPrompt, parsePromptInvocation } from '..
 import { discoverSkills, expandSkillInvocation, pluginSkillName } from '../config/skills.js';
 import { loadSteering } from '../config/steering.js';
 import { findModelEntry } from '../models/models.js';
-import { withStartSignal } from '../session/startSignal.js';
+import { currentStartSignal, isSessionStartCancelled, withStartSignal } from '../session/startSignal.js';
 import { SessionStore, previewText, sessionsDir } from '../session/store.js';
 import type {
   ApprovalRequest,
@@ -89,6 +98,7 @@ import { classifyApprovalInput } from './approval.js';
 import { CANCELLED, untilCancelled } from './commands/cancellable.js';
 import { builtinCommands } from './commands/index.js';
 import { PLAN_EXECUTE_PROMPT, PLAN_EXECUTE_QUESTION, looksLikePlan } from './commands/plan.js';
+import { ExitSignals, anySignal } from './exitSignals.js';
 import { openEditor, runShellCommand } from './external.js';
 import { LineReader, appendHistoryFile, historyFilePath, loadHistoryFile, sanitizeUnicodeTags } from './input.js';
 import { BUSY_MESSAGE, TIPS, approvalQuestion, colorPrompt, exitHint, formatGreeting, resumeHint } from './prompt.js';
@@ -200,6 +210,24 @@ export class Repl implements ReplContext {
   private stoppedSession: { session: KiroSession; closing: Promise<void>; tangentParent?: string; tangentId?: string } | undefined;
   /** The running slash command's {@link ReplContext.commandSignal}. */
   private cmdSignal: AbortSignal | undefined;
+  /** The controllers of every running slash command's signal (nested ones too): a fatal signal aborts them. */
+  private readonly cmdAborts = new Set<AbortController>();
+  /** Running slash commands (nested ones count): {@link nextPressSignal} waiters end with theirs. */
+  private cmdDepth = 0;
+  /**
+   * The user's chat while a slash command runs: the session current when the outermost command
+   * started, or the one `/chat new|resume|load` swapped in. A command may make sessions of its own
+   * current meanwhile (`/spec` phase and task sessions, origin `spec`); see {@link userChat}.
+   */
+  private chatAtCommand: KiroSession | undefined;
+  /** Outstanding {@link nextPressSignal}s with the command depth they were asked for at. */
+  private readonly pressWaiters = new Map<AbortController, { depth: number; off: () => void }>();
+  /** SIGHUP / SIGTERM (and Ctrl+C while the chat starts) handling; undefined in tests and on Windows. */
+  private exits: ExitSignals | undefined;
+  /** Every session this REPL opened (weakly: a closed one nothing else holds may go), for {@link closeOnSignal}. */
+  private readonly opened = new Set<WeakRef<KiroSession>>();
+  /** Session creations still running. */
+  private readonly creating = new Set<Promise<unknown>>();
 
   constructor(
     private readonly opts: RunReplOptions,
@@ -259,6 +287,35 @@ export class Repl implements ReplContext {
     return this.cmdSignal;
   }
 
+  /**
+   * ReplContext.nextPressSignal: aborted by the next Ctrl+C after this call (one the reader reports
+   * as `'interrupt'`, i.e. while no prompt reads a line, like the command signal), and by a fatal
+   * signal; once aborted it stays so. It only signals: the press is handled as before (F0: an idle
+   * session is never stopped). One asked for inside a slash command is dropped (never aborted)
+   * when that command ends; outside a command it waits for the next press.
+   */
+  nextPressSignal(): AbortSignal {
+    const ac = new AbortController();
+    if (this.exits?.received || !this.reader) {
+      if (this.exits?.received) ac.abort();
+      return ac.signal;
+    }
+    const onPress = (): void => {
+      this.dropPressWaiter(ac);
+      ac.abort();
+    };
+    this.reader.on('interrupt', onPress);
+    this.pressWaiters.set(ac, { depth: this.cmdDepth, off: () => this.reader.off('interrupt', onPress) });
+    return ac.signal;
+  }
+
+  private dropPressWaiter(ac: AbortController): void {
+    const w = this.pressWaiters.get(ac);
+    if (!w) return;
+    this.pressWaiters.delete(ac);
+    w.off();
+  }
+
   private wrapWidth(): number | undefined {
     const mode = this.opts.wrap ?? (this.settings.getBoolean('chat.disableWrap', false) ? 'never' : 'auto');
     if (mode === 'never') return undefined;
@@ -280,6 +337,10 @@ export class Repl implements ReplContext {
   }
 
   print(text: string): void {
+    // SIGHUP / SIGTERM came in: what a command (a `/spec` flow winding down as its sessions are
+    // closed) still reports is no longer for the user, and may be wrong (a continuation start the
+    // signal cancelled is no Ctrl+C); the headless front end prints nothing more either (r5 P3/P4)
+    if (this.exits?.received) return;
     this.write(text.endsWith('\n') ? text : `${text}\n`);
   }
 
@@ -341,20 +402,52 @@ export class Repl implements ReplContext {
   }
 
   createSession(opts: Partial<KiroSessionOptions>): Promise<KiroSession> {
-    return this.deps.createSession({
-      ...this.baseSessionOptions(),
-      ...opts,
-      ws: opts.ws ?? this.ws,
-      origin: opts.origin ?? 'repl',
-      interactive: opts.interactive ?? true,
-      ui: opts.ui ?? this.ui,
+    return this.opening(() =>
+      this.deps.createSession({
+        ...this.baseSessionOptions(),
+        ...opts,
+        ws: opts.ws ?? this.ws,
+        origin: opts.origin ?? 'repl',
+        interactive: opts.interactive ?? true,
+        ui: opts.ui ?? this.ui,
+      }),
+    );
+  }
+
+  /**
+   * Every session creation of this REPL (the chat, `/chat new|resume|load`, the spec runtime's
+   * phase, continuation and task sessions, the forced-stop restart): it runs under the caller's
+   * start signal (startSignal.ts; e.g. a command's Ctrl+C) and a fatal signal's ({@link ExitSignals}:
+   * agentSpawn hooks still running are killed, nothing of the session stays), and what it opens is
+   * remembered for {@link closeOnSignal}. Refused once a fatal signal came in.
+   */
+  private opening<T extends KiroSession>(create: () => Promise<T>): Promise<T> {
+    if (this.exits?.received) return Promise.reject(new Error('kiro-claude is exiting'));
+    const start = anySignal([currentStartSignal(), this.exits?.startSignal]);
+    const p = withStartSignal(start.signal, create).then((s) => {
+      this.remember(s);
+      return s;
     });
+    this.creating.add(p);
+    const done = (): void => {
+      this.creating.delete(p);
+      start.dispose();
+    };
+    p.then(done, done);
+    return p;
+  }
+
+  private remember(s: KiroSession): void {
+    for (const r of this.opened) if (r.deref() === undefined) this.opened.delete(r);
+    this.opened.add(new WeakRef(s));
   }
 
   async swapSession(next: KiroSession): Promise<void> {
     if (this.turnActive && next !== this.current) throw new Error(BUSY_MESSAGE);
     const old = this.current;
     this.replaceSession(next);
+    // `/chat new|resume|load` inside a command: this is the user's chat now
+    if (this.chatAtCommand) this.chatAtCommand = next;
     this.lastText = undefined;
     if (old && old !== next) {
       try {
@@ -368,7 +461,8 @@ export class Repl implements ReplContext {
   importSession(file: string): Promise<KiroSession> {
     if (!this.deps.importSessionExport) return Promise.reject(new Error('importing sessions is not available'));
     const base = this.baseSessionOptions();
-    return this.deps.importSessionExport(file, { ...base, ws: this.ws, origin: 'repl', interactive: true, ui: this.ui });
+    const importExport = this.deps.importSessionExport;
+    return this.opening(() => importExport(file, { ...base, ws: this.ws, origin: 'repl', interactive: true, ui: this.ui }));
   }
 
   commands(): readonly SlashCommand[] {
@@ -607,7 +701,9 @@ export class Repl implements ReplContext {
     if (text === '') return;
     // Claude Code was stopped (second Ctrl+C): bring the session back first (not just to quit)
     if (this.stoppedSession && !this.isQuitCommand(text)) {
-      const restarted = await this.restartStopped();
+      // a Ctrl+C while the restarted session runs its agentSpawn hooks cancels its start (r5 P2)
+      const press = new AbortController();
+      const restarted = await withStartSignal(press.signal, () => this.restartStopped(press));
       if (restarted === 'failed') return 'quit';
       if (restarted === 'cancelled') return;
     }
@@ -656,6 +752,9 @@ export class Repl implements ReplContext {
       const cmdAbort = new AbortController();
       const outerSignal = this.cmdSignal;
       this.cmdSignal = cmdAbort.signal;
+      this.cmdAborts.add(cmdAbort);
+      if (this.cmdDepth++ === 0) this.chatAtCommand = this.current;
+      const depth = this.cmdDepth;
       const onPress = (): void => cmdAbort.abort();
       const scope = this.interruptScope(undefined, () => !this.turnActive, { onlyWhenBusy: true });
       this.reader.on('interrupt', onPress);
@@ -676,6 +775,10 @@ export class Repl implements ReplContext {
         this.reader.off('interrupt', scope.listener);
         this.reader.off('interrupt', onPress);
         this.cmdSignal = outerSignal;
+        this.cmdAborts.delete(cmdAbort);
+        // next-press waiters asked for while this command ran end with it (no listener stays)
+        for (const [ac, w] of [...this.pressWaiters]) if (w.depth >= depth) this.dropPressWaiter(ac);
+        if (--this.cmdDepth === 0) this.chatAtCommand = undefined;
       }
     }
     // /<prompt> args (V3), prompts first (00 §2.2)
@@ -813,14 +916,19 @@ export class Repl implements ReplContext {
    * `'failed'` when that failed (the REPL then exits 1). A Ctrl+C while this runs (spawning
    * Claude Code takes a while) cancels the input it runs for (`'cancelled'`; the session is
    * still re-created) instead of waiting as type-ahead, where it would count as an exit press.
+   * It also aborts `press`, the start signal the caller runs this under (startSignal.ts): while
+   * the restarted session still runs its agentSpawn hooks (which may never end with timeout 0)
+   * they are killed and the restart is cancelled; the stopped session stays the REPL's (the next
+   * input restarts it again) and a notice says so (r5 P2).
    */
-  private async restartStopped(): Promise<'ok' | 'cancelled' | 'failed'> {
+  private async restartStopped(press?: AbortController): Promise<'ok' | 'cancelled' | 'failed'> {
     const st = this.stoppedSession;
     if (!st) return 'ok';
     this.stoppedSession = undefined;
     let pressed = false;
     const onPress = (): void => {
       pressed = true;
+      press?.abort();
     };
     this.reader.on('interrupt', onPress);
     try {
@@ -835,12 +943,15 @@ export class Repl implements ReplContext {
           resumable = false;
         }
         // the trust as it was, never the launch `--trust-tools` again (applied over a record it
-        // would re-trust a tool the user untrusted): a resumed record brings its own per-tool
-        // trust; a new conversation gets the stopped one's
+        // would re-trust a tool the user untrusted): all of it, session rules, revocations and
+        // other agents' trust included, as `initialTrust` (also for a new conversation, whose
+        // record closing dropped); trustAllTools / trustTools / untrustTools say the same to a
+        // session that does not take initialTrust (test doubles)
         const revoked = resumable ? [] : (old.trust.revokedTools ?? []);
         let fresh: KiroSession | undefined;
         try {
           fresh = await this.createSession({
+            initialTrust: { trust: old.trust, agent: old.agent.name },
             trustAllTools: old.trust.trustAll,
             trustTools: resumable ? [] : [...old.trust.allowedTools],
             ...(resumable ? { resume: { sessionId: old.id } } : {}),
@@ -851,11 +962,19 @@ export class Repl implements ReplContext {
           await fresh.start();
         } catch (e) {
           if (fresh) await fresh.close().catch(() => undefined);
+          if (isSessionStartCancelled(e)) {
+            // Ctrl+C during its agentSpawn hooks: nothing of the new session stays; the stopped one
+            // is still the REPL's, so the next input tries again (or /quit leaves)
+            this.stoppedSession = st;
+            if (!this.exits?.received) this.write(`\n${c.yellow('Restart cancelled (Ctrl+C). Claude Code restarts with your next input.')}\n\n`);
+            return 'cancelled';
+          }
           this.write(`\n${c.red(`Failed to restart Claude Code: ${errText(e)}`)}\n\n`);
           this.requestExit(1);
           return 'failed';
         }
         this.replaceSession(fresh);
+        if (this.chatAtCommand === st.session) this.chatAtCommand = fresh;
         // only when the record resumed is still the tangent the stop hit: a /tangent whose fork
         // was still starting fell back to its main record meanwhile (no tangent to announce)
         if (st.tangentParent && resumable && old.id === st.tangentId) {
@@ -878,6 +997,9 @@ export class Repl implements ReplContext {
   ): Promise<{ result: TurnResult; seen: Set<SessionEvent['type']> }> {
     const busy = this.refuseNestedTurn();
     if (busy) return { result: busy, seen: new Set() };
+    // SIGHUP / SIGTERM came in: the sessions are being closed; nothing more is sent (e.g. a spec
+    // turn in a phase session whose start completed after the signal)
+    if (this.exits?.received) return { result: errorResult('kiro-claude is exiting', true), seen: new Set() };
     // a turn run by a command typed at an approval prompt (whose own turn ended under it)
     const inApproval = this.approving;
     const ac = new AbortController();
@@ -999,6 +1121,88 @@ export class Repl implements ReplContext {
 
   // ───────────────────────────── lifecycle ─────────────────────────────
 
+  /**
+   * The user's chat: the current session, unless a running command made one of its own sessions
+   * current (`/spec` phase and task sessions, origin `spec`): then the session that command
+   * started from ({@link chatAtCommand}). A continuation the flow handed over (origin `repl`) is the
+   * chat as soon as it is current.
+   */
+  private userChat(): KiroSession | undefined {
+    const cur = this.current as KiroSession | undefined;
+    const chat = this.chatAtCommand;
+    if (chat && cur && cur !== chat && cur.record?.origin === 'spec') return chat;
+    return cur;
+  }
+
+  /** Sessions this REPL opened that may still be open (closing a closed one is a no-op). */
+  private openedSessions(): KiroSession[] {
+    const out = new Set<KiroSession>();
+    for (const r of this.opened) {
+      const s = r.deref();
+      if (s) out.add(s);
+      else this.opened.delete(r);
+    }
+    const cur = this.current as KiroSession | undefined;
+    if (cur) out.add(cur);
+    if (this.stoppedSession) out.add(this.stoppedSession.session);
+    return [...out];
+  }
+
+  /**
+   * SIGHUP / SIGTERM ({@link ExitSignals}, bounded by its grace; r5 P3): stop what runs (the running
+   * commands' signals and next-press waiters are aborted: `/spec run` stops, hook commands are
+   * killed; no session is created and no turn sent from now on), then close every session this REPL
+   * opened that is still open: the user's chat first ({@link userChat}), once it is closed the
+   * others together (`/spec` phase and task sessions, a forced-stop session still closing; sessions
+   * still being created first settle: one whose agentSpawn hooks ran is cancelled by the signal),
+   * each with its SessionEnd hooks, record and lock. Then the user's record is made the newest of them
+   * ({@link makeNewest}): a phase record closed after it would otherwise be what `chat --resume`
+   * opens.
+   */
+  private async closeOnSignal(): Promise<void> {
+    for (const ac of [...this.cmdAborts]) ac.abort();
+    for (const ac of [...this.pressWaiters.keys()]) {
+      this.dropPressWaiter(ac);
+      ac.abort();
+    }
+    const user = this.userChat();
+    const closeOf = (s: KiroSession): Promise<void> => s.close().catch(() => undefined);
+    // the user's chat first, on its own: its SessionEnd hooks, record and lock come before the rest
+    // (an idle chat closes quickly; the grace is shared)
+    if (user) await closeOf(user);
+    await Promise.allSettled([...this.creating]);
+    const others = this.openedSessions().filter((s) => s !== user);
+    await Promise.all(others.map(closeOf));
+    if (user && others.length > 0) this.makeNewest(user, others);
+  }
+
+  /**
+   * After {@link closeOnSignal}: when a record of `others` (closed after the user's chat, so saved
+   * later) is newer than the chat's, save the chat's record again as the newest, so `chat --resume`
+   * (the newest record) reaches the user's conversation. Only a record nobody holds (its lock is
+   * gone: the chat's close finished) is rewritten, unchanged but for `updatedAt`.
+   */
+  private makeNewest(user: KiroSession, others: readonly KiroSession[]): void {
+    try {
+      const store = new SessionStore(sessionsDir(this.ws));
+      // a tangent's main conversation (chat --resume never opens a tangent)
+      const id = user.tangent?.parentId ?? (user.resumeId ? user.resumeId() : user.id);
+      if (!id) return;
+      const rec = store.read(id);
+      if (!rec || store.lockInfo(id)) return;
+      let newest = 0;
+      for (const o of others) {
+        const r = o.id === id ? undefined : store.read(o.id);
+        if (r) newest = Math.max(newest, Date.parse(r.updatedAt) || 0);
+      }
+      if ((Date.parse(rec.updatedAt) || 0) > newest) return;
+      rec.updatedAt = new Date(Math.max(Date.now(), newest + 1)).toISOString();
+      store.write(rec);
+    } catch {
+      // best effort: the records are all saved; only which one `chat --resume` opens is at stake
+    }
+  }
+
   private async modelDisplayName(): Promise<string> {
     const id = this.current.model || 'auto';
     const list = await withTimeout(this.current.listModels(), USAGE_TIMEOUT_MS);
@@ -1059,10 +1263,12 @@ export class Repl implements ReplContext {
     // SIGHUP / SIGTERM, and Ctrl+C until the prompt is up: close the session, then die of the
     // signal (ExitSignals, r4 #4)
     const exits = this.deps.installSignalHandlers && process.platform !== 'win32'
-      ? new ExitSignals(() => this.current as KiroSession | undefined, [this.ctx.stdin, this.ctx.stdout, this.ctx.stderr])
+      ? new ExitSignals(() => this.closeOnSignal(), [this.ctx.stdin, this.ctx.stdout, this.ctx.stderr])
       : undefined;
+    this.exits = exits;
     try {
-      this.current = await withStartSignal(exits?.startSignal, () =>
+      // under the signals' start signal (opening): a signal while its agentSpawn hooks run cancels it
+      this.current = await this.opening(() =>
         this.deps.createSession({
           ...this.opts.sessionOptions,
           ws: this.ws,
@@ -1127,112 +1333,8 @@ export class Repl implements ReplContext {
   }
 }
 
-/**
- * How long a SIGHUP / SIGTERM (or a Ctrl+C while the chat starts) waits for the session to close
- * before the signal is re-raised anyway ({@link ExitSignals}).
- */
-export const SIGNAL_CLOSE_GRACE_MS = 2000;
-/** After the re-raise: exit with the signal's status if the process is somehow still alive. */
-const SIGNAL_EXIT_FALLBACK_MS = 5000;
-
-/**
- * SIGHUP / SIGTERM during the whole chat (a closed terminal tab, `kill`), and SIGINT while its
- * session starts (Claude Code initializing, agentSpawn hooks; the line reader takes Ctrl+C over
- * once the prompt is up). Without this, claude/lifecycle.ts's forwarder kills kiro-claude before
- * the session's close(), which drops a chat that never had a message (Q saves a conversation only
- * after a reply, r4 #4) and runs SessionEnd hooks. Here the current session is closed (a start
- * still running is cancelled through its start signal, startSignal.ts: agentSpawn hooks are
- * killed and nothing of it stays), then the signal is re-raised with these listeners removed, so
- * kiro-claude still dies of it (the forwarder ends any child left). The wait is bounded by
- * {@link SIGNAL_CLOSE_GRACE_MS}; a second signal re-raises at once. A record left anyway (the
- * grace ran out, SIGKILL, a crash) is skipped by the session index (store.ts `list`).
- */
-class ExitSignals {
-  /** The first signal received. */
-  received: NodeJS.Signals | undefined;
-  private readonly startAbort = new AbortController();
-  private readonly listeners = new Map<NodeJS.Signals, () => void>();
-  private started = false;
-  private reraised = false;
-  private grace: NodeJS.Timeout | undefined;
-  private dying: Promise<never> | undefined;
-
-  constructor(
-    /** The session to close (undefined while the first one is created). */
-    private readonly current: () => KiroSession | undefined,
-    /** stdin / stdout / stderr: a hung-up terminal fails their reads and writes (EIO). */
-    private readonly streams: readonly unknown[],
-  ) {
-    for (const sig of ['SIGHUP', 'SIGTERM', 'SIGINT'] as const) {
-      const l = (): void => this.onSignal(sig);
-      this.listeners.set(sig, l);
-      process.on(sig, l);
-    }
-  }
-
-  /** Cancels the first session's start when a signal comes in. */
-  get startSignal(): AbortSignal {
-    return this.startAbort.signal;
-  }
-
-  /** The chat is up: Ctrl+C is the line reader's from now on; a signal closes the current session. */
-  ready(): void {
-    this.started = true;
-    this.off('SIGINT');
-  }
-
-  /** Remove the listeners (the chat ended). */
-  dispose(): void {
-    for (const sig of [...this.listeners.keys()]) this.off(sig);
-    if (this.grace) clearTimeout(this.grace);
-    this.grace = undefined;
-  }
-
-  /**
-   * Close the current session (bounded), then re-raise the signal received. Never resolves: the
-   * signal ends the process.
-   */
-  die(): Promise<never> {
-    this.dying ??= (async () => {
-      const s = this.current();
-      if (s) await withTimeout(s.close().catch(() => undefined), SIGNAL_CLOSE_GRACE_MS);
-      this.reraise();
-      return new Promise<never>(() => undefined);
-    })();
-    return this.dying;
-  }
-
-  private onSignal(sig: NodeJS.Signals): void {
-    if (this.received) {
-      this.reraise(); // a second signal: stop waiting
-      return;
-    }
-    this.received = sig;
-    const noop = (): void => undefined;
-    for (const st of this.streams) (st as { on?: (e: string, f: () => void) => void } | undefined)?.on?.('error', noop);
-    this.startAbort.abort();
-    this.grace = setTimeout(() => this.reraise(), SIGNAL_CLOSE_GRACE_MS);
-    // while the first session is created, run() closes it once its creation settles
-    if (this.started) void this.die();
-  }
-
-  private off(sig: NodeJS.Signals): void {
-    const l = this.listeners.get(sig);
-    if (l) process.off(sig, l);
-    this.listeners.delete(sig);
-  }
-
-  private reraise(): void {
-    const sig = this.received;
-    if (this.reraised || !sig) return;
-    this.reraised = true;
-    this.dispose();
-    // claude/lifecycle.ts's forwarder (while children are tracked) or the default disposition ends
-    // the process; should anything else swallow the signal, exit with its status
-    setTimeout(() => process.exit(128 + (os.constants.signals[sig] ?? 15)), SIGNAL_EXIT_FALLBACK_MS);
-    process.kill(process.pid, sig);
-  }
-}
+/** How long a fatal signal waits for the sessions to close (repl/exitSignals.ts). */
+export { SIGNAL_CLOSE_GRACE_MS } from './exitSignals.js';
 
 /** Run the REPL with injected dependencies (repl/repl.ts wires the real ones). */
 export async function runReplWith(opts: RunReplOptions, deps: ReplDeps): Promise<number> {

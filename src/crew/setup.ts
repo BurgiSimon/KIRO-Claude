@@ -505,7 +505,7 @@ function rmdirIfEmpty(dir: string): void {
 /** Removes the files `crew` writes under `$CS/run` (never anything else there). */
 function removeOwnRunFiles(c: CrewCtx): void {
   const p = c.paths;
-  for (const f of [p.gatewayOut, p.gatewayErr, p.readyFile, p.tokenFile, p.setupLog]) fs.rmSync(f, { force: true });
+  for (const f of [p.gatewayOut, p.gatewayErr, p.readyFile, p.tokenFile, p.crashedFile, p.setupLog]) fs.rmSync(f, { force: true });
   rmdirIfEmpty(p.runDir);
 }
 

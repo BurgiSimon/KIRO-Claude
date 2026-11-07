@@ -46,6 +46,7 @@ import { SPEC_DOC_FILES, type SpecDocKind, type TaskSelection, type WorkflowType
 import { formatSpecList, formatSpecStatus, isValidSpecName, listSpecs, loadSpec, normalizeSpecName, specSummaryJson } from './store.js';
 import {
   SpecSessionDriver,
+  discardSpecRecord,
   analyzeRequirements,
   approveSpec,
   createNewSpec,
@@ -371,6 +372,10 @@ function cliRuntime(ctx: CliContext, o: CliRuntimeOptions, deps: SpecCliDeps, io
       current = s;
     },
     run: (s, input, opts) => driveTurn(s, input, new Renderer(ctx, undefined, opts?.quiet === true)),
+    // an earlier phase record the last one of the flow holds in full (T5)
+    discard: (s) => {
+      discardSpecRecord(ctx.ws, s.id);
+    },
   };
   const driver = new SpecSessionDriver(port);
   const max = Math.max(1, Math.min(4, Math.floor(ctx.settings.getNumber('kiroClaude.spec.maxParallelTasks', 1)) || 1));

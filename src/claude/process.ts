@@ -56,12 +56,22 @@
  * while our line is still queued, is taken as ours.
  *
  * Shutdown ({@link ClaudeProcess.close}): end stdin → wait `graceMs` (default 2000) → SIGTERM →
- * 2 s → SIGKILL. Idempotent.
+ * 2 s → SIGKILL, then (r5 H1) up to lifecycle's MEMBER_GRACE_MS for what is left of its process
+ * group. Idempotent.
  *
  * Process group (claude/lifecycle.ts): on POSIX the child is spawned `detached` (its own process
  * group; not unref'd) so a terminal Ctrl+C reaches only kiro-claude, which interrupts the turn
  * itself; signals go to the whole group. The child cannot outlive kiro-claude: it exits on stdin
  * EOF, and lifecycle.ts kills its group on process exit and on SIGTERM/SIGHUP nobody handles.
+ * Nor can its group's members (MCP servers, tool commands) outlive the child: once it exited
+ * (close(), a crash) they get MEMBER_GRACE_MS to leave and are SIGKILLed (`sweepMembers`; only
+ * while the group is provably still ours, lifecycle L1).
+ *
+ * While kiro-claude dies of a fatal signal nothing else handles (lifecycle `dyingSignal()`, r5 H2)
+ * no child is started ({@link ClaudeProcess.start} throws), nothing is written to one (sends,
+ * requests and answers fail or are dropped) and CLI control requests are not handed to the
+ * handlers: the child is being killed, and nothing may react to it meanwhile (a respawn, the
+ * prompt sent again, a tool allowed).
  *
  * Library code never writes to stdout; diagnostics go to the optional `logger`.
  */
@@ -72,7 +82,7 @@ import * as fs from 'node:fs';
 import { StringDecoder } from 'node:string_decoder';
 
 import { resolveSpawn, type ClaudeBinary } from './binary.js';
-import { PROCESS_GROUPS, groupSpawnOptions, signalChild, trackChild } from './lifecycle.js';
+import { PROCESS_GROUPS, dyingSignal, groupSpawnOptions, membersSettled, signalChild, trackChild } from './lifecycle.js';
 import type {
   CancelAsyncMessageResponse,
   CanUseToolRequest,
@@ -426,7 +436,8 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
       windowsVerbatimArguments: spec.windowsVerbatimArguments,
       ...groupSpawnOptions(),
     });
-    trackChild(this.child, PROCESS_GROUPS);
+    // Its group's members (MCP servers, tool commands) must not outlive it either (r5 H1).
+    trackChild(this.child, PROCESS_GROUPS, { sweepMembers: true });
 
     this.child.on('error', (err) => {
       if (this.child.pid === undefined && !this.spawnError) {
@@ -497,6 +508,10 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
       /* missing */
     }
     if (!cwdOk) throw new ClaudeProcessError(`Working directory does not exist: ${opts.cwd}`);
+    // r5 H2: no new child while kiro-claude dies of a fatal signal (a session respawning the claude
+    // child that signal just killed, and sending it the prompt)
+    const dying = dyingSignal();
+    if (dying) throw new ClaudeProcessError(`kiro-claude is shutting down (${dying}); Claude Code was not started`);
     let proc: ClaudeProcess;
     try {
       proc = new ClaudeProcess(opts);
@@ -574,9 +589,19 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
     });
   }
 
-  /** Writes one NDJSON line. Throws if stdin is closed or `obj` cannot be serialised. */
+  /**
+   * Writes one NDJSON line. Throws if stdin is closed, kiro-claude is dying of a fatal signal
+   * (r5 H2: nothing more goes to a child that signal is ending; a prompt, an answer that would
+   * let a tool run) or `obj` cannot be serialised.
+   */
   private writeLine(obj: unknown): void {
     if (this.stdinClosed || this._exitInfo) throw this.notRunningError();
+    const dying = dyingSignal();
+    if (dying) {
+      throw new ClaudeProcessError(`kiro-claude is shutting down (${dying}); nothing more is sent to Claude Code`, {
+        stderr: this._stderrTail,
+      });
+    }
     const line = JSON.stringify(obj);
     if (typeof line !== 'string') throw new TypeError('control-protocol message is not JSON-serialisable');
     this.child.stdin!.write(line + '\n');
@@ -772,13 +797,20 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
 
   /**
    * Graceful shutdown: end stdin, wait `graceMs` (default 2000), SIGTERM, wait 2 s, SIGKILL.
-   * Idempotent; resolves with the exit status.
+   * Once the child exited, members left in its process group (an MCP server or tool command that
+   * ignores stdin EOF) get up to lifecycle's MEMBER_GRACE_MS to leave and are then SIGKILLed;
+   * close() resolves after that (r5 H1; also when the child had exited before). Idempotent;
+   * resolves with the exit status.
    */
   close(opts: { graceMs?: number } = {}): Promise<ExitInfo> {
     if (this.closePromise) return this.closePromise;
     const graceMs = Math.max(0, opts.graceMs ?? 2000);
     this.closePromise = (async (): Promise<ExitInfo> => {
-      if (this._exitInfo) return this._exitInfo;
+      const settled = async (): Promise<ExitInfo> => {
+        await membersSettled(this.child);
+        return this._exitInfo!;
+      };
+      if (this._exitInfo) return settled();
       if (!this.stdinClosed) {
         this.stdinClosed = true;
         try {
@@ -787,11 +819,11 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
           /* ignore */
         }
       }
-      if (await this.waitExited(graceMs)) return this._exitInfo!;
+      if (await this.waitExited(graceMs)) return settled();
       this.kill('SIGTERM');
-      if (await this.waitExited(KILL_AFTER_TERM_MS)) return this._exitInfo!;
+      if (await this.waitExited(KILL_AFTER_TERM_MS)) return settled();
       this.kill('SIGKILL');
-      if (await this.waitExited(KILL_AFTER_TERM_MS + EXIT_DRAIN_MS)) return this._exitInfo!;
+      if (await this.waitExited(KILL_AFTER_TERM_MS + EXIT_DRAIN_MS)) return settled();
       // The OS did not report an exit (should not happen); stop waiting.
       this.finalize();
       return this._exitInfo!;
@@ -936,6 +968,12 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
       // stdin is closed (close() called, EPIPE, or the child exited): an answer can never be
       // delivered, so do not run the gate / Kiro hooks / a permission prompt for it.
       this.logger.debug?.(`control_request ${id} (${subtype}) arrived after stdin closed; not handled`);
+      return;
+    }
+    if (dyingSignal()) {
+      // r5 H2: kiro-claude dies of a fatal signal; no answer would be written (writeLine), so
+      // neither run the gate / hooks for it: the request stays unanswered and no tool runs.
+      this.logger.debug?.(`control_request ${id} (${subtype}) arrived while kiro-claude is dying; not handled`);
       return;
     }
     const entry: CliRequestEntry = { controller: new AbortController(), done: false };

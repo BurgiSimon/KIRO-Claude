@@ -45,6 +45,11 @@ export interface CrewPaths {
   gatewayErr: string;
   readyFile: string;
   tokenFile: string;
+  /**
+   * `run/crashed.json`: what `crew stop` needs to retire the leftovers of gateways whose
+   * `ready.json` is gone (crew start after a crash; a stop that left some), no token (C1).
+   */
+  crashedFile: string;
   setupLog: string;
   cacheDir: string;
   npmCache: string;
@@ -71,6 +76,7 @@ export function crewPaths(env: NodeJS.ProcessEnv): CrewPaths {
     gatewayErr: path.join(runDir, 'gateway.err'),
     readyFile: path.join(runDir, 'ready.json'),
     tokenFile: path.join(runDir, 'token'),
+    crashedFile: path.join(runDir, 'crashed.json'),
     setupLog: path.join(runDir, 'setup.log'),
     cacheDir: path.join(cs, 'cache'),
     npmCache: path.join(cs, 'cache', 'npm'),

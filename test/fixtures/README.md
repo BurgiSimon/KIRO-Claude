@@ -94,8 +94,10 @@ Flags with an effect: `--session-id`, `--resume`, `--fork-session`, `--resume-se
   `{"subtype":"error","error":"Unsupported control request subtype: <x>"}`.
 * Local slash commands (no script consumed): `/clear` (`conversation_reset` with the **old**
   session id, then everything carries a new id; `result.local_command:"clear"`), `/compact [instr]`
-  (`system/status compacting` → `compact_boundary` → synthetic summary user frame → result
-  `local_command:"compact"`, same id), `/effort <level>`, `/model [name]`, `/cost`, `/usage`,
+  (`system/status compacting` → `compact_boundary` (`compact_metadata.preserved_segment` /
+  `preserved_messages` when it keeps a message verbatim, `logical_parent_uuid`) → synthetic summary
+  user frame → `<local-command-stdout>Compacted </local-command-stdout>` replay → result
+  `local_command:"compact"`, same id; see Persistence for what it writes and keeps), `/effort <level>`, `/model [name]`, `/cost`, `/usage`,
   `/context`, `/help`. Any other `/x` is "forwarded to the model", i.e. handled by the script.
 * A non-JSON stdin line is fatal (`Error parsing streaming input line …`, exit 1), like the real CLI.
 * stdin EOF: finishes queued turns and exits 0 (1 if the last result was an error). If a CLI→host
@@ -174,7 +176,8 @@ Template variables, substituted in every string of `text`, `thinking`, tool spec
 `{{lastHookContext}}` (last `additionalContext` from a hook callback), `{{lastControlResponse}}`,
 `{{turnIndex}}` (user messages processed by this process, local commands included),
 `{{historyCount}}` / `{{historyUserTexts}}` (user messages in the session history — includes resumed
-history when persistence is on, not the entries of local commands; joined with ` | `), `{{env:NAME}}`.
+history when persistence is on, not the entries of local commands; a compaction summary stands for
+the lines it summarized, as the model still knows them; joined with ` | `), `{{env:NAME}}`.
 
 ### Persistence (opt-in): `FAKE_CLAUDE_PERSIST=1` + `CLAUDE_CONFIG_DIR=<temp dir>`
 
@@ -210,7 +213,22 @@ it appends a meta `<local-command-caveat>` user entry, a `<command-name>/x</comm
 entry carrying the uuid of the line the host sent, and a `system`/`local_command`
 `<local-command-stdout>` entry (shapes abridged; the fake marks them `localCommand: true` so
 `{{historyUserTexts}}` skips them), so a new session or a pending fork then HAS a transcript:
-`--resume <id>` and a fork of it find a conversation. `/clear` and `/help` write nothing (the real
+`--resume <id>` and a fork of it find a conversation.
+A successful `/compact` writes, like the real claude 2.1.319 (VERIFIED, haiku: two turns, `/compact`,
+a third turn, then forks at each uuid): a `system`/`compact_boundary` entry (`parentUuid` null,
+`logicalParentUuid` the last entry before it, `compactMetadata` with `preservedSegment` {head, anchor,
+tail} / `preservedMessages` when a message is kept verbatim), the summary (`isCompactSummary`, its uuid
+the summary frame's and the metadata's anchor), then the caveat, the `<command-name>/compact…` entry
+(the line's uuid) and a `<local-command-stdout>Compacted </local-command-stdout>` user entry (the
+replay frame's uuid). Every load (`--resume`, a fork, `--continue`) starts at the LAST compact
+boundary: the boundary, the summary, the kept messages (relinked after the summary), then what
+followed. So a `--resume-session-at` uuid from before the boundary that was not kept fails with `No
+message found …` (exit 1, with or without `--fork-session`); a fork at the summary, at a kept message,
+at the `Compacted` entry or later holds the compacted conversation; a fork at the boundary itself has no
+summary. What is kept: the last assistant message when the conversation has two user turns or more,
+nothing after a single turn (what the real claude kept in those probes; its rule may depend on more);
+`FAKE_CLAUDE_COMPACT_PRESERVE=none` keeps nothing, `=last` always the last assistant message. An
+interrupted `/compact` writes only the command entries. `/clear` and `/help` write nothing (the real
 2.1.319 writes a file for `/clear`'s new session; not modeled). Without persistence any `--resume` id is
 accepted with empty history (and `--resume-session-at` cuts nothing). Never point
 `CLAUDE_CONFIG_DIR` at a real config dir.
@@ -231,12 +249,14 @@ accepted with empty history (and `--resume-session-at` cuts nothing). Never poin
 | `FAKE_CLAUDE_NO_INIT_RESPONSE=1` | never answer `initialize` (timeout tests) |
 | `FAKE_CLAUDE_INIT_ERROR=<msg>` | answer `initialize` with an error |
 | `FAKE_CLAUDE_CONTROL_DELAYS` | JSON `{"<subtype>": ms}` delaying host control answers (out-of-order tests) |
+| `FAKE_CLAUDE_CONTROL_ERRORS` | JSON `{"<subtype>": "<message>"}`: answer those host control requests (not `initialize`) with an error, after their delay (e.g. a rejected `set_model`) |
 | `FAKE_CLAUDE_HANG_ON_EOF=1` | ignore stdin EOF (keeps running until killed) |
 | `FAKE_CLAUDE_IGNORE_SIGTERM=1` | ignore SIGTERM (SIGKILL escalation tests) |
 | `FAKE_CLAUDE_PERSIST=1` | transcript persistence (needs `CLAUDE_CONFIG_DIR`) |
 | `FAKE_CLAUDE_DEFAULT_MODEL` / `FAKE_CLAUDE_DEFAULT_EFFORT` | defaults (`claude-opus-5-5` / `medium`) |
 | `FAKE_CLAUDE_SUBSCRIPTION` | `initialize.account.subscriptionType` (default `max`) |
 | `FAKE_CLAUDE_COMPACT_MS` | duration of `/compact` (default 5 ms) |
+| `FAKE_CLAUDE_COMPACT_PRESERVE` | what `/compact` keeps verbatim: `auto` (default: the last assistant message with ≥ 2 user turns), `none`, `last` |
 
 `test/claude/helpers.ts` → `fakeEnv()` strips any inherited `FAKE_CLAUDE_*` variables so tests do
 not leak settings into each other.

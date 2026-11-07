@@ -443,6 +443,13 @@ export interface SessionTurnRecord {
   userUuid: string;
   /** uuid of the last assistant frame of the turn (for /rewind via --resume-session-at). */
   assistantUuid?: string;
+  /**
+   * A `/compact` that followed this turn (the newest, before any later turn): the uuid Claude
+   * resumes the compacted conversation at, the message the compaction kept verbatim or else its
+   * summary. Claude loads a transcript from its last compact boundary, so this turn's own uuids may
+   * be gone; a fork of the saved record at its last turn is pinned here (VERIFIED 2.1.319, r5 S2).
+   */
+  compactUuid?: string;
   preview: string;
   at: string;
 }
@@ -629,6 +636,18 @@ export interface KiroSessionOptions {
   trustAllTools?: boolean;
   /** Names from --trust-tools (normalized by policy). */
   trustTools?: string[];
+  /**
+   * Start from this session trust instead of the launch flags (`trustAllTools` / `trustTools` are
+   * then ignored) and instead of a resumed record's own: a snapshot of the trust of the chat this
+   * session continues, as the chat has it (trust-all, per-tool trust, V3 session rules,
+   * `/tools untrust` revocations, other agents' trust), deep-copied at creation. `agent` names the
+   * agent the snapshot's flat per-tool fields belong to (default: this session's); when this
+   * session runs another agent they are parked under `byAgent` (Q keeps per-agent trust). Used for
+   * the sessions that continue a chat: `/spec` phase sessions, the continuation, `/spec run` task
+   * sessions, the REPL's forced-stop restart (a launch `--trust-tools` applied again would re-trust
+   * a tool the user untrusted).
+   */
+  initialTrust?: { trust: SessionTrust; agent?: string };
   /** Resume an existing kiro-claude session id, or the newest for this cwd. */
   resume?: { sessionId: string } | { latest: true };
   /** Fork from a Claude session (tangent / rewind / chat load). */
@@ -711,8 +730,9 @@ export interface KiroSession extends EventEmitter {
   /**
    * Where a new fork of this session's current conversation must start
    * (`KiroSessionOptions.fork.fromClaudeSessionId` / `at`): its own Claude session or, while that
-   * is itself a fork without a message yet (a /tangent or /rewind just entered; Claude Code writes
-   * a fork's transcript only with its first message), that fork's own source. Undefined (or an
+   * is itself a fork without a message yet (a /tangent or /rewind just entered, no turn and no
+   * local command line since; Claude Code writes a fork's transcript only with its first line),
+   * that fork's own source. Undefined (or an
    * empty `from`) when the session has no Claude session to fork. Used by the spec driver.
    */
   forkSource(): { from: string; at?: string } | undefined;

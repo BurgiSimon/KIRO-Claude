@@ -27,10 +27,18 @@
  *   while its pid names nothing. When `ready.json` proves that (this boot, its start time, it led
  *   its group, no process has its pid), the members it left in its process group that carry this
  *   crew's HOME and KIROCREW_KIRO_BIN and started after it are retired (SIGTERM, then SIGKILL;
- *   {@link crashedGateway}), and the stop says so: `Stopped (pid <n>, which had already exited;
+ *   {@link crashedLeftovers}), and the stop says so: `Stopped (pid <n>, which had already exited;
  *   <m> leftover process(es) of its process group retired); <k> orphan agent process(es) reaped`.
  *   A lock that is still held, or still `indeterminate`, after that (its holder may be outside the
  *   group) is reported with all that was signalled, exit 1 ({@link reportLockKept}).
+ *   C1: that evidence (pid, start time, boot, group, HOME and KIROCREW_KIRO_BIN; no token) outlives
+ *   `ready.json`: whenever `crew start` (after a crash) or `crew stop` removes that file, it is
+ *   kept in `run/crashed.json`, and every later stop retires, by the same proof, what each of
+ *   those gateways left (`; <m> leftover process(es) of the process group of an earlier gateway
+ *   (pid <n>, which had already exited) retired`); `crew start` warns when such leftovers run. An
+ *   entry is dropped once nothing provable of it is left (or after a reboot).
+ *   C2: Linux only. The proof needs every member's environment, which only /proc gives; off
+ *   Linux nothing a crashed gateway left is signalled, and a stop that cannot free the lock says so.
  *   Every signal is identity-checked by start time right before it is sent ({@link CrewSys.kill}).
  * - `--approval auto` is passed as KiroCrew's `yolo` (its choices are reads|yolo|interactive).
  * - Every command uses one gateway env (context.gatewayEnvFor): a `--kiro-bin` given to the
@@ -128,6 +136,8 @@ export async function crewStart(c: CrewCtx, o: StartOptions): Promise<number> {
     await printStatus(c, state, kc, holder, false);
     return 0;
   }
+  // the env of the gateway run/ready.json names (crew.json's, before a new --kiro-bin applies)
+  const earlierEnv = gatewayEnvFor(c, state).env;
   // Remember a foreign --kiro-bin for the gateway started now: every later crew command uses it
   // (context.gatewayEnvFor) and doctor skips the probe-contract rows for it (08 §5.1 A2).
   if (override !== state.kiroBinOverride) {
@@ -135,8 +145,11 @@ export async function crewStart(c: CrewCtx, o: StartOptions): Promise<number> {
     writeState(c.paths.stateFile, state);
   }
   // Nothing holds the gateway lock: run files left by an earlier gateway (its dashboard token,
-  // its pid and port) are stale. Drop them so status/stop/open never act on a dead gateway's data.
-  removeRunSecrets(c);
+  // its pid and port) are stale. Drop them so status/stop/open never act on a dead gateway's data,
+  // keeping in run/crashed.json what crew stop needs to retire what it left running (C1).
+  removeRunSecrets(c, earlierEnv);
+  pruneCrashed(c);
+  warnCrashedLeftovers(c);
   const port = o.port ?? state.port;
   const args = ['gateway', '--no-open', '--no-tunnel', '--json-ready', '--port', String(port)];
   if (o.approval) args.push('--approval', o.approval);
@@ -213,7 +226,15 @@ export async function crewStart(c: CrewCtx, o: StartOptions): Promise<number> {
   // that start time, so crew stop can retire what a crashed gateway leaves in it (K7).
   let pgid = startTime !== undefined ? c.deps.sys.processGroup(realPid) : undefined;
   if (pgid !== undefined && c.deps.sys.startTime(realPid) !== startTime) pgid = undefined;
-  const identity = { pid: realPid, ...(startTime !== undefined ? { startTime } : {}), ...(bootId ? { bootId } : {}), ...(pgid !== undefined ? { pgid } : {}) };
+  // and the env its children inherit, which tells this crew's leftovers from anyone else's (C1)
+  const ids = { HOME: gw.env.HOME ?? c.home, ...(gw.env.KIROCREW_KIRO_BIN !== undefined ? { KIROCREW_KIRO_BIN: gw.env.KIROCREW_KIRO_BIN } : {}) };
+  const identity = {
+    pid: realPid,
+    ...(startTime !== undefined ? { startTime } : {}),
+    ...(bootId ? { bootId } : {}),
+    ...(pgid !== undefined ? { pgid } : {}),
+    ...(startTime !== undefined ? { env: ids } : {}),
+  };
   writeFileAtomic(c.paths.readyFile, `${JSON.stringify({ ...ready, pid: realPid, [READY_IDENTITY_KEY]: identity })}\n`, { mode: 0o600 });
   const token = typeof ready.token === 'string' ? ready.token : '';
   if (token) writeFileAtomic(c.paths.tokenFile, `${token}\n`, { mode: 0o600 });
@@ -358,9 +379,11 @@ async function retireGatewayTree(c: CrewCtx, g: GatewaySnapshot): Promise<number
   return (await retireProcesses(c, [...targets.values()])).signalled;
 }
 
-/** What `crew stop` retired of a gateway that had exited before the stop ({@link crashedGateway}). */
+/** What `crew stop` retired of a gateway that had exited before the stop ({@link crashedLeftovers}). */
 interface CrashedRetire {
   pid: number;
+  /** Where its record came from: `run/ready.json`, or `run/crashed.json` (C1). */
+  file: 'run/ready.json' | 'run/crashed.json';
   /** Leftover members of its process group that had to be signalled. */
   retired: number;
   /** Those still running after the SIGKILL (and a short wait). */
@@ -368,45 +391,173 @@ interface CrashedRetire {
 }
 
 /**
- * The gateway `crew start` recorded in `run/ready.json`, when it provably has exited (a crash:
- * KiroCrew's history-index worker or another child can keep the gateway lock it inherited, so
- * `gateway-pid` answers `held`, or `indeterminate`, and names no holder), with the members it left
- * in its process group. Provable only from a record `crew start` wrote on this boot (pid, start
- * time, boot id) for a gateway that led its own group (pgid = pid), and only while no process
- * has that pid: a pid number stays reserved while any process still uses it as its process group
- * id, so group `<pid>` is then the gateway's own, unless the group emptied and a later process
- * that took the pid made one again. Which is why a member must also carry this crew's HOME and
- * KIROCREW_KIRO_BIN (every process the gateway starts inherits them) and have started after the
- * gateway: whatever else is in that group, of another crew, another user or older than the
- * gateway, is left alone, as are this process and its ancestors (a stop run from a crew agent).
+ * What `crew stop` needs to retire what a gateway `crew start` ran left in its process group once
+ * it has exited (K7): its pid, start time and boot, that it led its own group (pgid = pid), and
+ * the HOME and KIROCREW_KIRO_BIN every process it starts inherits. Held in `run/ready.json`
+ * while that file names the gateway, and in `run/crashed.json` once it is gone (C1: `crew start`
+ * after a crash replaces it; a stop removes it with the dashboard token). No token in it.
  */
-function crashedGateway(c: CrewCtx, gwEnv: NodeJS.ProcessEnv): { pid: number; leftovers: ProcessInfo[] } | undefined {
-  const rec = readReady(c.paths);
+interface GatewayEvidence {
+  pid: number;
+  startTime: number;
+  bootId: string;
+  home: string;
+  kiroBin: string;
+}
+
+/** The evidence a `ready.json` record holds (`gwEnv`: crew.json's gateway env, for an older record without one). */
+function evidenceOf(c: CrewCtx, rec: ReadyRecord | undefined, gwEnv: NodeJS.ProcessEnv): GatewayEvidence | undefined {
   const g = rec?.pid;
-  const since = rec?.startTime;
-  if (g === undefined || since === undefined || rec?.bootId === undefined || rec.pgid !== g) return undefined;
-  const boot = c.deps.sys.bootId();
-  if (boot === undefined || boot !== rec.bootId) return undefined;
-  const home = gwEnv.HOME ?? c.home;
-  const kiroBin = gwEnv.KIROCREW_KIRO_BIN;
+  if (!rec || g === undefined || rec.startTime === undefined || rec.bootId === undefined || rec.pgid !== g) return undefined;
+  const kiroBin = rec.env?.KIROCREW_KIRO_BIN ?? gwEnv.KIROCREW_KIRO_BIN;
   if (kiroBin === undefined) return undefined;
+  return { pid: g, startTime: rec.startTime, bootId: rec.bootId, home: rec.env?.HOME ?? gwEnv.HOME ?? c.home, kiroBin };
+}
+
+const sameEvidence = (a: GatewayEvidence, b: GatewayEvidence): boolean => a.pid === b.pid && a.startTime === b.startTime && a.bootId === b.bootId;
+
+/** At most this many gateways are kept in `run/crashed.json` (the oldest are dropped). */
+const MAX_CRASHED = 16;
+
+/** `run/crashed.json` (C1); a missing or broken file is an empty list. */
+function readCrashed(c: CrewCtx): GatewayEvidence[] {
+  let j: unknown;
+  try {
+    j = JSON.parse(fs.readFileSync(c.paths.crashedFile, 'utf8'));
+  } catch {
+    return [];
+  }
+  const list = j && typeof j === 'object' && Array.isArray((j as { gateways?: unknown }).gateways) ? (j as { gateways: unknown[] }).gateways : [];
+  const out: GatewayEvidence[] = [];
+  for (const e of list) {
+    if (!e || typeof e !== 'object') continue;
+    const r = e as Record<string, unknown>;
+    const int = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v > 0;
+    const text = (v: unknown): v is string => typeof v === 'string' && v !== '';
+    if (int(r.pid) && typeof r.startTime === 'number' && Number.isInteger(r.startTime) && text(r.bootId) && text(r.home) && text(r.kiroBin)) {
+      out.push({ pid: r.pid, startTime: r.startTime, bootId: r.bootId, home: r.home, kiroBin: r.kiroBin });
+    }
+  }
+  return out;
+}
+
+function writeCrashed(c: CrewCtx, list: GatewayEvidence[]): void {
+  try {
+    if (list.length === 0) {
+      fs.rmSync(c.paths.crashedFile, { force: true });
+      return;
+    }
+    fs.mkdirSync(c.paths.runDir, { recursive: true, mode: 0o700 });
+    writeFileAtomic(c.paths.crashedFile, `${JSON.stringify({ version: 1, gateways: list.slice(-MAX_CRASHED) })}\n`, { mode: 0o600 });
+  } catch {
+    // best effort: without it a later stop only retires what ready.json still names
+  }
+}
+
+/** Adds `ev` to `run/crashed.json` (once; entries of an earlier boot are dropped: their pids mean nothing now). */
+function archiveEvidence(c: CrewCtx, ev: GatewayEvidence | undefined): void {
+  if (!ev) return;
+  const boot = c.deps.sys.bootId();
+  const list = readCrashed(c).filter((e) => !sameEvidence(e, ev) && (boot === undefined || e.bootId === boot));
+  writeCrashed(c, [...list, ev]);
+}
+
+/**
+ * The members a gateway left in its process group, when it provably has exited (a crash:
+ * KiroCrew's history-index worker or another child can keep the gateway lock it inherited, so
+ * `gateway-pid` answers `held`, or `indeterminate`, and names no holder). Provable only from a
+ * record `crew start` wrote on this boot (pid, start time, boot id) for a gateway that led its
+ * own group (pgid = pid), and only while no process has that pid: a pid number stays reserved
+ * while any process still uses it as its process group id, so group `<pid>` is then the
+ * gateway's own, unless the group emptied and a later process that took the pid made one again.
+ * Which is why a member must also carry the gateway's HOME and KIROCREW_KIRO_BIN (every process
+ * it starts inherits them) and have started after the gateway: whatever else is in that group,
+ * of another crew, another user or older than the gateway, is left alone, as are this process
+ * and its ancestors (a stop run from a crew agent). Undefined when it cannot be proven.
+ *
+ * Linux only (C2): it needs every member's environment and a start time that names one process,
+ * which only /proc gives ({@link CrewSys.listProcesses}). Elsewhere `ps` lists pid, ppid, pgid
+ * and a start time to the second, but no environment that can be read back unambiguously (macOS
+ * `ps -E` appends it, space-joined, to the command line, and only for this user's processes), and
+ * without it a group that a later process took over (its own leader gone, its members of another
+ * program) cannot be told from the gateway's. Off Linux `crew start` records no start time or
+ * boot, so nothing is ever proven and nothing is signalled.
+ */
+function crashedLeftovers(c: CrewCtx, ev: GatewayEvidence): ProcessInfo[] | undefined {
+  const boot = c.deps.sys.bootId();
+  if (boot === undefined || boot !== ev.bootId) return undefined;
+  const g = ev.pid;
   const procs = c.deps.sys.listProcesses();
   // its pid taken (by a later process, or one this process cannot see: EPERM): not provably gone
   if (procs.some((p) => p.pid === g) || c.deps.sys.isAlive(g)) return undefined;
   const spare = selfAndAncestors(procs, c.deps.sys.pid);
-  const leftovers = procs.filter(
-    (p) => p.pgid === g && p.pid !== g && !spare.has(p.pid) && p.env?.HOME === home && p.env.KIROCREW_KIRO_BIN === kiroBin && p.startTime !== undefined && p.startTime >= since,
+  return procs.filter(
+    (p) => p.pgid === g && p.pid !== g && !spare.has(p.pid) && p.env?.HOME === ev.home && p.env.KIROCREW_KIRO_BIN === ev.kiroBin && p.startTime !== undefined && p.startTime >= ev.startTime,
   );
-  return { pid: g, leftovers };
 }
 
-/** Retires what a crashed gateway left in its process group ({@link crashedGateway}); undefined when there is nothing. */
-async function retireCrashedGateway(c: CrewCtx, gwEnv: NodeJS.ProcessEnv): Promise<CrashedRetire | undefined> {
-  const found = crashedGateway(c, gwEnv);
-  if (!found || found.leftovers.length === 0) return undefined;
-  const { signalled, running } = await retireProcesses(c, found.leftovers);
+/** Retires what a crashed gateway left in its process group ({@link crashedLeftovers}); undefined when there is nothing. */
+async function retireCrashed(c: CrewCtx, ev: GatewayEvidence | undefined, file: CrashedRetire['file']): Promise<CrashedRetire | undefined> {
+  const found = ev ? crashedLeftovers(c, ev) : undefined;
+  if (!ev || !found || found.length === 0) return undefined;
+  const { signalled, running } = await retireProcesses(c, found);
   if (signalled === 0) return undefined;
-  return { pid: found.pid, retired: signalled, left: running() };
+  return { pid: ev.pid, file, retired: signalled, left: running() };
+}
+
+/** The gateway `run/ready.json` names, when it crashed ({@link retireCrashed}). */
+function retireCrashedGateway(c: CrewCtx, gwEnv: NodeJS.ProcessEnv): Promise<CrashedRetire | undefined> {
+  return retireCrashed(c, evidenceOf(c, readReady(c.paths), gwEnv), 'run/ready.json');
+}
+
+/**
+ * The earlier gateways of `run/crashed.json` (C1): what each left in its process group, when it
+ * provably has exited ({@link crashedLeftovers}). The one `ready.json` names is skipped there,
+ * and retired first instead with `withReady` (a stop of another, running gateway: ready.json
+ * provably names one that is not it, which may have crashed before it). `stopping` is the gateway
+ * this stop stops: never one of them (its own tree is retired as such, {@link retireGatewayTree}).
+ */
+async function retireEarlierGateways(c: CrewCtx, gwEnv: NodeJS.ProcessEnv, o: { withReady?: boolean; stopping?: { pid: number; startTime?: number } } = {}): Promise<CrashedRetire[]> {
+  const current = evidenceOf(c, readReady(c.paths), gwEnv);
+  const isStopping = (ev: GatewayEvidence): boolean => o.stopping !== undefined && ev.pid === o.stopping.pid && ev.startTime === o.stopping.startTime;
+  const out: CrashedRetire[] = [];
+  if (o.withReady && current && !isStopping(current)) {
+    const r = await retireCrashed(c, current, 'run/ready.json');
+    if (r) out.push(r);
+  }
+  for (const ev of readCrashed(c)) {
+    if ((current && sameEvidence(ev, current)) || isStopping(ev)) continue;
+    const r = await retireCrashed(c, ev, 'run/crashed.json');
+    if (r) out.push(r);
+  }
+  return out;
+}
+
+/**
+ * Drops from `run/crashed.json` the gateways nothing is left of: of another boot, or exited with
+ * no provable leftover still running. Kept: one that still runs as recorded (a stop it did not
+ * exit from), and one whose leftovers outlived the stop's SIGKILL, for the next stop.
+ */
+function pruneCrashed(c: CrewCtx): void {
+  const list = readCrashed(c);
+  if (list.length === 0) return;
+  const boot = c.deps.sys.bootId();
+  const keep = list.filter((ev) => {
+    if (boot === undefined || ev.bootId !== boot) return false;
+    if (c.deps.sys.isAlive(ev.pid) && c.deps.sys.startTime(ev.pid) === ev.startTime) return true;
+    return (crashedLeftovers(c, ev)?.length ?? 0) > 0;
+  });
+  if (keep.length !== list.length) writeCrashed(c, keep);
+}
+
+/** `crew start`: says so when an earlier gateway's provable leftovers still run (crew stop retires them, C1). */
+function warnCrashedLeftovers(c: CrewCtx): void {
+  for (const ev of readCrashed(c)) {
+    const left = crashedLeftovers(c, ev);
+    if (left && left.length > 0) {
+      c.err(`warning: the Kiro Crew gateway started earlier (pid ${ev.pid}) has exited, but ${left.length} process(es) of its process group still run (pid ${left.map((p) => p.pid).join(', ')}); kiro-claude crew stop retires them`);
+    }
+  }
 }
 
 /** `N leftover process(es) of its process group retired` (and which still run after the SIGKILL). */
@@ -415,16 +566,23 @@ function retiredText(r: CrashedRetire, whose = 'its process group'): string {
   return `${r.retired} leftover process(es) of ${whose} retired${still}`;
 }
 
+/** `; N leftover process(es) of the process group of an earlier gateway (pid P, which had already exited) retired`, for each. */
+function earlierText(list: readonly CrashedRetire[]): string {
+  return list.map((r) => `; ${retiredText(r, `the process group of an earlier gateway (pid ${r.pid}, which had already exited)`)}`).join('');
+}
+
+/** `<file> named pid P, which had already exited: N leftover process(es) of its process group retired`. */
+function namedText(r: CrashedRetire): string {
+  return `${r.file} named pid ${r.pid}, which had already exited: ${retiredText(r)}`;
+}
+
 /**
  * A failed stop's account of a gateway it did not signal: `nothing was signalled`, unless it did
  * signal something else (a crashed gateway's leftovers, orphan agents): then `it was not
  * signalled (…what was…)`.
  */
-function notSignalled(crashed: CrashedRetire | undefined, reaped: number): string {
-  const what = [
-    ...(crashed ? [`run/ready.json named pid ${crashed.pid}, which had already exited: ${retiredText(crashed)}`] : []),
-    ...(reaped > 0 ? [`${reaped} orphan agent process(es) reaped`] : []),
-  ];
+function notSignalled(crashed: readonly CrashedRetire[], reaped: number): string {
+  const what = [...crashed.map(namedText), ...(reaped > 0 ? [`${reaped} orphan agent process(es) reaped`] : [])];
   return what.length > 0 ? `it was not signalled (${what.join('; ')})` : 'nothing was signalled';
 }
 
@@ -432,10 +590,10 @@ function notSignalled(crashed: CrashedRetire | undefined, reaped: number): strin
  * The report of a crashed gateway's retire after which the lock is still not free (`after`:
  * `gateway-pid` then): what was signalled, all of it (its leftovers and the orphan agents reaped).
  */
-function reportLockKept(c: CrewCtx, crashed: CrashedRetire, reaped: number, after: GatewayHolder): number {
+function reportLockKept(c: CrewCtx, crashed: readonly CrashedRetire[], reaped: number, after: GatewayHolder): number {
   const lock = after.holder === 'indeterminate' ? `may still be held (kirocrew gateway-pid: indeterminate: ${after.reason})` : `is still held (kirocrew gateway-pid: ${after.holder})`;
   const orphans = reaped > 0 ? `; ${reaped} orphan agent process(es) reaped` : '';
-  c.err(`kiro-claude: the Kiro Crew gateway lock ${lock}. run/ready.json named pid ${crashed.pid}, which had already exited: ${retiredText(crashed)}${orphans}. Nothing else names a holder, so nothing else was signalled.`);
+  c.err(`kiro-claude: the Kiro Crew gateway lock ${lock}. ${crashed.map(namedText).join('; ')}${orphans}. Nothing else names a holder, so nothing else was signalled.`);
   return 1;
 }
 
@@ -577,9 +735,13 @@ function reapOrphans(c: CrewCtx, state: CrewState): number {
 /**
  * Removes `run/token` and `run/ready.json` (both hold the dashboard token, valid up to 20 h) and
  * blanks the token in `gateway.out`'s READY line, so nothing of a stopped gateway's credential
- * is left behind (08 §3.8 stop: "Remove run/token").
+ * is left behind (08 §3.8 stop: "Remove run/token"). What `crew stop` needs to retire the
+ * gateway's leftovers later is kept, without the token, in `run/crashed.json` (C1; `gwEnv`: the
+ * gateway env of crew.json for a record without its own). {@link pruneCrashed} drops it again
+ * once nothing of that gateway is left.
  */
-function removeRunSecrets(c: CrewCtx): void {
+function removeRunSecrets(c: CrewCtx, gwEnv: NodeJS.ProcessEnv): void {
+  archiveEvidence(c, evidenceOf(c, readReady(c.paths), gwEnv));
   for (const f of [c.paths.tokenFile, c.paths.readyFile]) fs.rmSync(f, { force: true });
   redactReadyToken(c.paths.gatewayOut);
 }
@@ -614,20 +776,40 @@ export function redactReadyToken(file: string): void {
 export async function crewStop(c: CrewCtx, o: StopOptions = {}): Promise<number> {
   const state = loadState(c);
   if (!state) return 1;
+  try {
+    return await stopGateway(c, state, o);
+  } finally {
+    pruneCrashed(c);
+  }
+}
+
+/**
+ * The note a stop that could not free the lock adds off Linux (C2): it never signals what a
+ * crashed gateway may have left there, since it cannot prove whose that is ({@link crashedLeftovers}).
+ */
+function platformNote(c: CrewCtx): string {
+  if (c.deps.sys.platform === 'linux') return '';
+  return ` On ${c.deps.sys.platform}, crew stop cannot tell what a gateway that crashed left running (that needs Linux /proc), so it signals none of it; if a process of its process group keeps the lock, stop that process yourself.`;
+}
+
+async function stopGateway(c: CrewCtx, state: CrewState, o: StopOptions): Promise<number> {
   const { kc, gw: gwEnv } = kirocrewFor(c, state);
   const holder = fs.existsSync(kc.launcher) ? await kc.gatewayPid() : ({ holder: 'nobody' } as GatewayHolder);
   if (!gatewayRunning(holder)) {
     // `indeterminate` is also KiroCrew's answer (on Linux) for a lock that a crashed gateway's
-    // child keeps (K7); `nobody` can still leave such a child running.
+    // child keeps (K7); `nobody` can still leave such a child running. Also the gateways of
+    // run/crashed.json, whose ready.json a `crew start` or an earlier stop removed (C1).
     const crashed = await retireCrashedGateway(c, gwEnv.env);
+    const earlier = await retireEarlierGateways(c, gwEnv.env);
     const reaped = reapOrphans(c, state);
-    removeRunSecrets(c);
-    if (crashed) {
+    removeRunSecrets(c, gwEnv.env);
+    const all = [...(crashed ? [crashed] : []), ...earlier];
+    if (all.length > 0) {
       // `indeterminate` is no proof that the retire freed the lock (its holder may be outside the
       // gateway's process group): ask again, and say so when it is still not free.
       const after = holder.holder === 'indeterminate' ? await kc.gatewayPid() : holder;
-      if (after.holder === 'indeterminate' || after.holder === 'held') return reportLockKept(c, crashed, reaped, after);
-      return reportCrashed(c, crashed, reaped);
+      if (after.holder === 'indeterminate' || after.holder === 'held') return reportLockKept(c, all, reaped, after);
+      return reportCrashed(c, all, reaped);
     }
     c.out(reaped > 0 ? `Kiro Crew gateway is not running; ${reaped} orphan agent process(es) reaped` : 'Kiro Crew gateway is not running.');
     return 0;
@@ -645,7 +827,11 @@ export async function crewStop(c: CrewCtx, o: StopOptions = {}): Promise<number>
   if (stopRun.code !== 0 && c.cli.verbosity > 0) c.err(`kirocrew stop: ${(stopRun.stderr || stopRun.stdout).trim()}`);
   // K7: a held lock and a record of a gateway that has exited (a crash) — what it left in its
   // process group may be what keeps the lock; retire that before waiting for the lock to go.
-  const crashed = !snap && holder.holder === 'held' ? await retireCrashedGateway(c, gwEnv.env) : undefined;
+  const heldCrash = !snap && holder.holder === 'held';
+  const crashed = heldCrash ? await retireCrashedGateway(c, gwEnv.env) : undefined;
+  // C1: what earlier gateways that crashed left (run/crashed.json; ready.json's too while it names
+  // one that crashed before the running gateway), which may keep the lock as well
+  const earlier = await retireEarlierGateways(c, gwEnv.env, { withReady: !heldCrash && rec.verdict === 'other', ...(snap ? { stopping: snap } : {}) });
   const deadline = c.deps.sys.now() + (o.timeoutSec ?? 30) * 1000;
   let gone = false;
   let unproven: number | undefined;
@@ -688,33 +874,35 @@ export async function crewStop(c: CrewCtx, o: StopOptions = {}): Promise<number>
   const exited = snap ? !alive() : gone;
   const reaped = reapOrphans(c, state);
   if (snap && exited) await retireGatewayTree(c, snap);
-  removeRunSecrets(c);
+  removeRunSecrets(c, gwEnv.env);
+  const signalled = [...(crashed ? [crashed] : []), ...earlier];
   if (!exited) {
-    if (snap) c.err(`kiro-claude: the Kiro Crew gateway (pid ${pid}) did not exit.`);
+    if (snap) c.err(`kiro-claude: the Kiro Crew gateway (pid ${pid}) did not exit.${signalled.length > 0 ? ` ${signalled.map(namedText).join('; ')}.` : ''}`);
     else if (unproven !== undefined) {
-      c.err(`kiro-claude: the Kiro Crew gateway did not exit. kirocrew gateway-pid named pid ${unproven} only after the stop, and crew stop cannot tell it from a gateway started since, so ${notSignalled(crashed, reaped)}. To stop it, run: kiro-claude crew stop`);
-    } else if (crashed) {
-      return reportLockKept(c, crashed, reaped, holder);
+      c.err(`kiro-claude: the Kiro Crew gateway did not exit. kirocrew gateway-pid named pid ${unproven} only after the stop, and crew stop cannot tell it from a gateway started since, so ${notSignalled(signalled, reaped)}. To stop it, run: kiro-claude crew stop`);
+    } else if (signalled.length > 0) {
+      return reportLockKept(c, signalled, reaped, holder);
     } else {
       const stale = rec.verdict === 'other' && rec.record?.pid !== undefined ? `; run/ready.json named pid ${rec.record.pid}, which is no longer that gateway` : '';
-      c.err(`kiro-claude: the Kiro Crew gateway did not exit. Nothing names its pid (kirocrew gateway-pid: ${holder.holder}${stale}), so ${notSignalled(undefined, reaped)}.`);
+      c.err(`kiro-claude: the Kiro Crew gateway did not exit. Nothing names its pid (kirocrew gateway-pid: ${holder.holder}${stale}), so ${notSignalled([], reaped)}.${platformNote(c)}`);
     }
     return 1;
   }
-  if (crashed && !snap) return reportCrashed(c, crashed, reaped);
-  const earlier = crashed ? `; ${retiredText(crashed, `the process group of an earlier gateway (pid ${crashed.pid}, which had already exited)`)}` : '';
-  c.out(`Stopped (pid ${pid ?? 'unknown'}); ${reaped} orphan agent process(es) reaped${earlier}`);
+  if (crashed && !snap) return reportCrashed(c, signalled, reaped);
+  c.out(`Stopped (pid ${pid ?? 'unknown'}); ${reaped} orphan agent process(es) reaped${earlierText(signalled)}`);
   return 0;
 }
 
 /**
  * Reports a stop that found the gateway already gone and retired what it had left (K7):
  * `Stopped (pid <n>, which had already exited; <m> leftover process(es) of its process group
- * retired); <k> orphan agent process(es) reaped`, exit 0; exit 1 when some survived the SIGKILL.
+ * retired); <k> orphan agent process(es) reaped`, plus what earlier gateways left (C1), exit 0;
+ * exit 1 when some survived the SIGKILL.
  */
-function reportCrashed(c: CrewCtx, crashed: CrashedRetire, reaped: number): number {
-  const line = `Stopped (pid ${crashed.pid}, which had already exited; ${retiredText(crashed)}); ${reaped} orphan agent process(es) reaped`;
-  if (crashed.left.length === 0) {
+function reportCrashed(c: CrewCtx, crashed: readonly CrashedRetire[], reaped: number): number {
+  const [first, ...rest] = crashed;
+  const line = `Stopped (pid ${first!.pid}, which had already exited; ${retiredText(first!)}); ${reaped} orphan agent process(es) reaped${earlierText(rest)}`;
+  if (crashed.every((r) => r.left.length === 0)) {
     c.out(line);
     return 0;
   }

@@ -42,6 +42,12 @@ export const SESSION_KIND = 'kiro-claude-session';
 export const TITLE_MAX_CHARS = 60;
 /** `lastPreview` / turn preview cap. */
 export const PREVIEW_MAX_CHARS = 200;
+/**
+ * Cap of a record's `pendingHistory` read from a file (a record, a `/chat load` export, r5 S3):
+ * the block kiro-claude builds holds at most 48 KB of journal history (kiroFiles
+ * `journalHistoryText`) inside its `<kiro-restored-history>` wrapper, which this leaves room for.
+ */
+export const PENDING_HISTORY_MAX_BYTES = 49 * 1024;
 
 /** `$KIRO_CLAUDE_SESSIONS_DIR` (absolute, `~` expanded) else `<kiroHome>/sessions/cli`. */
 export function sessionsDir(ws: WorkspaceContext): string {
@@ -136,6 +142,40 @@ export function toDiskJson(rec: SessionRecord): Record<string, unknown> {
   };
 }
 
+const RESTORED_OPEN = '<kiro-restored-history>';
+const RESTORED_CLOSE = '</kiro-restored-history>';
+
+/** The last `max` bytes of `s`, cut at a character boundary. */
+function utf8Tail(s: string, max: number): string {
+  const buf = Buffer.from(s, 'utf8');
+  if (buf.length <= max) return s;
+  let start = buf.length - Math.max(0, max);
+  while (start < buf.length && (buf[start]! & 0xc0) === 0x80) start++; // never start inside a character
+  return buf.subarray(start).toString('utf8');
+}
+
+/**
+ * A `pendingHistory` no larger than {@link PENDING_HISTORY_MAX_BYTES} (r5 S3): as the journal
+ * history is cut when kiro-claude builds the block, the most recent part is kept (`…` marks the
+ * cut), inside the block's `<kiro-restored-history>` wrapper and explanation when it has them.
+ * A block kiro-claude built is returned unchanged.
+ */
+export function capPendingHistory(text: string, max = PENDING_HISTORY_MAX_BYTES): string {
+  if (text.length * 3 <= max || Buffer.byteLength(text, 'utf8') <= max) return text;
+  let head = '';
+  let tail = '';
+  let body = text;
+  const t = text.trimEnd();
+  if (t.startsWith(RESTORED_OPEN) && t.endsWith(RESTORED_CLOSE)) {
+    const end = t.indexOf('\n\n', RESTORED_OPEN.length);
+    head = end >= 0 && end < 1024 ? t.slice(0, end + 2) : `${RESTORED_OPEN}\n`;
+    tail = `\n${RESTORED_CLOSE}`;
+    body = t.slice(head.length, t.length - RESTORED_CLOSE.length).replace(/\n$/, '');
+  }
+  const room = max - Buffer.byteLength(head, 'utf8') - Buffer.byteLength(tail, 'utf8') - Buffer.byteLength('…', 'utf8');
+  return `${head}…${utf8Tail(body, Math.max(0, room))}${tail}`;
+}
+
 /** Parse on-disk JSON into a record; undefined for foreign / malformed files. */
 export function fromDiskJson(raw: unknown, id: string): SessionRecord | undefined {
   if (!isObj(raw) || raw.kind !== SESSION_KIND) return undefined;
@@ -151,6 +191,8 @@ export function fromDiskJson(raw: unknown, id: string): SessionRecord | undefine
     ? raw.turns.filter(isObj).map((t) => {
         const turn: SessionTurnRecord = { userUuid: str(t.userUuid, ''), preview: str(t.preview, ''), at: str(t.at, '') };
         if (typeof t.assistantUuid === 'string') turn.assistantUuid = t.assistantUuid;
+        // a `--resume-session-at` value (a fork's pin, r5 S2): a UUID only
+        if (isClaudeUuid(t.compactUuid)) turn.compactUuid = t.compactUuid;
         return turn;
       })
     : [];
@@ -188,8 +230,9 @@ export function fromDiskJson(raw: unknown, id: string): SessionRecord | undefine
   if (byAgent) rec.trust.byAgent = byAgent;
   const pending = strArr(raw.pendingContext).filter((s) => s.trim() !== '');
   if (pending.length) rec.pendingContext = pending;
-  // context text like pendingContext (sent to Claude with the next line, R4 #1): a non-blank string
-  if (typeof raw.pendingHistory === 'string' && raw.pendingHistory.trim() !== '') rec.pendingHistory = raw.pendingHistory;
+  // context text like pendingContext (sent to Claude with the next line, R4 #1): a non-blank
+  // string, no larger than a block kiro-claude builds (a hand-edited record, a crafted export, r5 S3)
+  if (typeof raw.pendingHistory === 'string' && raw.pendingHistory.trim() !== '') rec.pendingHistory = capPendingHistory(raw.pendingHistory);
   // ids that become `--resume` / `--resume-session-at` argv values: UUIDs only (a copied record
   // file is not trusted to name a flag)
   const pf = raw.pendingFork;

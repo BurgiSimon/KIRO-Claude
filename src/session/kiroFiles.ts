@@ -313,13 +313,16 @@ export function journalSize(dir: string, sid: string): number {
  * (it saves a conversation only after a reply, 06 §6.1): a main record of the user's own (not a
  * tangent or rewind, not an ACP / KiroCrew session) with no turns, no message and no `Prompt` in
  * its journal. A chat cleared after a conversation keeps its record (its journal holds the prompts,
- * K4); one whose only action was `/clear` or `/compact` journals only a compaction marker.
- * KiroSession's close drops such a record (unusedRecord); the session index skips one left behind
- * by a process that died before its close (store.ts `list`, r4 #4).
+ * K4); one whose only action was `/clear` or `/compact` journals only a compaction marker. One
+ * that holds context for its next line (a `/tangent merge` summary merged into it, a restored
+ * history) is kept: a reopen delivers it. KiroSession's close drops such a record (unusedRecord;
+ * also one a quit inside its tangent leaves in the tangent stack, r5 S4); the session index skips
+ * one left behind by a process that died before its close (store.ts `list`, r4 #4).
  */
 export function recordNeverUsed(dir: string, rec: SessionRecord): boolean {
   if (rec.forkKind !== 'main' || rec.origin === 'acp') return false;
   if (rec.turns.length > 0 || rec.messageCount > 0) return false;
+  if (rec.pendingContext?.length || rec.pendingHistory !== undefined) return false;
   let text: string;
   try {
     const file = journalPath(dir, rec.sessionId);
@@ -373,7 +376,7 @@ export function copyJournal(dir: string, fromSid: string, toSid: string, opts: {
  * Copy the journal of a conversation forked at turn `index` (0-based) of `turns` (`/rewind`, or
  * a fork at a rewind point, `KiroSessionOptions.fork.at`): the records before the next turn's
  * `Prompt` (by message id, so steers and `/clear` markers do not shift the cut); at the last turn
- * every record but trailing compactions (the fork's history is uncompacted). Nothing is written
+ * every record but trailing compactions (the turn's own, uncompacted history). Nothing is written
  * when there is nothing to copy. Returns the number of records copied.
  */
 export function copyJournalThroughTurn(dir: string, fromSid: string, toSid: string, turns: readonly { userUuid: string }[], index: number): number {

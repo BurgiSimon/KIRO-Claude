@@ -29,6 +29,10 @@
  *    and `error` set.
  *  - `timeoutMs` / `closeGraceMs` above 2^31-1 ms are clamped ({@link clampTimerMs}); Node
  *    would otherwise fire such timers after 1 ms and print a warning on stderr.
+ *  - While kiro-claude dies of a fatal signal that claude/lifecycle.ts forwards (`dyingSignal()`,
+ *    review r5 H2) no command is started (`aborted`, `error` "kiro-claude is shutting down"),
+ *    and a run that a signal ended meanwhile is `aborted` too, not a failure: the hook runner
+ *    reports neither (a run that exited by itself keeps its exit code, a block included).
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -37,7 +41,7 @@ import * as path from 'node:path';
 import { utf8SafePrefixLength } from './text.js';
 import { log } from './log.js';
 // claude/lifecycle.ts imports only node: built-ins, so this adds no import cycle.
-import { childReaped, signalChild, trackChild } from '../claude/lifecycle.js';
+import { childReaped, dyingSignal, signalChild, trackChild } from '../claude/lifecycle.js';
 
 export interface ShellResult {
   exitCode: number | null;
@@ -50,7 +54,10 @@ export interface ShellResult {
   error?: string;
   /** Which streams exceeded `maxOutputBytes`. */
   truncated?: { stdout: boolean; stderr: boolean };
-  /** True when the run was cancelled through `opts.signal`. */
+  /**
+   * True when the run was cancelled through `opts.signal`, or by kiro-claude dying of a fatal
+   * signal (it was not started, or that signal ended it; r5 H2).
+   */
   aborted?: boolean;
 }
 
@@ -240,6 +247,8 @@ export function runShell(command: string, opts: RunShellOptions): Promise<ShellR
       };
       if (error !== undefined) res.error = error;
       if (out.truncated || err.truncated) res.truncated = { stdout: out.truncated, stderr: err.truncated };
+      // ended by a signal while kiro-claude dies of one (forwarded to it, or its group's SIGKILL)
+      if (signal !== null && !timedOut && dyingSignal() !== undefined) aborted = true;
       if (aborted) res.aborted = true;
       resolve(res);
     };
@@ -253,6 +262,12 @@ export function runShell(command: string, opts: RunShellOptions): Promise<ShellR
     if (opts.signal?.aborted) {
       aborted = true;
       finish(null, null, 'aborted before start');
+      return;
+    }
+    const dying = dyingSignal();
+    if (dying) {
+      aborted = true;
+      finish(null, null, `kiro-claude is shutting down (${dying})`);
       return;
     }
 

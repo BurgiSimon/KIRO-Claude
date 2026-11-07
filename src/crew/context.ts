@@ -167,14 +167,20 @@ export interface ReadyRecord {
    * led its own group, as `crew start` runs it (absent in an older kiro-claude's file).
    */
   pgid?: number;
+  /**
+   * The HOME and KIROCREW_KIRO_BIN the gateway was started with (with a start time only), which
+   * every process it starts inherits: what `crew stop` matches a crashed gateway's leftovers by
+   * (absent in an older kiro-claude's file: the gateway env of crew.json is used then).
+   */
+  env?: { HOME?: string; KIROCREW_KIRO_BIN?: string };
 }
 
 /**
  * The key under which `crew start` adds, to the `KIROCREW_READY:{…}` object it stores as
- * `ready.json`, the identity of the gateway process: `{pid, startTime?, bootId?, pgid?}`. A pid
- * alone outlives its process (a stale file, a reboot); with its start time and boot it names one
- * process. `pgid` says whether it led its own process group (`crew stop` retires the members a
- * crashed gateway left there).
+ * `ready.json`, the identity of the gateway process: `{pid, startTime?, bootId?, pgid?, env?}`. A
+ * pid alone outlives its process (a stale file, a reboot); with its start time and boot it names
+ * one process. `pgid` says whether it led its own process group, and `env` holds its HOME and
+ * KIROCREW_KIRO_BIN (`crew stop` retires the members of this crew a crashed gateway left there).
  */
 export const READY_IDENTITY_KEY = 'kiroClaude';
 
@@ -195,6 +201,13 @@ export function readReady(paths: CrewPaths): ReadyRecord | undefined {
       if (typeof id.startTime === 'number' && Number.isInteger(id.startTime)) rec.startTime = id.startTime;
       if (typeof id.bootId === 'string' && id.bootId) rec.bootId = id.bootId;
       if (rec.startTime !== undefined && typeof id.pgid === 'number' && Number.isInteger(id.pgid) && id.pgid > 0) rec.pgid = id.pgid;
+      const env = id.env as Record<string, unknown> | undefined;
+      if (rec.startTime !== undefined && env && typeof env === 'object' && !Array.isArray(env)) {
+        const e: NonNullable<ReadyRecord['env']> = {};
+        if (typeof env.HOME === 'string' && env.HOME) e.HOME = env.HOME;
+        if (typeof env.KIROCREW_KIRO_BIN === 'string' && env.KIROCREW_KIRO_BIN) e.KIROCREW_KIRO_BIN = env.KIROCREW_KIRO_BIN;
+        rec.env = e;
+      }
     }
     return rec;
   } catch {

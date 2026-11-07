@@ -102,6 +102,16 @@ export interface ReplContext extends ReplHost {
    * the forced stop never ends a command while the session is idle (F0).
    */
   readonly commandSignal: AbortSignal | undefined;
+  /**
+   * A signal the NEXT Ctrl+C after this call aborts (a press the command signal already handled
+   * does not count; once aborted it stays aborted; SIGHUP / SIGTERM abort it too). For work a
+   * command starts after its {@link commandSignal} fired, which stays aborted: the PostTaskExec
+   * hooks of a `/spec run` task the first press interrupted, the start of the `/spec` continuation
+   * or a later phase session (spec/workflow.ts reads it duck-typed). It only signals: the press is
+   * handled as any other (F0: it never interrupts or force-stops the idle session on its own). One
+   * asked for inside a command is dropped, never aborted, when that command ends.
+   */
+  nextPressSignal?(): AbortSignal;
 }
 
 /** A built-in command: same shape as SlashCommand, but its run gets the full context. */

@@ -23,7 +23,23 @@
  *     is re-raised with our listeners removed, so kiro-claude still dies of it (default
  *     disposition, exit status unchanged). When another listener exists (ACP server, REPL,
  *     headless runner, crew runner) it owns the shutdown and (2) still applies at exit.
- *     Listeners are installed only while at least one child is tracked.
+ *     Listeners are installed only while at least one child is tracked (or a group of (4) is
+ *     being swept).
+ *  4. Nor can the members of the claude child's group (`sweepMembers`: MCP servers and any
+ *     command Claude Code runs in its group) outlive the child itself (review r5 H1): once the leader
+ *     exited, gracefully on stdin EOF (ClaudeProcess.close(): `/quit`, the front ends'
+ *     ExitSignals close, ACP shutdown, the end of a headless run) or not (a crash), members left
+ *     in its group get {@link MEMBER_GRACE_MS} (SIGTERM after {@link MEMBER_TERM_AFTER_MS}) and
+ *     are then SIGKILLed through {@link signalChild} (L1 below). close() waits for that
+ *     ({@link membersSettled}); a fatal signal (3) or an exit (2) meanwhile SIGKILLs them at once.
+ *     runShell's children do not sweep: background commands of a hook shell that exited by
+ *     itself may be meant to outlive it. Nor does anything Claude Code starts in a session of
+ *     its own (setsid), by design (it may be meant to outlive claude): with the real 2.1.319
+ *     (VERIFIED, r5 verifier) that is every Bash tool command (claude → a wrapper shell leading a
+ *     new session → the command, in a group of its own there), which claude itself kills on its
+ *     exit or SIGTERM; one that ignores claude's SIGTERM outlives it, as under claude alone. Its
+ *     MCP servers are in its group (also VERIFIED), so their grandchildren (a shell or `npx`
+ *     wrapper's server) are swept here.
  *
  * Survivors include members of a group whose leader died of the signal while they handle or
  * ignore it (a hook program with a cleanup handler under runShell's shell, a trap, a nohup'd
@@ -37,6 +53,15 @@
  * errors are reported). The process-'exit' sweep (2) also covers the signalled groups, should an
  * exit cut the grace short. {@link shutdownTrackedChildren} SIGKILLs such members too, and, as
  * main() has resolved by then, gives them the rest of its grace first.
+ *
+ * Dying (review r5 H2): from the forwarded signal (3) until its re-raise, {@link dyingSignal}
+ * names it. Spawn sites check it, since nothing in kiro-claude may react to the children it is
+ * killing: ClaudeProcess.start() starts no child (no respawn of the claude child the signal just
+ * killed), a ClaudeProcess writes nothing more to its child (no prompt, no answer that lets a
+ * tool run) and hands it no CLI request, runShell() starts no command and reports one the signal
+ * ended as aborted (no hook failure). The state is set only when lifecycle owns the shutdown;
+ * should another listener take the re-raised signal (a front end that started during the grace),
+ * it is cleared again and that listener owns the shutdown from then on.
  *
  * {@link shutdownTrackedChildren} is the graceful variant for the executable entry (src/bin):
  * after main() resolved, a child still running was abandoned (e.g. a probe left behind by
@@ -64,6 +89,23 @@
  * shutdownTrackedChildren() after main() resolved) a sibling may be reaped while its exitCode is
  * still null. On Linux, signalChild therefore also treats a child as reaped when /proc no longer
  * shows the process it saw at {@link trackChild} (gone, or another start time).
+ *
+ * The check-to-kill window (review r5 H3). The proof and the `kill(-pid)` are two steps, so a
+ * reuse in between cannot be excluded: the last proving member exits, the group empties, and the
+ * kernel hands that number out again to a process that makes itself a group leader, all after the
+ * proof was read and before kill(2). The full /proc scan takes milliseconds on a busy host and the
+ * proving member may have been read early in it, so the proof is re-read right before the kill
+ * (one `/proc/<pgid>/stat` and one member's stat, microseconds); the window left is those reads.
+ * A reuse inside it needs the cyclic allocator to come round to exactly that number within it,
+ * i.e. in practice only a deliberately steered allocator (ns_last_pid, as the pid-reuse tests do).
+ * There is no race-free primitive in reach: Node's core API (>= 18.17; checked against v22.23.4,
+ * whose binary, embedding lib/, contains no "pidfd" at all) has no pidfd_open, pidfd_send_signal
+ * or waitid(P_PIDFD); `process.kill()` and `child.kill()` are kill(2) by number; an fd on
+ * `/proc/<pid>` (which pidfd_send_signal would accept) cannot be used for signalling from JS and
+ * does not keep the number reserved; and the leader cannot be left unreaped (a zombie keeps its
+ * number reserved) since libuv reaps every child on SIGCHLD. Closing the window would take a
+ * native addon (no: zero runtime deps) or a sentinel process of ours leading each group for its
+ * whole life (an extra process per child; a larger redesign, not done).
  */
 import { spawnSync, type ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
@@ -78,6 +120,16 @@ export const KILL_GRACE_MS = 1_000;
 /** How often members left in a reaped leader's group are checked during the grace. */
 const MEMBER_POLL_MS = 25;
 
+/**
+ * How long members left in a `sweepMembers` child's group (the claude child: MCP servers, tool
+ * commands) get once the leader exited, before they are SIGKILLed (r5 H1). They are SIGTERMed
+ * after {@link MEMBER_TERM_AFTER_MS} of it.
+ */
+export const MEMBER_GRACE_MS = 500;
+
+/** Within {@link MEMBER_GRACE_MS}: members still there this long after the leader's exit are SIGTERMed. */
+const MEMBER_TERM_AFTER_MS = 100;
+
 const FORWARDED_SIGNALS: readonly NodeJS.Signals[] = ['SIGTERM', 'SIGHUP', 'SIGINT'];
 
 interface Tracked {
@@ -85,15 +137,33 @@ interface Tracked {
   group: boolean;
   /** SIGTERM before SIGKILL on shutdown (session children); probes are just SIGKILLed. */
   graceful: boolean;
+  /** Once the leader exited, SIGKILL what is left of its group after {@link MEMBER_GRACE_MS}. */
+  sweepMembers: boolean;
   exited: Promise<void>;
 }
 
 const tracked = new Set<Tracked>();
+/** `sweepMembers` entries whose leader exited and whose group is being swept (r5 H1). */
+const lingering = new Set<Tracked>();
+/** The sweep of each `sweepMembers` child, from its leader's exit ({@link membersSettled}). */
+const sweeps = new WeakMap<ChildProcess, Promise<void>>();
 const signalListeners = new Map<NodeJS.Signals, () => void>();
 let exitHookInstalled = false;
 let dying: NodeJS.Signals | undefined;
 /** The entries a fatal signal was forwarded to: SIGKILLed with the survivors (r4 #11). */
 let forwarded: readonly Tracked[] = [];
+/** Counts fatal-signal episodes, so a grace's die() never runs for a later one. */
+let dyingEpisode = 0;
+
+/**
+ * The fatal signal kiro-claude is dying of, while lifecycle forwards it to the children (from the
+ * signal until the re-raise; module doc, r5 H2); undefined otherwise, also when another listener
+ * owns the shutdown. Spawn sites check it: nothing new may start (a session must not respawn its
+ * claude child, a hook must not run) and nothing may be sent to a dying child.
+ */
+export function dyingSignal(): NodeJS.Signals | undefined {
+  return dying;
+}
 
 /** Extra `spawn()` options for a tracked child (`detached` on POSIX). */
 export function groupSpawnOptions(): { detached?: boolean } {
@@ -142,9 +212,11 @@ export function signalChild(child: ChildProcess, signal: NodeJS.Signals, group: 
  * Registers a spawned child (spawned with {@link groupSpawnOptions} when `group`) until it
  * exits. A child whose spawn failed (no pid) is ignored. `graceful: false` marks a stateless
  * probe (`--version`, `--help`, `auth status`) that {@link shutdownTrackedChildren} may SIGKILL
- * at once.
+ * at once. `sweepMembers` (a `group` child whose group's members must not outlive it: the claude
+ * child) SIGKILLs what is left of the group once the leader exited, after up to
+ * {@link MEMBER_GRACE_MS} (module doc, r5 H1; {@link membersSettled}).
  */
-export function trackChild(child: ChildProcess, group: boolean = PROCESS_GROUPS, opts: { graceful?: boolean } = {}): void {
+export function trackChild(child: ChildProcess, group: boolean = PROCESS_GROUPS, opts: { graceful?: boolean; sweepMembers?: boolean } = {}): void {
   if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
   // Who holds the pid now (it cannot have been reaped yet: libuv reaps in the event loop), so a
   // reap Node has not reported yet can be told from a live child (reapedUnreported).
@@ -164,11 +236,21 @@ export function trackChild(child: ChildProcess, group: boolean = PROCESS_GROUPS,
   const exited = new Promise<void>((resolve) => {
     child.once('exit', () => {
       tracked.delete(entry);
+      if (entry.sweepMembers) {
+        lingering.add(entry);
+        sweeps.set(
+          child,
+          sweepGroup(entry).then(() => {
+            lingering.delete(entry);
+            removeListenersWhenIdle();
+          }),
+        );
+      }
       resolve();
-      if (tracked.size === 0) removeSignalListeners();
+      removeListenersWhenIdle();
     });
   });
-  entry = { child, group, graceful: opts.graceful ?? true, exited };
+  entry = { child, group, graceful: opts.graceful ?? true, sweepMembers: opts.sweepMembers === true && group && PROCESS_GROUPS, exited };
   tracked.add(entry);
   installHooks();
 }
@@ -179,13 +261,52 @@ export function trackedChildCount(): number {
 }
 
 /**
+ * Resolves once the sweep of a `sweepMembers` child's group after its leader exited has ended
+ * (its members left, or were SIGKILLed after {@link MEMBER_GRACE_MS}); at once for any other
+ * child, or one that has not exited. Never rejects.
+ */
+export function membersSettled(child: ChildProcess): Promise<void> {
+  return sweeps.get(child) ?? Promise.resolve();
+}
+
+/**
+ * r5 H1: what is left of `t`'s group once its leader exited (gracefully or not): members first
+ * get {@link MEMBER_TERM_AFTER_MS} to leave on their own (they already got what the leader sent
+ * them: stdin EOF, Claude Code's own shutdown of its MCP servers; or close()'s signal to the
+ * whole group), then a SIGTERM, and are SIGKILLed once {@link MEMBER_GRACE_MS} has passed. Both
+ * go through {@link signalChild}, i.e. only while the group is provably still ours (L1).
+ */
+async function sweepGroup(t: Tracked): Promise<void> {
+  const start = performance.now();
+  let termed = false;
+  for (;;) {
+    if (!membersLeft(t)) return;
+    const elapsed = performance.now() - start;
+    if (elapsed >= MEMBER_GRACE_MS) break;
+    if (!termed && elapsed >= MEMBER_TERM_AFTER_MS) {
+      termed = true;
+      signalChild(t.child, 'SIGTERM', t.group);
+      continue;
+    }
+    const next = (termed ? MEMBER_GRACE_MS : MEMBER_TERM_AFTER_MS) - elapsed;
+    await new Promise<void>((resolve) => setTimeout(resolve, Math.min(MEMBER_POLL_MS, next)));
+  }
+  signalChild(t.child, 'SIGKILL', t.group);
+}
+
+function removeListenersWhenIdle(): void {
+  if (tracked.size === 0 && lingering.size === 0) removeSignalListeners();
+}
+
+/**
  * SIGTERM every tracked child group (SIGKILL for probes), wait up to `graceMs` for them to
  * exit (leaders, and members a leader that died of the SIGTERM left in its group), SIGKILL the
  * rest and wait (bounded) for their exit events. Resolves immediately when nothing is tracked.
  */
 export async function shutdownTrackedChildren(graceMs: number = KILL_GRACE_MS): Promise<void> {
-  if (tracked.size === 0) return;
-  const entries = [...tracked];
+  if (tracked.size === 0 && lingering.size === 0) return;
+  // groups still being swept after their leader's exit (r5 H1) are shut down like the others
+  const entries = [...tracked, ...lingering];
   for (const t of entries) signalChild(t.child, t.graceful ? 'SIGTERM' : 'SIGKILL', t.group);
   if (await settleGroupsWithin(entries, graceMs)) return;
   // Every entry, not only those still tracked: a reaped leader's group is signalled only while
@@ -241,8 +362,9 @@ function installHooks(): void {
   if (!exitHookInstalled) {
     exitHookInstalled = true;
     process.on('exit', () => {
-      // `forwarded` is empty unless a fatal signal's grace was cut short by an exit.
-      for (const t of new Set([...forwarded, ...tracked])) signalChild(t.child, 'SIGKILL', t.group);
+      // `forwarded` is empty unless a fatal signal's grace was cut short by an exit; `lingering`
+      // holds groups whose members' wait an exit cuts short (r5 H1).
+      for (const t of new Set([...forwarded, ...tracked, ...lingering])) signalChild(t.child, 'SIGKILL', t.group);
     });
   }
   // Only POSIX children escape the terminal's signals; on Windows they share the console.
@@ -270,21 +392,30 @@ function onSignal(sig: NodeJS.Signals): void {
   // Someone else (ACP server, REPL, headless runner…) handles it and owns the shutdown.
   if (process.listenerCount(sig) > 1) return;
   dying = sig;
-  const entries = [...tracked];
+  // groups still being swept after their leader's exit (r5 H1) too: die() SIGKILLs them at once
+  const entries = [...tracked, ...lingering];
   forwarded = entries;
   for (const t of entries) signalChild(t.child, sig, t.group);
   // Leaders only: members get no grace of their own (module doc; the rest of kiro-claude would
   // react to the dead leaders meanwhile). die() SIGKILLs those left.
-  void settleWithin(entries, KILL_GRACE_MS).then(() => die(sig));
+  const episode = ++dyingEpisode;
+  // (unless a second signal's die() ran meanwhile and another listener took the re-raise)
+  void settleWithin(entries, KILL_GRACE_MS).then(() => {
+    if (dying !== undefined && episode === dyingEpisode) die(sig);
+  });
 }
 
 function die(sig: NodeJS.Signals): void {
   // Every group the signal reached, not only leaders still tracked: a reaped leader's group is
   // SIGKILLed only while provably still ours (signalChild, L1), so survivors die, reuses do not.
-  for (const t of new Set([...forwarded, ...tracked])) signalChild(t.child, 'SIGKILL', t.group);
+  for (const t of new Set([...forwarded, ...tracked, ...lingering])) signalChild(t.child, 'SIGKILL', t.group);
   removeSignalListeners();
   // Re-raise with the default disposition (Node's own handler resets the terminal, then exits).
   process.kill(process.pid, sig);
+  // Still alive: a listener added meanwhile (a front end that started during the grace) took the
+  // signal and owns the shutdown now; kiro-claude is no longer dying of it here (r5 H2).
+  dying = undefined;
+  forwarded = [];
 }
 
 /* ------------------------------------------------------------------------------------------ */
@@ -472,5 +603,37 @@ export function ownsExitedGroup(pgid: number, table: readonly ProcInfo[], exitTi
 function exitedGroupIsOurs(child: ChildProcess, pgid: number, unreported = false): boolean {
   const table = readProcessTable('auto', pgid);
   const exitTick = exitTicks.get(child) ?? (unreported ? bootTicksNow() : undefined);
-  return table !== undefined && ownsExitedGroup(pgid, table, exitTick);
+  if (table === undefined || !ownsExitedGroup(pgid, table, exitTick)) return false;
+  // The scan reads one file per process (milliseconds on a busy host) and a member that proved the
+  // group ours may have been read early in it: re-read just that proof, so the window before the
+  // caller's kill(2) is one or two small reads (module doc, r5 H3). Not with the `ps` listing.
+  return !procfsState().ok || reconfirmOwnership(pgid, table, exitTick);
+}
+
+/** `/proc/<pid>/stat`, parsed; undefined when gone or unreadable. */
+function procStat(pid: number): ProcInfo | undefined {
+  try {
+    return parseProcStat(fs.readFileSync(`/proc/${pid}/stat`, 'latin1'));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Re-checks, right now, what made {@link ownsExitedGroup} true for `table`: still no (readable)
+ * process with pid `pgid`, and one of the proving members still alive in group and session
+ * `pgid` with the same start time (when start times are usable). Linux /proc only.
+ */
+function reconfirmOwnership(pgid: number, table: readonly ProcInfo[], exitTick: number | undefined): boolean {
+  if (procStat(pgid) !== undefined) return false;
+  const withStart = procfsState().startTimes;
+  for (const m of table) {
+    if (m.pgid !== pgid || (m.sid !== undefined && m.sid !== pgid) || m.state === 'Z' || m.state === 'X') continue;
+    if (!(m.startTicks === undefined || (exitTick !== undefined && m.startTicks <= exitTick))) continue;
+    const now = procStat(m.pid);
+    if (!now || now.pgid !== pgid || now.sid !== m.sid || now.state === 'Z' || now.state === 'X') continue;
+    if (withStart && now.startTicks !== m.startTicks) continue;
+    return true;
+  }
+  return false;
 }

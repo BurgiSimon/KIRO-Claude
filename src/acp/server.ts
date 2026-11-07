@@ -22,6 +22,22 @@
  * Concurrent `session/load`s of one id share one session; a session that finishes creating
  * after shutdown began is closed instead of registered (no orphaned `claude` child or lock).
  *
+ * Cancelling commands and starts (C3). The 05 §4.6 "no turn running: ignore" leaves a Kiro
+ * command (`commands/execute`, or one sent as prompt text) out, so a command waiting for Claude
+ * Code (`usage()`: get_context_usage, `mcpStatus()` and the MCP init wait: mcp_status, the model
+ * listing) is cancelled by `session/cancel`, its own `$/cancel_request` and the session's close
+ * (the connection closing): it answers at once (`{success:false,message:"Command cancelled"}`, or
+ * `stopReason:"cancelled"` as prompt text) and whatever its wait yields later is dropped (no MCP
+ * notification, no message chunk). For `/clear` and an agent swap the cancel also interrupts the
+ * session, which kills the agentSpawn hooks they run first (K3: it answers cancelled, nothing
+ * changed; as prompt text: its message, then `stopReason:"cancelled"`, KC-ACP-07, never
+ * `end_turn`); other commands that change state (`/model x`, `/effort x`) are not interrupted: they
+ * finish and answer what they did. A command withdrawn by `$/cancel_request` while still queued
+ * never runs. Every session start (`session/new|load`, the stuck-cancel restart) runs under a
+ * start signal (session/startSignal.ts) that shutdown (stdin EOF, a signal) and the request's own
+ * cancel abort: a start still running its agentSpawn hooks is cancelled, its hooks killed, and no
+ * record or lock of it stays behind.
+ *
  * Ordering (05 §3): every update a request produces is written before its response, except
  * where kiro-cli does otherwise: `/compact` answers `end_turn` first and then sends the
  * compaction status frames (05 §4.5.4); `session/new|load` answers first and then reports MCP
@@ -91,12 +107,13 @@ import { claudeServerName } from '../config/mcp.js';
 import { expandPrompt, findPrompt, loadPrompts, parsePromptInvocation } from '../config/prompts.js';
 import { buildModelList } from '../models/models.js';
 import { SessionStore, isSafeSessionId, sessionsDir } from '../session/store.js';
+import { isSessionStartCancelled, withStartSignal } from '../session/startSignal.js';
 import { toKiroCall } from '../policy/toolmap.js';
 import { findClaudeBinary } from '../claude/binary.js';
 import { runAuthCommand } from '../claude/auth.js';
 import { buildChildEnv } from '../claude/env.js';
 import { createLogger, levelFromVerbosity, parseLogLevel, type Logger } from '../util/log.js';
-import { JsonRpcConnection, RpcError, internalError, invalidParams, methodNotFound, respondThen, type RequestContext } from './jsonrpc.js';
+import { ErrorCodes, JsonRpcConnection, RpcError, internalError, invalidParams, methodNotFound, respondThen, type RequestContext } from './jsonrpc.js';
 import {
   CANCELLED_TEXT,
   EFFORT_LEVELS,
@@ -378,6 +395,75 @@ async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined>
   }
 }
 
+/**
+ * A command's wait was cancelled (`session/cancel`, `$/cancel_request`, the connection closing:
+ * {@link AcpServer.cancelOp}); the command answers at once and drops whatever comes later (C3).
+ */
+class OpCancelledError extends Error {
+  constructor() {
+    super('Command cancelled');
+    this.name = 'OpCancelledError';
+  }
+}
+
+/** {@link AcpServer.runOp}'s answer for a cancelled command. */
+const CANCELLED_OP: unique symbol = Symbol('cancelled-op');
+
+/**
+ * `p`, or an {@link OpCancelledError} as soon as `signal` aborts. A late settlement of `p` is
+ * dropped (a rejection is swallowed, never unhandled): nothing waits for it any more.
+ */
+function untilAborted<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return p;
+  p.catch(() => undefined);
+  if (signal.aborted) return Promise.reject(new OpCancelledError());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(new OpCancelledError());
+    signal.addEventListener('abort', onAbort, { once: true });
+    p.then(
+      (v) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(v);
+      },
+      (e: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(e);
+      },
+    );
+  });
+}
+
+/** `sleep(ms)` that ends early (resolves) when `signal` aborts. */
+function sleepUnless(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  if (!signal) return sleep(ms);
+  if (signal.aborted) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const done = (): void => {
+      clearTimeout(t);
+      signal.removeEventListener('abort', done);
+      resolve();
+    };
+    const t = setTimeout(done, ms);
+    t.unref?.();
+    signal.addEventListener('abort', done, { once: true });
+  });
+}
+
+/** One signal that aborts when any of `signals` does (Node 18 has no `AbortSignal.any`); `dispose` unlinks. */
+function eitherSignal(signals: readonly (AbortSignal | undefined)[]): { signal: AbortSignal; dispose(): void } {
+  const ac = new AbortController();
+  const live = signals.filter((x): x is AbortSignal => x !== undefined);
+  const onAbort = (): void => ac.abort();
+  for (const x of live) {
+    if (x.aborted) {
+      ac.abort();
+      break;
+    }
+    x.addEventListener('abort', onAbort, { once: true });
+  }
+  return { signal: ac.signal, dispose: () => live.forEach((x) => x.removeEventListener('abort', onAbort)) };
+}
+
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
 
@@ -481,6 +567,13 @@ class AcpSessionState {
   cancelEpoch = 0;
   /** JSON-RPC id of the `session/prompt` whose job is running (for `$/cancel_request`). */
   activePrompt: string | number | undefined;
+  /**
+   * The command running in this session's queue (`commands/execute`, or a Kiro command sent as
+   * prompt text): aborted by `session/cancel`, its own `$/cancel_request` and the session's close,
+   * which end its waits for Claude Code at once (C3, {@link AcpServer.cancelOp}). `interrupt`:
+   * the cancel also interrupts the session (a `/clear` or agent swap: kills its agentSpawn hooks).
+   */
+  op: { abort: AbortController; interrupt: boolean } | undefined;
   /** Listener on the session's synchronous `'event'` stream (see {@link AcpServer.onLiveEvent}). */
   liveListener: ((ev: SessionEvent) => void) | undefined;
   /**
@@ -536,6 +629,15 @@ export class AcpServer {
   private readonly loading = new Map<string, Promise<unknown>>();
   /** Session closes still running (awaited by {@link serve} before it returns). */
   private readonly closing = new Set<Promise<void>>();
+  /**
+   * Aborted when shutdown begins (stdin EOF, {@link stop}): the start signal of every session this
+   * server creates (session/startSignal.ts, K3). A start still running its agentSpawn hooks then is
+   * cancelled (the hooks are killed, the fresh record removed, the lock released) instead of
+   * finishing into a session nobody uses (C3).
+   */
+  private readonly stopAbort = new AbortController();
+  /** Session creations still running (awaited by {@link serve} before it returns). */
+  private readonly creating = new Set<Promise<unknown>>();
 
   constructor(opts: AcpServerOptions) {
     this.ctx = opts.ctx;
@@ -582,19 +684,52 @@ export class AcpServer {
     const end = Date.now() + 2000;
     while (!this.conn.closed && this.conn.inFlightRequestIds.length > 0 && Date.now() < end) await sleep(10);
     this.conn.close();
+    // a creation cancelled by the stop signal leaves nothing (bounded: a spawn of Claude Code
+    // already under way ends within its initialize timeout, and is then closed by its handler)
+    if (this.creating.size > 0) await withTimeout(Promise.allSettled([...this.creating]), this.timings.closeTimeoutMs);
     // sessions that finished creating after shutdown began are closed by their handlers
     while (this.closing.size > 0) await Promise.allSettled([...this.closing]);
   }
 
   /** Stop serving (signal handlers): closes the connection; {@link serve} then shuts down. */
   stop(): void {
+    this.stopAbort.abort();
     this.conn.close();
+  }
+
+  /**
+   * `this.factory(opts)` under the start signal (session/startSignal.ts): the server's stop
+   * signal and, for `session/new|load`, the request's own (`$/cancel_request`, the connection
+   * closing). A cancelled start leaves nothing behind (C3). For a request (`rpc`) a failure is a
+   * JSON-RPC error (a cancelled start: `Server is shutting down` / `Request cancelled`); without
+   * it the factory's own error is passed on.
+   */
+  private async createUnderStop(opts: KiroSessionOptions, request?: AbortSignal, rpc = true): Promise<KiroSession> {
+    const start = eitherSignal([this.stopAbort.signal, request]);
+    const job = withStartSignal(start.signal, () => this.factory(opts));
+    this.creating.add(job);
+    try {
+      return await job;
+    } catch (e) {
+      if (!rpc) throw e;
+      if (isSessionStartCancelled(e) || (start.signal.aborted && !(e instanceof RpcError))) {
+        if (this.stopping || this.stopAbort.signal.aborted) throw internalError('Server is shutting down');
+        throw new RpcError(ErrorCodes.REQUEST_CANCELLED, 'Request cancelled', errMessage(e));
+      }
+      if (e instanceof RpcError) throw e;
+      throw internalError(errMessage(e));
+    } finally {
+      start.dispose();
+      this.creating.delete(job);
+      job.catch(() => undefined);
+    }
   }
 
   /** Cancel turns and close every session (≤ closeTimeoutMs each, in parallel). */
   async shutdown(): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
+    this.stopAbort.abort();
     const all = [...this.sessions.values()];
     this.sessions.clear();
     await Promise.allSettled(all.map((st) => this.closeSession(st)));
@@ -652,9 +787,9 @@ export class AcpServer {
       case 'authenticate':
         return {};
       case 'session/new':
-        return this.sessionNew(p);
+        return this.sessionNew(p, rc);
       case 'session/load':
-        return this.sessionLoad(p);
+        return this.sessionLoad(p, rc);
       case 'session/prompt':
         return this.sessionPrompt(p, rc);
       case 'session/cancel':
@@ -673,7 +808,7 @@ export class AcpServer {
       case '_session/terminate':
         return this.terminate(str(p.sessionId));
       case '_kiro.dev/commands/execute':
-        return this.commandsExecute(p);
+        return this.commandsExecute(p, rc);
       case '_kiro.dev/commands/options':
         return this.commandsOptions(p);
       case '_session/steer':
@@ -829,7 +964,7 @@ export class AcpServer {
   }
 
   /** `session/new` (05 §4.3, 08 KC-ACP-02). */
-  private async sessionNew(p: Record<string, unknown>): Promise<unknown> {
+  private async sessionNew(p: Record<string, unknown>, rc: RequestContext): Promise<unknown> {
     const ws = this.sessionWs(p.cwd);
     const { servers, warnings } = acpMcpServersToConfigs(p.mcpServers);
     for (const w of warnings) this.log.warn(`acp: ${w}`);
@@ -843,13 +978,7 @@ export class AcpServer {
     const effort = normalizeEffort(str(kmeta.effortLevel)) ?? this.flags.effort;
     if (effort) opts.effort = effort;
     if (servers.length) opts.extraMcpServers = servers;
-    let session: KiroSession;
-    try {
-      session = await this.factory(opts);
-    } catch (e) {
-      if (e instanceof RpcError) throw e;
-      throw internalError(errMessage(e));
-    }
+    const session = await this.createUnderStop(opts, rc.signal);
     if (this.stopping) return this.discardLate(session);
     const st = new AcpSessionState(session.id, session, ws, opts);
     holder.st = st;
@@ -884,16 +1013,19 @@ export class AcpServer {
 
   /**
    * `_kiro.dev/mcp/server_initialized` / `server_init_failure` once per server as soon as
-   * Claude reports it connected / failed (08 KC-ACP-04); polls while servers are pending.
+   * Claude reports it connected / failed (08 KC-ACP-04); polls while servers are pending. With
+   * `signal` (a command's, C3) an abort ends the wait at once with {@link OpCancelledError}, and
+   * an answer that arrives after it reports nothing.
    */
-  private async reportMcp(st: AcpSessionState): Promise<McpStatusEntry[]> {
+  private async reportMcp(st: AcpSessionState, signal?: AbortSignal): Promise<McpStatusEntry[]> {
     const deadline = Date.now() + this.timings.mcpWaitMs;
     let last: McpStatusEntry[] = [];
     for (;;) {
       if (st.closed) return last;
       try {
-        last = await st.session.mcpStatus();
+        last = await untilAborted(st.session.mcpStatus(), signal);
       } catch (e) {
+        if (e instanceof OpCancelledError) throw e;
         this.log.debug('acp: mcpStatus failed:', e);
         return last;
       }
@@ -914,7 +1046,8 @@ export class AcpServer {
         }
       }
       if (!pending || Date.now() >= deadline) return last;
-      await sleep(this.timings.mcpPollMs);
+      await sleepUnless(this.timings.mcpPollMs, signal);
+      if (signal?.aborted) throw new OpCancelledError();
     }
   }
 
@@ -961,7 +1094,7 @@ export class AcpServer {
    * arrives while another load of the same id is still starting waits for it and re-attaches,
    * so one ACP session id never gets two `claude` children.
    */
-  private async sessionLoad(p: Record<string, unknown>): Promise<unknown> {
+  private async sessionLoad(p: Record<string, unknown>, rc: RequestContext): Promise<unknown> {
     const sessionId = str(p.sessionId);
     if (!sessionId) throw invalidParams('sessionId is required');
     const ws = this.sessionWs(p.cwd);
@@ -978,7 +1111,7 @@ export class AcpServer {
       });
     }
     if (!isSafeSessionId(sessionId)) throw internalError('Session not found');
-    const job = this.loadFresh(sessionId, ws, p);
+    const job = this.loadFresh(sessionId, ws, p, rc.signal);
     this.loading.set(sessionId, job);
     try {
       return await job;
@@ -987,7 +1120,7 @@ export class AcpServer {
     }
   }
 
-  private async loadFresh(sessionId: string, ws: WorkspaceContext, p: Record<string, unknown>): Promise<unknown> {
+  private async loadFresh(sessionId: string, ws: WorkspaceContext, p: Record<string, unknown>, request: AbortSignal): Promise<unknown> {
     const dir = sessionsDir(ws);
     const rec = new SessionStore(dir).read(sessionId);
     if (!rec) throw internalError('Session not found');
@@ -1003,13 +1136,7 @@ export class AcpServer {
     if (rec.effort) opts.effort = rec.effort;
     if (!opts.additionalDirectories && rec.additionalDirectories.length) opts.additionalDirectories = [...rec.additionalDirectories];
     if (servers.length) opts.extraMcpServers = servers;
-    let session: KiroSession;
-    try {
-      session = await this.factory(opts);
-    } catch (e) {
-      if (e instanceof RpcError) throw e;
-      throw internalError(errMessage(e));
-    }
+    const session = await this.createUnderStop(opts, request);
     if (this.stopping) return this.discardLate(session);
     if (session.id !== sessionId) this.log.warn(`acp: session/load ${sessionId}: the session module answered id ${session.id}; keeping the client's id`);
     const st = new AcpSessionState(sessionId, session, ws, opts);
@@ -1089,6 +1216,8 @@ export class AcpServer {
   private async closeSession(st: AcpSessionState): Promise<void> {
     if (st.closed) return;
     st.closed = true;
+    // a command waiting for Claude Code answers now (C3), not when the child is gone
+    st.op?.abort.abort();
     const turn = st.turn;
     if (turn) {
       turn.cancelled = true;
@@ -1217,7 +1346,7 @@ export class AcpServer {
   // ───────────── commands ─────────────
 
   /** `_kiro.dev/commands/execute` (05 §4.12, 08 KC-ACP-05). */
-  private commandsExecute(p: Record<string, unknown>): Promise<unknown> {
+  private commandsExecute(p: Record<string, unknown>, rc: RequestContext): Promise<unknown> {
     const st = this.getSession(p.sessionId);
     const cmd = parseCommandParam(p.command);
     if (!cmd) return Promise.resolve({ success: false, message: 'Unknown command: /' });
@@ -1234,8 +1363,46 @@ export class AcpServer {
     return st.enqueue(async () => {
       if (st.closed) throw sessionNotFound();
       await st.whenReady();
-      return this.runCommand(st, cmd.name, cmd.args);
+      const r = await this.runOp(st, rc.signal, cmd.name, (signal) => this.runCommand(st, cmd.name, cmd.args, signal));
+      return r === CANCELLED_OP ? { success: false, message: 'Command cancelled' } : r;
     });
+  }
+
+  /**
+   * Run `job` as the session's command ({@link AcpSessionState.op}, C3): `session/cancel`, the
+   * request's `$/cancel_request` (`request`) and the session's close abort its signal, which ends
+   * its waits for Claude Code (`usage()`, `mcpStatus()`, the MCP init wait) at once. For `/clear`
+   * and an agent swap (`name`) the cancel also interrupts the session, which kills the agentSpawn
+   * hooks they run first (K3: the command is then cancelled with nothing changed), as a REPL
+   * Ctrl+C does. Commands that change state otherwise (`/model x`, `/effort x`) are not
+   * interrupted: they finish and answer what they did. Returns {@link CANCELLED_OP} for a
+   * cancelled wait; whatever its wait would have produced later is dropped.
+   */
+  private async runOp<T>(st: AcpSessionState, request: AbortSignal | undefined, name: string, job: (signal: AbortSignal) => Promise<T>): Promise<T | typeof CANCELLED_OP> {
+    // withdrawn while it was queued (`$/cancel_request`), or its session closed: it never runs
+    if (request?.aborted || st.closed) return CANCELLED_OP;
+    const op = { abort: new AbortController(), interrupt: name === 'clear' || name === 'agent' };
+    st.op = op;
+    const onRequestAbort = (): void => this.cancelOp(st);
+    request?.addEventListener('abort', onRequestAbort, { once: true });
+    try {
+      return await job(op.abort.signal);
+    } catch (e) {
+      if (e instanceof OpCancelledError) return CANCELLED_OP;
+      throw e;
+    } finally {
+      request?.removeEventListener('abort', onRequestAbort);
+      if (st.op === op) st.op = undefined;
+    }
+  }
+
+  /** Cancel the session's running command, if any ({@link runOp}). */
+  private cancelOp(st: AcpSessionState): void {
+    const op = st.op;
+    if (!op || op.abort.signal.aborted) return;
+    op.abort.abort();
+    // the agentSpawn hooks of a /clear or agent swap (K3)
+    if (op.interrupt && !st.turn && !st.closed) st.session.interrupt().catch((e) => this.log.warn(`acp[${st.id}]: interrupt failed:`, e));
   }
 
   /** `_kiro.dev/commands/options` (P2; shape UNVERIFIED, 05 §4.12). */
@@ -1246,12 +1413,15 @@ export class AcpServer {
     return { options: all.filter((o) => o.name.toLowerCase().startsWith(partial)) };
   }
 
-  private async waitForMcp(st: AcpSessionState): Promise<McpStatusEntry[]> {
-    return this.reportMcp(st);
+  private async waitForMcp(st: AcpSessionState, signal?: AbortSignal): Promise<McpStatusEntry[]> {
+    return this.reportMcp(st, signal);
   }
 
-  /** Run a Kiro command against a session (queued by the caller). */
-  private async runCommand(st: AcpSessionState, name: string, args: Record<string, unknown>): Promise<CommandResult> {
+  /**
+   * Run a Kiro command against a session (queued by the caller). `signal` (the command's,
+   * {@link runOp}) cancels its waits for Claude Code: {@link OpCancelledError}.
+   */
+  private async runCommand(st: AcpSessionState, name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<CommandResult> {
     const value = argString(args, 'value');
     switch (name) {
       case 'effort': {
@@ -1277,7 +1447,7 @@ export class AcpServer {
         return { success: true, message: 'Conversation cleared' };
       case 'model': {
         const id = argString(args, 'value', 'model', 'modelId');
-        const entries = await this.listModels(st);
+        const entries = id ? await this.listModels(st) : await untilAborted(this.listModels(st), signal);
         if (!id) {
           const lines = entries.map((e) => `${e.kiroId === st.session.model ? '*' : ' '} ${e.kiroId}${e.displayName && e.kiroId !== 'auto' ? ` (${e.displayName})` : ''}`);
           return { success: true, message: `Current model: ${st.session.model}\n${lines.join('\n')}`, data: { model: { id: st.session.model } } };
@@ -1315,20 +1485,22 @@ export class AcpServer {
         return { success: true, message: `Agent changed to ${st.session.agent.name}`, data: { agent: { name: st.session.agent.name } } };
       }
       case 'mcp':
-        return mcpResult(await this.waitForMcp(st));
+        return mcpResult(await this.waitForMcp(st, signal));
       case 'tools':
-        await this.waitForMcp(st);
+        await this.waitForMcp(st, signal);
         return toolsResult(st.session.toolListing());
       case 'context':
         try {
-          return { success: true, message: contextText(await st.session.contextReport()) };
+          return { success: true, message: contextText(await untilAborted(st.session.contextReport(), signal)) };
         } catch (e) {
+          if (e instanceof OpCancelledError) throw e;
           return { success: false, message: errMessage(e) };
         }
       case 'usage':
         try {
-          return { success: true, message: usageText(await st.session.usage()) };
+          return { success: true, message: usageText(await untilAborted(st.session.usage(), signal)) };
         } catch (e) {
+          if (e instanceof OpCancelledError) throw e;
           return { success: false, message: errMessage(e) };
         }
       case 'help':
@@ -1504,6 +1676,8 @@ export class AcpServer {
     if (!st) return;
     st.cancelEpoch++;
     this.cancelTurn(st);
+    // a command waiting for Claude Code (or running a /clear's agentSpawn hooks) answers now (C3)
+    this.cancelOp(st);
   }
 
   /** Interrupt the running turn (if any); the prompt then answers `cancelled`. */
@@ -1797,7 +1971,7 @@ export class AcpServer {
         await st.whenReady();
         // a cancel that arrived while the child was still starting
         if (cancelledBeforeStart()) return done.resolve({ stopReason: 'cancelled' });
-        await this.handlePrompt(st, input, (r) => done.resolve(r));
+        await this.handlePrompt(st, input, (r) => done.resolve(r), rc.signal);
       } finally {
         if (st.activePrompt === rc.id) st.activePrompt = undefined;
       }
@@ -1810,7 +1984,7 @@ export class AcpServer {
     return done.promise;
   }
 
-  private async handlePrompt(st: AcpSessionState, input: PromptInput, respond: (r: unknown) => void): Promise<void> {
+  private async handlePrompt(st: AcpSessionState, input: PromptInput, respond: (r: unknown) => void, request?: AbortSignal): Promise<void> {
     const slash = input.images?.length ? undefined : parseSlashText(input.text);
     if (slash) {
       if (slash.name === 'compact') {
@@ -1819,10 +1993,22 @@ export class AcpServer {
         return;
       }
       if (isAcpCommand(slash.name)) {
-        const res = await this.runCommand(st, slash.name, slash.args);
+        let opSignal: AbortSignal | undefined;
+        const res = await this.runOp(st, request, slash.name, (signal) => {
+          opSignal = signal;
+          return this.runCommand(st, slash.name, slash.args, signal);
+        });
+        // cancelled (C3): `cancelled`, and nothing of what its wait would have produced
+        if (res === CANCELLED_OP || st.closed) {
+          respond({ stopReason: 'cancelled' });
+          return;
+        }
         const text = res.message ?? (res.success ? 'Done.' : 'Failed.');
         this.update(st.id, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: text.endsWith('\n') ? text : `${text}\n` } });
-        respond({ stopReason: 'end_turn' });
+        // a command the cancel stopped (a /clear or agent swap whose agentSpawn hooks it killed:
+        // nothing changed, its text says so) is a cancelled prompt (05 §4.6, KC-ACP-07); one that
+        // finished all the same answers what it did
+        respond({ stopReason: opSignal?.aborted && !res.success ? 'cancelled' : 'end_turn' });
         return;
       }
       const prompt = findPrompt(loadPrompts(st.ws), slash.name);
@@ -2015,7 +2201,7 @@ export class AcpServer {
     if (old.trust.trustAll) opts.trustAllTools = true;
     let fresh: KiroSession;
     try {
-      fresh = await this.factory(opts);
+      fresh = await this.createUnderStop(opts, undefined, false);
     } catch (e) {
       this.log.error(`acp[${st.id}]: re-creating the session after a stuck cancel failed:`, e);
       st.startError = e;

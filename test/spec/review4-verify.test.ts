@@ -4,7 +4,7 @@
  * Plan mode the user turns on DURING a /spec flow (Shift+Tab while a checkpoint question is read:
  * the REPL toggles the session that is the chat's then, a phase session, and the prompt shows
  * `[plan]`) must not be dropped when the driver hands the chat its continuation, or its original
- * back. The phase sessions themselves keep running without plan mode.
+ * back. (r5 T2: a later phase session starts in the plan mode the chat then has.)
  */
 
 import { test } from 'node:test';
@@ -27,10 +27,11 @@ function shiftTabAt(host: MockHost, calls: number[]): void {
 }
 
 test('R4 verify #0/#7: plan mode turned on at a /spec checkpoint (Shift+Tab) is not dropped by the hand-over', async () => {
-  const cases: { label: string; choose: string[]; at: number[] }[] = [
-    { label: 'at the requirements checkpoint, then Stop', choose: ['Stop here'], at: [1] },
-    { label: 'at the requirements checkpoint, then approved through the tasks', choose: ['Approve and continue to design', 'Approve and continue to tasks', 'Approve tasks'], at: [1] },
-    { label: 'at the tasks checkpoint, then approved', choose: ['Approve and continue to design', 'Approve and continue to tasks', 'Approve tasks'], at: [3] },
+  // `phases`: plan mode of each phase turn (r5 T2: the phase sessions after the toggle take it)
+  const cases: { label: string; choose: string[]; at: number[]; phases: boolean[] }[] = [
+    { label: 'at the requirements checkpoint, then Stop', choose: ['Stop here'], at: [1], phases: [false] },
+    { label: 'at the requirements checkpoint, then approved through the tasks', choose: ['Approve and continue to design', 'Approve and continue to tasks', 'Approve tasks'], at: [1], phases: [false, true, true] },
+    { label: 'at the tasks checkpoint, then approved', choose: ['Approve and continue to design', 'Approve and continue to tasks', 'Approve tasks'], at: [3], phases: [false, false, false] },
   ];
   for (const k of cases) {
     const w = makeWs();
@@ -53,7 +54,7 @@ test('R4 verify #0/#7: plan mode turned on at a /spec checkpoint (Shift+Tab) is 
       await createNewSpec(rtOf(host), { name: 'todo-export', kind: 'feature', description: 'Export todos as CSV' });
       assert.notEqual(host.session, original, k.label);
       assert.equal(host.session.planMode, true, `${k.label}: the plan mode the user turned on during the flow was dropped`);
-      assert.deepEqual(phasePlan.filter((p) => p), [], `${k.label}: a later phase session ran in plan mode`);
+      assert.deepEqual(phasePlan, k.phases, `${k.label}: the phase sessions did not take the chat's plan mode`);
     } finally {
       w.cleanup();
     }

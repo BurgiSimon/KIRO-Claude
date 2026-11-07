@@ -65,6 +65,19 @@ Ground rules:
 </kiro-spec-mode>`;
 }
 
+/**
+ * A spec phase turn in plan mode (the chat is in `/plan`, T2): the `<kiro-plan-mode>` block of the
+ * turn forbids writing files, but this phase's spec documents may still be written; the gate allows
+ * exactly those and denies every other mutating tool (`Plan mode is read-only`).
+ */
+export function specPlanModeBlock(allowedWritePaths: readonly string[]): string {
+  return `<kiro-spec-plan-mode>
+Plan mode is on. In this spec phase you may still write the spec document(s) named here, and
+nothing else: ${allowedWritePaths.join(', ')}
+Everything else stays read-only: do not run commands, call MCP tools, or write any other file.
+</kiro-spec-plan-mode>`;
+}
+
 // ───────────────────────────── §1.10.2 requirements ─────────────────────────────
 
 const EARS_RULES = `Write every acceptance criterion in EARS form with a glossary term as the subject:

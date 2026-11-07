@@ -15,6 +15,15 @@
  * | `/spec approve [name]` · `/spec revise [name] <feedback>` | approve / revise the pending checkpoint (scripted use) |
  * | `/spec sync <name>` | adapter extension (03 §1.7.4) |
  *
+ * In plan mode `/spec run` (and running tasks from `/spec <name>`) is refused: Kiro's plan mode is
+ * the read-only planner (workflow PLAN_MODE_RUN_REFUSED, T3); the spec phases still run there,
+ * writing only their documents. Inside a tangent every form that runs spec turns (`new`, `approve`,
+ * `revise`, `analyze`, `sync`, resuming a spec with a document to draft or review) is refused with
+ * SPEC_IN_TANGENT_REFUSED: the continuation it hands over would replace the tangent, so `/tangent`
+ * could no longer return to the main conversation (T4). A tangent with no message of its own yet is
+ * left first instead (SPEC_TANGENT_LEFT; it holds nothing the main conversation lacks). `list`,
+ * `status`, `view` and task runs work in a tangent.
+ *
  * Not reproduced (gap): the V3 full-screen reader (Ctrl+X line comments) and "spec mode" for
  * later free-form turns (needs a REPL hook; ReplHost has none).
  */
@@ -22,9 +31,13 @@
 import type { ReplHost, SlashCommand } from '../types.js';
 import { SPEC_DOC_FILES, type SpecDocKind, type TaskSelection, type WorkflowType } from './model.js';
 import { formatSpecList, formatSpecStatus, isValidSpecName, listSpecs, loadSpec, normalizeSpecName, resolveSpecDir, summarizeSpec } from './store.js';
+import { SessionStore, sessionsDir } from '../session/store.js';
 import {
+  SPEC_IN_TANGENT_REFUSED,
+  SPEC_TANGENT_LEFT,
   analyzeRequirements,
   approveSpec,
+  canSetSpecPhase,
   conversationHasHistory,
   createNewSpec,
   createReplRuntime,
@@ -78,6 +91,61 @@ function stateOf(host: ReplHost): { current?: string } {
 
 function remember(host: ReplHost, name: string): void {
   stateOf(host).current = name;
+}
+
+/**
+ * T4: the forms that run spec turns hand the chat a continuation when they end, which would
+ * replace a tangent the chat is in (`/tangent` could no longer return to the main conversation).
+ * A tangent with something of its own is kept: the command is refused with
+ * {@link SPEC_IN_TANGENT_REFUSED} (Q disables checkpoints in tangent mode the same way, 06 §6.4).
+ * A tangent that has no message of its own yet (just entered, directly under the main
+ * conversation) holds nothing to lose: it is left first (`/tangent`), with
+ * {@link SPEC_TANGENT_LEFT}, and the spec continues the main conversation (G0). `name`: only when
+ * that spec still has a document to draft or review (a spec in task execution only steps through
+ * its tasks, which runs no spec turn). True when the command must not run.
+ */
+async function tangentRefuses(host: ReplHost, name?: string): Promise<boolean> {
+  const s = host.session;
+  if (s.tangent === undefined || canSetSpecPhase(s)) return false;
+  if (name !== undefined) {
+    const phase = summarizeSpec(host.ws, name)?.phase;
+    if (phase === undefined || phase === 'execution' || phase === 'done') return false;
+  }
+  if (emptyTangent(host)) {
+    try {
+      await s.exitTangent('discard');
+    } catch {
+      // could not leave it (busy, a respawn failed): keep it, refuse
+    }
+    if (host.session.tangent === undefined) {
+      host.print(SPEC_TANGENT_LEFT);
+      return false;
+    }
+  }
+  host.print(SPEC_IN_TANGENT_REFUSED);
+  return true;
+}
+
+/**
+ * The chat is in a tangent of the main conversation (not of another tangent) that has no message
+ * of its own yet: it is still a pending fork of the conversation it left (KiroSession.forkSource
+ * answers that source) and its record holds no turn beyond its parent's, nor a carry.
+ */
+function emptyTangent(host: ReplHost): boolean {
+  const s = host.session;
+  const t = s.tangent;
+  if (!t) return false;
+  const src = s.forkSource();
+  if (!src?.from || src.from === s.claudeSessionId) return false;
+  let parent: ReturnType<SessionStore['read']>;
+  try {
+    parent = new SessionStore(sessionsDir(host.ws)).read(t.parentId);
+  } catch {
+    return false;
+  }
+  if (!parent || parent.forkKind === 'tangent') return false;
+  const rec = s.record;
+  return (rec?.turns?.length ?? 0) <= parent.turns.length && !rec?.pendingContext?.length;
 }
 
 function parseKind(v: string | undefined): SpecKindChoice | undefined {
@@ -290,6 +358,7 @@ async function runSpec(args: string[], host: ReplHost): Promise<void> {
     case undefined: {
       const name = await pickSpec(host, 'Select a spec');
       if (!name) return;
+      if (await tangentRefuses(host, name)) return;
       remember(host, name);
       await resumeSpec(rt, name);
       return;
@@ -309,6 +378,7 @@ async function runSpec(args: string[], host: ReplHost): Promise<void> {
       cmdStatus(host, rest[0]);
       return;
     case 'new':
+      if (await tangentRefuses(host)) return;
       await cmdNew(host, rt, rest);
       return;
     case 'view':
@@ -321,6 +391,7 @@ async function runSpec(args: string[], host: ReplHost): Promise<void> {
     case 'analyze_requirements':
     case 'analyze-requirements':
     case 'analyze': {
+      if (await tangentRefuses(host)) return;
       const name = rest[0] ?? (await pickSpec(host, 'Analyze which spec?', (s) => s.docs.requirements.nonEmpty || s.docs.bugfix.nonEmpty, 'No spec has requirements yet. Create one with /spec new <feature-name>'));
       if (!name) return;
       remember(host, name);
@@ -330,11 +401,13 @@ async function runSpec(args: string[], host: ReplHost): Promise<void> {
     case 'approve': {
       const name = await resolveName(host, rest[0], 'Approve which spec?', (s) => s.awaitingApproval !== undefined);
       if (!name) return;
+      if (await tangentRefuses(host, name)) return;
       remember(host, name);
       await approveSpec(rt, name);
       return;
     }
     case 'revise': {
+      if (await tangentRefuses(host)) return;
       let name: string | undefined;
       let words = rest;
       if (rest[0] && resolveSpecDir(host.ws, rest[0])) {
@@ -351,6 +424,7 @@ async function runSpec(args: string[], host: ReplHost): Promise<void> {
       return;
     }
     case 'sync': {
+      if (await tangentRefuses(host)) return;
       const name = await resolveName(host, rest[0], 'Sync which spec?', (s) => s.docs.tasks.nonEmpty);
       if (!name) return;
       remember(host, name);
@@ -362,6 +436,7 @@ async function runSpec(args: string[], host: ReplHost): Promise<void> {
         host.print(`Spec '${sub}' not found. Create it with /spec new ${sub}\n\n${SPEC_USAGE}`);
         return;
       }
+      if (await tangentRefuses(host, sub)) return;
       remember(host, sub);
       await resumeSpec(rt, sub);
     }

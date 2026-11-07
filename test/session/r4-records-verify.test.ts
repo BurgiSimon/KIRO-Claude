@@ -178,9 +178,10 @@ function layerBCopy(sb: Sandbox, sid: string): string {
 describe('r4 #10 (verify): a copy whose journal ends with a compaction, as the real claude serves it', () => {
   // Real claude 2.1.319 (VERIFIED by this verifier: haiku, turn → /compact → turn, then `--resume S
   // --resume-session-at <the pre-compaction answer> --fork-session`) loads a transcript from its
-  // last compact boundary and refuses an older uuid: `No message found with message.uuid of: <uuid>`.
-  // The fake keeps every entry findable, so the refusal is made here by removing the entries
-  // before the compaction from the source transcript.
+  // last compact boundary and refuses an older uuid it did not keep verbatim: `No message found
+  // with message.uuid of: <uuid>`. With two turns the compaction keeps the last answer (the pin,
+  // r5 S2), which the fake (r5 S1) and the real claude serve, so the refusal is made here by
+  // removing the entries through that answer from the source transcript.
   it('falls back on its own journal: the conversation through the compaction, none of the original\'s later turns', async () => {
     const sb = mkSandbox({ script: SCRIPT, env: { FAKE_CLAUDE_PERSIST: '1' } });
     const s = await open(sb, { origin: 'acp' });
@@ -202,7 +203,7 @@ describe('r4 #10 (verify): a copy whose journal ends with a compaction, as the r
       assert.equal(files.length, 1, 'precondition: one source transcript');
       const lines = fs.readFileSync(files[0]!, 'utf8').split('\n').filter((l) => l.trim() !== '');
       const cut = lines.findIndex((l) => (JSON.parse(l) as { uuid?: string }).uuid === at);
-      assert.ok(cut >= 0, 'precondition: the fake holds the pre-compaction answer');
+      assert.ok(cut >= 0, 'precondition: the transcript holds the pre-compaction answer');
       fs.writeFileSync(files[0]!, lines.slice(cut + 1).join('\n') + '\n');
       const starts = sb.starts().length;
       const ui = recordingUI();

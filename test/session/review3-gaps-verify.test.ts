@@ -169,10 +169,11 @@ describe('S3 (verify): a pending fork re-forked after a quit keeps the conversat
   });
 
   // r4 #10: a record with turns never forks the whole source (its later turns would leak in).
-  // After a compaction the real claude refuses the pre-compaction uuid (`No message found`,
-  // VERIFIED 2.1.319) and the fork falls back on the journal (test/session/r4-records-verify);
-  // the fake still holds it, so here the fork succeeds uncompacted.
-  it('…also at a turn a compaction followed (an uncompacted fork of exactly the record\'s conversation), and at a last turn without an assistant message (its user line)', async () => {
+  // After a compaction the real claude loads the transcript from its compact boundary and refuses
+  // a pre-compaction uuid it did not keep (`No message found`, VERIFIED 2.1.319; the fake models it
+  // since r5 S1), so the pin is the compaction's (r5 S2: here the summary, a single turn keeps
+  // nothing verbatim): a fork of the compacted conversation, exactly the record's.
+  it('…also at a turn a compaction followed (a fork at the compaction: exactly the record\'s conversation), and at a last turn without an assistant message (its user line)', async () => {
     const sb = mkSandbox({ script: HIST, env: { FAKE_CLAUDE_PERSIST: '1' } });
     const s = await open(sb);
     let t: KiroSessionImpl | undefined;
@@ -180,7 +181,9 @@ describe('S3 (verify): a pending fork re-forked after a quit keeps the conversat
       await drain(s.prompt({ text: 'first ALPHA_1' }));
       await drain(s.compact());
       const mainClaude = s.claudeSessionId!;
-      const a1 = s.record.turns[0]!.assistantUuid!;
+      const a1 = s.record.turns[0]!.compactUuid!;
+      assert.ok(a1, 'the compaction recorded where Claude resumes it');
+      assert.notEqual(a1, s.record.turns[0]!.assistantUuid);
       await s.enterTangent('side');
       const tangentId = s.id;
       await s.close();
@@ -194,11 +197,11 @@ describe('S3 (verify): a pending fork re-forked after a quit keeps the conversat
       // a last turn with no assistant message (e.g. cancelled before any): pinned at its user line
       // (a uuid this source does not hold: Claude's `No message found` falls back on the journal)
       const file = path.join(sb.sessionsDir, `${tangentId}.json`);
-      const rawT = JSON.parse(fs.readFileSync(file, 'utf8')) as { turns: { userUuid: string; assistantUuid?: string }[]; pendingFork: { from: string; at?: string } };
+      const rawT = JSON.parse(fs.readFileSync(file, 'utf8')) as { turns: { userUuid: string; assistantUuid?: string; compactUuid?: string }[]; pendingFork: { from: string; at?: string } };
       assert.deepEqual(rawT.pendingFork, { from: mainClaude, at: a1 }, 'the reopen keeps its pin with the pending fork');
       rawT.pendingFork = { from: mainClaude }; // as before that reopen: the pin comes from the turns
       const cancelledUuid = randomUUID();
-      rawT.turns.push({ ...rawT.turns[0]!, userUuid: cancelledUuid, assistantUuid: undefined });
+      rawT.turns.push({ ...rawT.turns[0]!, userUuid: cancelledUuid, assistantUuid: undefined, compactUuid: undefined });
       fs.writeFileSync(file, JSON.stringify(rawT));
       fs.appendFileSync(path.join(sb.sessionsDir, `${tangentId}.jsonl`), JSON.stringify({ version: 1, kind: 'Prompt', timestamp: new Date().toISOString(), data: { message_id: cancelledUuid, content: [{ kind: 'text', data: 'cancelled' }] } }) + '\n');
       starts = sb.starts().length;

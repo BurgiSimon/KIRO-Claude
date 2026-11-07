@@ -4,7 +4,8 @@
  * runRepl and the fake claude are in test/repl/spec-r4-*.test.ts.
  *
  *  - #0/#7: a /spec flow started in plan mode hands the chat a continuation that is in plan mode
- *    again (the phase sessions run without it: they must write the spec documents).
+ *    again. (r5 T2: the phase sessions run in plan mode too; the gate still lets them write their
+ *    spec documents, test/spec/r5-spec-policy.test.ts.)
  *  - #2: `/spec run` passes its signal (Ctrl+C) to a task's PreTaskExec / PostTaskExec hooks; a
  *    press during PreTaskExec opens no task session; a PostTaskExec after an interrupt still runs.
  *  - #3: task sessions (and the driver's phase sessions and continuation) are created under the
@@ -77,7 +78,7 @@ function recordActivations(host: MockHost): { s: KiroSession; plan: boolean }[] 
 
 // ──────────────────────── #0 / #7: plan mode survives a /spec flow ────────────────────────
 
-test('R4 #0/#7: a /spec flow started in plan mode hands the chat a continuation in plan mode; the phase sessions run without it', async () => {
+test('R4 #0/#7: a /spec flow started in plan mode hands the chat a continuation in plan mode; the phase sessions run in it too (r5 T2)', async () => {
   const cases: { label: string; choose: string[]; override?: FakeModelOptions['override'] }[] = [
     { label: 'stopped at the requirements checkpoint', choose: ['Stop here'] },
     { label: 'every checkpoint approved', choose: ['Approve and continue to design', 'Approve and continue to tasks', 'Approve tasks'] },
@@ -110,13 +111,15 @@ test('R4 #0/#7: a /spec flow started in plan mode hands the chat a continuation 
       assert.equal(activations.at(-1)?.plan, true, `${k.label}: the continuation was handed to the chat before its plan mode was set`);
       const phaseTurns = turns.filter((t) => t.phase !== undefined);
       assert.ok(phaseTurns.length > 0, k.label);
+      // r5 T2: the phase sessions of a plan-mode chat run in plan mode (the prompt shows `[plan]`;
+      // the gate lets them write only their own documents)
       assert.deepEqual(
-        phaseTurns.filter((t) => t.plan),
+        phaseTurns.filter((t) => !t.plan),
         [],
-        `${k.label}: a phase session ran in plan mode (it could not write its document)`,
+        `${k.label}: a phase session of a plan-mode chat ran without plan mode`,
       );
       if (!k.override) assert.ok(fs.existsSync(path.join(w.specs, 'todo-export', 'requirements.md')), `${k.label}: the phase session could not write`);
-      for (const s of host.sessions) if (s.opts.specPhase) assert.equal(s.planMode, false, `${k.label}: phase session ${s.id} in plan mode`);
+      for (const s of host.sessions) if (s.opts.specPhase) assert.equal(s.planMode, true, `${k.label}: phase session ${s.id} not in plan mode`);
     } finally {
       w.cleanup();
     }
@@ -214,7 +217,7 @@ test('R4 #0/#7: flows that hand the chat its own session back keep its plan mode
     };
     const d = new SpecSessionDriver(port);
     await d.runTurn({ text: 'a' }, { name: 'requirements', allowedWritePaths: ['/a'] });
-    assert.equal(made[0]!.planMode, false, 'the phase session runs without plan mode');
+    assert.equal(made[0]!.planMode, true, 'the phase session takes the chat\'s plan mode (r5 T2)');
     await d.finish('close');
     assert.equal(current, main);
     assert.equal(main.planMode, true);

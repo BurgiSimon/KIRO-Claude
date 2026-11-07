@@ -12,7 +12,9 @@
  * else run as its own turn after the result; plain interrupt keeps it, `cancel_queued` drops
  * it), and (opt-in) transcript persistence for --resume / --fork-session (a fork's transcript is
  * written with its first user line, like the real claude) / --resume-session-at (a uuid the
- * transcript does not hold fails with `No message found with message.uuid of: <uuid>`, exit 1).
+ * transcript does not hold fails with `No message found with message.uuid of: <uuid>`, exit 1),
+ * a compacted transcript loaded from its last compact boundary like the real claude 2.1.319 (the
+ * summary and the messages the compaction kept verbatim; older uuids are not found).
  *
  * Turns are scripted with $FAKE_CLAUDE_SCRIPT (JSON file) or $FAKE_CLAUDE_SCRIPT_JSON (inline).
  * See test/fixtures/README.md for the script format and every FAKE_CLAUDE_* variable.
@@ -541,6 +543,44 @@ function contextWindow(model) {
   return /-5(-|$)/.test(model) || /-5-\d/.test(model) ? 1_000_000 : 200_000;
 }
 
+/**
+ * The conversation claude 2.1.319 loads from transcript lines (`--resume`, `--continue`, a fork):
+ * from the LAST `compact_boundary` entry on (VERIFIED: a `--resume-session-at` uuid before it fails
+ * with `No message found with message.uuid of: <uuid>`, with or without --fork-session): the
+ * boundary, the summary (`isCompactSummary`, the metadata's `anchorUuid`), the messages the
+ * compaction kept verbatim (`compactMetadata.preservedMessages.uuids`, looked up before the
+ * boundary and relinked after the summary, VERIFIED: a fork at such a message holds boundary,
+ * summary, message), then the entries that followed the summary. Lines without a boundary load
+ * whole.
+ */
+function loadedConversation(lines) {
+  let b = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i] && lines[i].type === 'system' && lines[i].subtype === 'compact_boundary') {
+      b = i;
+      break;
+    }
+  }
+  if (b < 0) return lines;
+  const boundary = lines[b];
+  const rest = lines.slice(b + 1);
+  const md = boundary.compactMetadata && typeof boundary.compactMetadata === 'object' ? boundary.compactMetadata : {};
+  const pm = md.preservedMessages && typeof md.preservedMessages === 'object' ? md.preservedMessages : {};
+  const anchor = pm.anchorUuid ?? (md.preservedSegment && md.preservedSegment.anchorUuid);
+  const before = lines.slice(0, b);
+  const kept = (Array.isArray(pm.uuids) ? pm.uuids : []).map((u) => before.find((l) => l.uuid === u)).filter(Boolean);
+  const ai = rest.findIndex((l) => l.uuid === anchor);
+  if (ai < 0 || kept.length === 0) return [boundary, ...rest];
+  let parent = anchor;
+  const relinked = kept.map((l) => {
+    const o = { ...l, parentUuid: parent };
+    parent = l.uuid;
+    return o;
+  });
+  const after = rest.slice(ai + 1).map((l, i) => (i === 0 ? { ...l, parentUuid: parent } : l));
+  return [boundary, ...rest.slice(0, ai + 1), ...relinked, ...after];
+}
+
 /* ---------------------------------------------------------------------------------------- */
 /* Main (stream-json mode)                                                                   */
 /* ---------------------------------------------------------------------------------------- */
@@ -630,7 +670,7 @@ function main() {
         log({ event: 'exit', code: 1, reason: 'resume not found' });
         return exitAfterFlush(1);
       }
-      loaded = fs.readFileSync(file, 'utf8').split('\n').filter((l) => l.trim()).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+      loaded = loadedConversation(fs.readFileSync(file, 'utf8').split('\n').filter((l) => l.trim()).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean));
     }
     if (resumeAt !== undefined) {
       const idx = loaded.findIndex((l) => l.uuid === resumeAt);
@@ -665,7 +705,7 @@ function main() {
       /* none */
     }
     sessionId = newest ? newest.f.replace(/\.jsonl$/, '') : uuid();
-    if (newest) historyLines = fs.readFileSync(path.join(projectDir, newest.f), 'utf8').split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
+    if (newest) historyLines = loadedConversation(fs.readFileSync(path.join(projectDir, newest.f), 'utf8').split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l)));
   } else {
     sessionId = sessionIdArg || uuid(); // an existing --session-id was refused above
   }
@@ -775,6 +815,15 @@ function main() {
       return {};
     }
   })();
+  // host control requests answered with an error instead ({"<subtype>": "<message>"}), after
+  // their FAKE_CLAUDE_CONTROL_DELAYS delay (a set_model the CLI rejects)
+  const controlErrors = (() => {
+    try {
+      return JSON.parse(env.FAKE_CLAUDE_CONTROL_ERRORS || '{}');
+    } catch {
+      return {};
+    }
+  })();
   const transcriptPathFor = () => path.join(env.CLAUDE_CONFIG_DIR || path.join(env.HOME || '/', '.claude'), 'projects', sanitize(cwd), `${sessionId}.jsonl`);
 
   /** Write a pending fork's copied history (its first user line arrived, see forkPending). */
@@ -808,11 +857,27 @@ function main() {
     return content.map((b) => (b && b.type === 'text' ? b.text : b && b.type === 'image' ? '[image]' : b && b.type === 'document' ? '[document]' : '')).join('');
   };
   // the conversation's user messages: tool results and the entries of a local command (see
-  // recordLocalCommand) are not listed
+  // recordLocalCommand) are not listed; a compaction summary stands for the lines it summarized
+  // (the model still knows them, VERIFIED: it answered ALPHA, BETA after /compact)
   const historyUserTexts = () =>
     historyLines
       .filter((l) => l.type === 'user' && l.message && !l.localCommand && !(Array.isArray(l.message.content) && l.message.content.some((b) => b && b.type === 'tool_result')))
-      .map((l) => userTextOf(l.message.content));
+      .flatMap((l) => (l.isCompactSummary ? (Array.isArray(l.fakeSummarizedTexts) ? l.fakeSummarizedTexts : []) : [userTextOf(l.message.content)]));
+  // the message /compact keeps verbatim: real claude 2.1.319 kept the last assistant message of a
+  // conversation with two user turns or more and nothing after a single turn (VERIFIED);
+  // $FAKE_CLAUDE_COMPACT_PRESERVE=none keeps nothing, =last always the last assistant message
+  const compactKept = () => {
+    const mode = env.FAKE_CLAUDE_COMPACT_PRESERVE || 'auto';
+    if (mode === 'none') return undefined;
+    const prompts = historyLines.filter((l) => l.type === 'user' && l.message && !l.localCommand && !l.isCompactSummary && !(Array.isArray(l.message.content) && l.message.content.some((b) => b && b.type === 'tool_result'))).length;
+    if (mode !== 'last' && prompts < 2) return undefined;
+    for (let i = historyLines.length - 1; i >= 0; i--) {
+      const l = historyLines[i];
+      if (l.type === 'system' && l.subtype === 'compact_boundary') return undefined;
+      if (l.type === 'assistant' && typeof l.uuid === 'string') return l.uuid;
+    }
+    return undefined;
+  };
   // Local commands whose line becomes part of the session transcript, like the real claude 2.1.319
   // (VERIFIED for /effort, /compact, /model, /cost and /context as the only line of a new session,
   // of a resumed one and of a fork that had no line yet: the transcript, a fork's copied history
@@ -1227,7 +1292,7 @@ function main() {
   function newTurnState(msg, text) {
     const ac = new AbortController();
     const t = {
-      uuids: msg.uuid ? [msg.uuid] : [], userText: text, promptId: uuid(), started: Date.now(),
+      uuids: msg.uuid ? [msg.uuid] : [], userText: text, promptId: uuid(), started: Date.now(), line: msg, localRecorded: false,
       numTurns: 0, inTokens: 0, outTokens: 0, denials: [], resultText: '', resultMsgId: null, msg: null,
       lastToolResult: '', lastHookContext: '', lastControlResponse: '', resultOverrides: null, abortReason: null,
       signal: ac.signal, inTools: false,
@@ -1293,9 +1358,31 @@ function main() {
         contextTokens = Math.round(contextTokens / 4);
         emit({ type: 'system', subtype: 'status', status: null, compact_result: 'success', session_id: sessionId, uuid: uuid() });
         emit(initFrame(t.uuids));
-        emit({ type: 'system', subtype: 'compact_boundary', session_id: sessionId, uuid: uuid(), compact_metadata: { trigger: 'manual', pre_tokens: pre, post_tokens: 18000 + contextTokens } });
-        emit({ type: 'user', message: { role: 'user', content: `This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\n${historyUserTexts().join('\n')}${args ? `\n\nCompaction instructions: ${args}` : ''}` }, isSynthetic: true, parent_tool_use_id: null, session_id: sessionId, uuid: uuid(), timestamp: now() });
-        emit({ type: 'user', message: { role: 'user', content: '<local-command-stdout>Compacted </local-command-stdout>' }, session_id: sessionId, parent_tool_use_id: null, uuid: uuid(), timestamp: now(), isReplay: true });
+        const boundaryUuid = uuid();
+        const summaryUuid = uuid();
+        const stdoutUuid = uuid();
+        const kept = compactKept();
+        const logicalParent = lastParentUuid;
+        const summarized = historyUserTexts();
+        const summary = `This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\n${summarized.join('\n')}${args ? `\n\nCompaction instructions: ${args}` : ''}`;
+        emit({
+          type: 'system', subtype: 'compact_boundary', session_id: sessionId, uuid: boundaryUuid,
+          compact_metadata: { trigger: 'manual', pre_tokens: pre, post_tokens: 18000 + contextTokens, ...(kept ? { preserved_segment: { head_uuid: kept, anchor_uuid: summaryUuid, tail_uuid: kept }, preserved_messages: { anchor_uuid: summaryUuid, uuids: [kept], all_uuids: [kept] } } : {}) },
+          logical_parent_uuid: logicalParent,
+        });
+        emit({ type: 'user', message: { role: 'user', content: summary }, isSynthetic: true, parent_tool_use_id: null, session_id: sessionId, uuid: summaryUuid, timestamp: now() });
+        // the transcript (VERIFIED 2.1.319 order): boundary, summary, then the command's entries;
+        // from here on the conversation is what a resume of it loads (loadedConversation)
+        appendTranscript({
+          type: 'system', subtype: 'compact_boundary', uuid: boundaryUuid, parentUuid: null, logicalParentUuid: logicalParent, content: 'Conversation compacted', isMeta: false, level: 'info',
+          compactMetadata: { trigger: 'manual', preTokens: pre, postTokens: 18000 + contextTokens, ...(kept ? { preservedSegment: { headUuid: kept, anchorUuid: summaryUuid, tailUuid: kept }, preservedMessages: { anchorUuid: summaryUuid, uuids: [kept], allUuids: [kept] } } : {}) },
+        });
+        appendTranscript({ type: 'user', uuid: summaryUuid, isCompactSummary: true, isVisibleInTranscriptOnly: true, message: { role: 'user', content: summary }, fakeSummarizedTexts: summarized });
+        historyLines = loadedConversation(historyLines);
+        recordLocalCommand(t.line, 'compact', args);
+        t.localRecorded = true;
+        emit({ type: 'user', message: { role: 'user', content: '<local-command-stdout>Compacted </local-command-stdout>' }, session_id: sessionId, parent_tool_use_id: null, uuid: stdoutUuid, timestamp: now(), isReplay: true });
+        appendTranscript({ type: 'user', uuid: stdoutUuid, localCommand: true, message: { role: 'user', content: '<local-command-stdout>Compacted </local-command-stdout>' } });
         t.inTokens += 500;
         t.outTokens += 200;
         return emitResult(t, { result: '', local_command: 'compact', stop_reason: null });
@@ -1433,10 +1520,14 @@ function main() {
       if (slash) {
         const args = (slash[2] || '').trim();
         const recorded = LOCAL_RECORDED.has(slash[1]);
-        if (recorded) recordLocalCommand(msg, slash[1], args);
+        // a /compact that succeeds writes its own entries after the compaction's (runLocal)
+        if (recorded && slash[1] !== 'compact') recordLocalCommand(msg, slash[1], args);
         const r = await runLocal(t, slash[1], args);
         done = r !== undefined;
-        if (recorded && r) appendTranscript({ type: 'system', subtype: 'local_command', uuid: uuid(), content: `<local-command-stdout>${typeof r.result === 'string' ? r.result : ''}</local-command-stdout>` });
+        if (recorded && r && !t.localRecorded) {
+          if (slash[1] === 'compact') recordLocalCommand(msg, slash[1], args);
+          appendTranscript({ type: 'system', subtype: 'local_command', uuid: uuid(), content: `<local-command-stdout>${typeof r.result === 'string' ? r.result : ''}</local-command-stdout>` });
+        }
       }
       if (!done) {
         appendTranscript({ type: 'user', uuid: msg.uuid || uuid(), message: { role: 'user', content } });
@@ -1498,6 +1589,7 @@ function main() {
     const id = msg.request_id;
     const req = msg.request || {};
     const answer = () => {
+      if (req.subtype !== 'initialize' && typeof controlErrors[req.subtype] === 'string') return respondError(id, controlErrors[req.subtype]);
       switch (req.subtype) {
         case 'initialize': {
           if (env.FAKE_CLAUDE_NO_INIT_RESPONSE === '1') return;

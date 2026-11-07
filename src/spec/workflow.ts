@@ -23,9 +23,19 @@
  *    session started) the REPL keeps its original session. A fork's parent RECORD (whose turns,
  *    journal, context rules and merged carry the fork's record copies) is the session the user is
  *    in, also a continuation an earlier flow handed over that has no message yet (its fork point is
- *    still its source's). The continuation takes the plan mode of the session it replaces (also
- *    plan mode the user turned on during the flow, e.g. Shift+Tab at a checkpoint); the phase
- *    sessions run without plan mode (they write the spec documents). The REPL runtime creates
+ *    still its source's). Every session the driver creates (phase sessions, the continuation)
+ *    starts from the trust and plan mode of the session it continues as the chat has them, every
+ *    `/spec run` task session from the chat's trust (KiroSessionOptions.initialTrust: `/tools untrust`, a revoked agent tool,
+ *    a `t` answer hold; never the launch `--trust-tools` / agent allowedTools again, T1), so a
+ *    Shift+Tab or `t` while a phase session is the chat's reaches the continuation. Phase sessions
+ *    of a plan-mode chat run in plan mode (the prompt shows `[plan]`): the gate denies every
+ *    mutating tool except writes of the phase's own documents (policy/gate.ts, T2), and the turn
+ *    says so ({@link specPlanModeBlock}). `/spec run` in plan mode is refused (Kiro's plan mode is
+ *    the read-only planner, T3); a spec command that would hand over a continuation is refused
+ *    inside a tangent with messages of its own (it would replace the tangent; an empty one is left
+ *    first, slash.ts, T4). When a flow ends, the records of its
+ *    phase sessions that a later session holds in full are removed (T5,
+ *    {@link SpecSessionDriver.finish}). The REPL runtime creates
  *    every session (phase sessions, the continuation, task sessions) under the command's Ctrl+C as
  *    its start signal (session/startSignal.ts): a press while one runs its agentSpawn hooks cancels
  *    that start (phase turn not sent, continuation not made: the chat keeps its session, task
@@ -39,12 +49,20 @@
  *    `[ ]` and the run stops (03 §1.7.2, KI:#11786); PostTaskExec hooks (agent prompts ⇒ follow-up
  *    turn in the task session before it closes). Concurrency per wave = runtime.maxParallelTasks
  *    (REPL 1; CLI `kiroClaude.spec.maxParallelTasks`, ≤ 4 — documented deviation 03 §1.7.2).
- *    The run's signal (Ctrl+C) stops scheduling, interrupts running task sessions, kills running
+ *    A REPL task session starts from the chat's trust (T1). While its task runs it is the chat's:
+ *    a restriction the user adds there (Shift+Tab into plan mode, `/tools untrust` at its approval
+ *    prompt) carries back to the chat when the task hands it back, so it holds for the later tasks,
+ *    and a run in which plan mode came on starts no further task (T3). Trust given in it with `t`
+ *    stays in that task session (the next task and the chat start from the chat's: known gap, only
+ *    ever more restrictive than Kiro, whose tasks run in the chat itself). The run's signal (Ctrl+C) stops scheduling, interrupts running task sessions, kills running
  *    task hook commands (with their process groups, also with timeout 0) and cancels a task
  *    session start whose agentSpawn hooks run. A press during PreTaskExec ⇒ the task is
  *    `interrupted` before its box or a session is touched (no PostTaskExec). The PostTaskExec of
- *    an interrupted task still runs (status `interrupted`), without the already aborted signal, so
- *    it cannot be cancelled (known gap: a host signal for a LATER press does not exist).
+ *    an interrupted task still runs (status `interrupted`), not under the already aborted signal
+ *    but under the host's NEXT press (SpecRuntime.nextPressSignal; REPL ReplContext.nextPressSignal):
+ *    a second Ctrl+C kills it. Likewise the REPL runtime starts a phase session or the
+ *    continuation that comes after a press under the next press (r5 P1); a cancelled
+ *    continuation start gives the chat its own session back with a notice.
  *
  * The workflow talks to its host only through {@link SpecRuntime}; {@link createReplRuntime}
  * adapts a ReplHost (slash commands) and spec/cli.ts builds a headless one.
@@ -66,7 +84,10 @@ import type {
   WorkspaceContext,
 } from '../types.js';
 import { HookRunner } from '../hooks/runner.js';
+import { cloneTrust } from '../policy/gate.js';
+import { journalPath } from '../session/kiroFiles.js';
 import { isSessionStartCancelled, withStartSignal } from '../session/startSignal.js';
+import { SessionStore, sessionsDir } from '../session/store.js';
 import { writeFileAtomic } from '../util/fsx.js';
 import { shlexSplit } from '../util/shlex.js';
 import {
@@ -100,6 +121,7 @@ import {
   quickQuestionsPrompt,
   revisionPrompt,
   specModeBlock,
+  specPlanModeBlock,
   syncPrompt,
   taskExecutionPrompt,
   type AnalysisFinding,
@@ -133,6 +155,24 @@ export interface SpecPhaseSettable {
   setSpecPhase(phase: SpecPhaseRestriction | undefined): void | Promise<void>;
 }
 
+/** `/spec run` in plan mode (T3), followed by how to leave it. */
+export const PLAN_MODE_RUN_REFUSED = 'Plan mode is read-only: running spec tasks implements code (it edits files and runs commands).';
+
+/**
+ * A spec command that hands the chat a continuation, run inside a tangent that has something of
+ * its own (T4): the continuation would replace the tangent, so `/tangent` could no longer return
+ * to the main conversation. Same shape as Q's `Checkpoint is disabled while in tangent mode`
+ * (06 §6.4).
+ */
+export const SPEC_IN_TANGENT_REFUSED =
+  '⚠️ Spec drafting is disabled while in tangent mode: its spec conversation would replace this tangent. Return to the main conversation first (/tangent, or /tangent merge to keep what this tangent found), then run the /spec command again.';
+
+/** A spec command run in a tangent that has no message of its own left it first (T4). */
+export const SPEC_TANGENT_LEFT = 'Left the tangent (↯): it had no messages of its own, so the spec continues the main conversation.';
+
+/** The failure a spec turn reports when its phase session would fork a tangent (T4 backstop). */
+export const SPEC_IN_TANGENT_ERROR = 'spec drafting is disabled while in tangent mode (return to the main conversation with /tangent first)';
+
 export function canSetSpecPhase(s: unknown): s is SpecPhaseSettable {
   return !!s && typeof (s as { setSpecPhase?: unknown }).setSpecPhase === 'function';
 }
@@ -159,6 +199,18 @@ export interface SpecRuntime {
    * {@link RunOptions.signal} for task runs.
    */
   readonly signal?: AbortSignal | undefined;
+  /**
+   * A signal the host's NEXT Ctrl+C aborts (REPL: ReplContext.nextPressSignal), for work that runs
+   * after {@link signal} fired and stays aborted: the PostTaskExec hooks of an interrupted task.
+   * Absent (spec CLI): such work runs without a signal.
+   */
+  nextPressSignal?(): AbortSignal | undefined;
+  /**
+   * The chat is in plan mode (REPL `/plan`, Shift+Tab; the CLI has none): Kiro's plan mode is the
+   * read-only planner, so task execution, which implements code, is refused (T3); the spec phases
+   * still run, writing only their documents.
+   */
+  readonly planMode?: boolean;
   print(text: string): void;
   /** Final results (findings, run summary). Defaults to print. */
   result?(text: string): void;
@@ -199,6 +251,75 @@ export interface SessionPort {
   create(opts: Partial<KiroSessionOptions>): Promise<KiroSession>;
   activate(s: KiroSession): void;
   run(s: KiroSession, input: PromptInput, opts?: TurnOptions): Promise<TurnResult>;
+  /**
+   * Remove the saved record of a closed phase session whose conversation a later session of the
+   * flow holds in full (its turns and journal copied into that session's record): the duplicate
+   * would only clutter `--list-sessions` ({@link SpecSessionDriver.finish}). Absent: records stay.
+   */
+  discard?(s: KiroSession): void | Promise<void>;
+}
+
+/**
+ * {@link SessionPort.discard} over the session index: delete the record `id` (index file, lock,
+ * journal) when it is a spec-phase record (origin `spec`, never a tangent / rewind) that no live
+ * process holds open (this one included). The Claude transcript is never touched: a later
+ * session's pending fork may still start from it. True when it was removed.
+ */
+export function discardSpecRecord(ws: WorkspaceContext, id: string): boolean {
+  try {
+    const store = new SessionStore(sessionsDir(ws));
+    const rec = store.read(id);
+    if (!rec || rec.origin !== 'spec' || rec.forkKind !== 'main') return false;
+    if (store.lockInfo(id)?.live) return false;
+    if (!store.delete(id)) return false;
+    fs.rmSync(journalPath(store.dir, id), { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Every turn `s`'s record holds is in `keeper`'s record too (a fork carries its parent's turns, K1). */
+function recordHolds(keeper: KiroSession, s: KiroSession): boolean {
+  const own = s.record?.turns ?? [];
+  const kept = new Set((keeper.record?.turns ?? []).map((t) => t.userUuid));
+  return own.length > 0 && own.every((t) => kept.has(t.userUuid));
+}
+
+/**
+ * The trust a session that continues `prev` starts from (KiroSessionOptions.initialTrust): `prev`'s
+ * as the chat has it (`/tools untrust`, a revoked agent tool, `t` answers, other agents' trust),
+ * never the launch `--trust-tools` / agent allowedTools again.
+ */
+function trustOf(prev: KiroSession): KiroSessionOptions['initialTrust'] | undefined {
+  const t = prev.trust;
+  if (!t) return undefined;
+  return { trust: cloneTrust(t), ...(prev.agent?.name ? { agent: prev.agent.name } : {}) };
+}
+
+/**
+ * `to` gets back the chat while `from` (a task session, or a phase session whose flow hands no
+ * continuation over) was the chat's: the restrictions the user added in `from` apply to `to` too,
+ * through its public trust methods (KiroSession has no SessionTrust setter): trust-all turned off,
+ * a tool `from` no longer trusts or has revoked (`/tools untrust` typed at an approval prompt,
+ * `/tools reset`) untrusted, and plan mode turned on. Trust `from` gained (a `t` answer) is not
+ * copied back: only ever more restrictive than the user set. Per-tool trust only when both run the
+ * same agent (the flat fields are that agent's).
+ */
+function carryRestrictions(from: KiroSession, to: KiroSession): void {
+  if (from === to) return;
+  if (from.planMode && !to.planMode) to.planMode = true;
+  const f = from.trust;
+  const t = to.trust;
+  if (!f || !t) return;
+  if (t.trustAll && !f.trustAll) to.setTrustAll(false);
+  if (from.agent?.name !== to.agent?.name) return;
+  const kept = new Set(f.allowedTools ?? []);
+  const revokedHere = new Set(t.revokedTools ?? []);
+  const names = new Set<string>();
+  for (const n of t.allowedTools ?? []) if (!kept.has(n)) names.add(n);
+  for (const n of f.revokedTools ?? []) if (!revokedHere.has(n)) names.add(n);
+  if (names.size) to.untrustTools([...names]);
 }
 
 function phaseKey(p: SpecPhaseRestriction): string {
@@ -300,12 +421,10 @@ export class SpecSessionDriver {
   private replacedOriginal = false;
   /** A turn of this flow reached Claude in a session this driver created. */
   private reached = false;
-  /**
-   * The user turned plan mode on in a session this driver created while it was the chat's
-   * (Shift+Tab at a question of the flow, e.g. a checkpoint: the prompt showed `[plan]`). Phase
-   * sessions start without plan mode, so plan mode on one of them is the user's.
-   */
-  private planTurnedOn = false;
+  /** See {@link continuationCancelled} (r5 P1). */
+  private handOverCancelled = false;
+  /** The sessions this driver created that a turn of this flow reached, in order (T5). */
+  private readonly reachedSessions: KiroSession[] = [];
 
   constructor(
     private readonly port: SessionPort,
@@ -323,7 +442,7 @@ export class SpecSessionDriver {
       await s.setSpecPhase(phase);
       try {
         if (opts.signal?.aborted) return notSent();
-        return await this.port.run(s, input, opts);
+        return await this.port.run(s, withPlanNote(s, input, phase), opts);
       } finally {
         await s.setSpecPhase(undefined);
       }
@@ -344,18 +463,25 @@ export class SpecSessionDriver {
     if (opts.signal?.aborted) return notSent();
     const before = recordedTurns(s);
     try {
-      return await this.port.run(s, input, opts);
+      return await this.port.run(s, withPlanNote(s, input, phase), opts);
     } finally {
-      if (recordedTurns(s) > before) this.reached = true;
+      if (recordedTurns(s) > before) {
+        this.reached = true;
+        if (!this.reachedSessions.includes(s)) this.reachedSessions.push(s);
+      }
     }
   }
 
   /**
-   * A new session forking `prev`'s conversation, made active. `planMode`: it starts in plan mode
-   * (set before the host sees it).
+   * A new session forking `prev`'s conversation, made active. It starts with `prev`'s trust
+   * (KiroSessionOptions.initialTrust) and plan mode (`init.planMode` overrides that), set before the
+   * host sees it: the chat's as it is, never the launch flags again (a `/tools untrust`, a revoked
+   * agent tool, a `t` answer in an earlier phase session hold; the prompt shows the true plan mode).
    */
   private async fork(prev: KiroSession | undefined, extra: Partial<KiroSessionOptions>, init: { planMode?: boolean } = {}): Promise<KiroSession> {
     const o: Partial<KiroSessionOptions> = { ...extra };
+    const trust = prev && !o.initialTrust ? trustOf(prev) : undefined;
+    if (trust) o.initialTrust = trust;
     // never from a session without a transcript yet (its fork would start empty): from its source
     const p = forkPointOf(prev);
     // The parent RECORD (create({fork}) builds the fork's record from it: turns, journal, title,
@@ -368,11 +494,13 @@ export class SpecSessionDriver {
     const history = !!p && conversationHasHistory(prev);
     const next = await this.port.create(o);
     unwritten.set(next, { point: p, turns: recordedTurns(next), claudeSessionId: next.claudeSessionId, source: forkSourceKey(next), history });
-    if (init.planMode) next.planMode = true;
+    // a phase session of a plan-mode chat runs in plan mode too: the gate still lets it write the
+    // phase's own spec documents, nothing else (policy/gate.ts, T2)
+    const plan = init.planMode ?? prev?.planMode;
+    if (plan !== undefined && next.planMode !== plan) next.planMode = plan;
     if (prev && !this.created.has(prev) && this.original === undefined) this.original = prev;
     this.port.activate(next);
     if (prev && this.created.has(prev)) {
-      if (prev.planMode) this.planTurnedOn = true;
       this.created.delete(prev);
       await prev.close().catch(() => undefined);
     } else if (prev) {
@@ -386,43 +514,97 @@ export class SpecSessionDriver {
    * End of a flow. `keep`: when a restricted session is active, fork an unrestricted continuation
    * (keeps the spec conversation, 03 §1.7.2) from the last session a turn reached, and close the
    * restricted one and the replaced original; when no turn of the flow reached Claude the original
-   * stays (nothing to carry). The continuation takes the plan mode of the session it replaces (the
-   * phase sessions run without it: they write the spec documents; r4 #0), or plan mode when the
-   * user turned it on during the flow (in a phase session); so does an original the host gets
-   * back. Then, and for `close`, close every session this driver created, the host never left on
-   * one of them.
+   * stays (nothing to carry). The continuation takes the plan mode and trust of the session it
+   * replaces: the chat's as they are at the end of the flow (every phase session starts with those
+   * of the session it replaced, so a Shift+Tab or a `t` answer while one was the chat's carries on;
+   * r4 #0, T1/T2); an original the host gets back takes that plan mode and the restrictions the
+   * user added meanwhile (trust-all off, a `/tools untrust`: {@link carryRestrictions}; trust a
+   * phase session gained is not copied back: only ever more restrictive). Then, and for `close`, close every
+   * session this driver created, the host never left on one of them, and remove the records of
+   * the phase sessions a later session holds in full ({@link discardSuperseded}, T5).
+   * {@link continuationCancelled} tells whether the continuation's start was cancelled.
    */
   async finish(mode: 'keep' | 'close'): Promise<void> {
+    this.handOverCancelled = false;
     const active = this.port.active();
-    if (active && this.created.has(active) && active.planMode) this.planTurnedOn = true;
-    // never out of plan mode the chat was in, or that the user turned on during the flow (the
-    // prompt showed `[plan]`); a phase session in plan mode is the user's doing (they start without)
-    const planMode = this.original?.planMode === true || this.planTurnedOn;
+    // the plan mode the chat shows at the end of the flow (the prompt's `[plan]`): the session it
+    // is in, a phase session that started with the plan mode of the one it replaced
+    const shown = active && this.created.has(active) ? active : this.original;
+    const planMode = shown?.planMode === true;
     const giveBack = (s: KiroSession): void => {
-      if (planMode && !s.planMode) s.planMode = true;
+      // a revocation the user made while a phase session was the chat's (`/tools untrust` at its
+      // approval prompt) holds for the session the chat gets back; trust it gained does not
+      if (shown && shown !== s) carryRestrictions(shown, s);
+      if (s.planMode !== planMode) s.planMode = planMode;
       this.port.activate(s);
     };
+    let keeper: KiroSession | undefined;
     if (mode === 'keep' && active && this.restricted && this.restricted.session === active && (this.reached || !this.original)) {
       this.restricted = undefined;
       try {
         const next = await this.fork(active, { ...this.opts.finalOptions }, { planMode });
         this.created.delete(next); // handed over to the host
+        keeper = next;
         if (this.replacedOriginal && this.original) await this.original.close().catch(() => undefined);
-      } catch {
+      } catch (e) {
         // could not fork a continuation: give the host its original session back
         if (this.original) giveBack(this.original);
+        if (isSessionStartCancelled(e)) this.handOverCancelled = true;
       }
     } else if (active && this.created.has(active) && this.original) {
       giveBack(this.original);
     }
     for (const s of this.created) await s.close().catch(() => undefined);
     this.created.clear();
+    await this.discardSuperseded(keeper);
     this.restricted = undefined;
     this.original = undefined;
     this.replacedOriginal = false;
     this.reached = false;
-    this.planTurnedOn = false;
   }
+
+  /**
+   * The last {@link finish} could not hand the continuation over because its start was cancelled
+   * (a Ctrl+C while it ran its agentSpawn hooks: the command's press or, after one, the next press;
+   * r5 P1): the chat has its original session back, nothing half-started is current.
+   */
+  get continuationCancelled(): boolean {
+    return this.handOverCancelled;
+  }
+
+  /**
+   * T5: remove the saved records of this flow's phase sessions that a later session holds in full
+   * (each phase session forks the last one a turn reached, and its record carries that one's turns
+   * and journal, K1/S1): with a continuation (`keeper`, the user's chat) every one of them, else
+   * all but the last a turn reached, which keeps the spec conversation (the CLI's `close`; a
+   * continuation that could not be made). All are closed by now; their Claude transcripts stay (a
+   * pending fork of the keeper may start from one). The chat's own records are never touched.
+   */
+  private async discardSuperseded(keeper: KiroSession | undefined): Promise<void> {
+    const reached = this.reachedSessions.splice(0);
+    const discard = this.port.discard;
+    if (!discard) return;
+    const holder = keeper ?? reached.pop();
+    if (!holder) return;
+    for (const s of reached) {
+      if (s === holder || !recordHolds(holder, s)) continue;
+      try {
+        await discard.call(this.port, s);
+      } catch {
+        // best effort: a duplicate record is clutter, not harm
+      }
+    }
+  }
+}
+
+/**
+ * The phase turn's input, with the {@link specPlanModeBlock} when `s` is in plan mode: the
+ * `<kiro-plan-mode>` block every plan-mode turn carries says "do not write files", but the phase's
+ * spec documents may be written (the gate allows exactly those, T2).
+ */
+function withPlanNote(s: KiroSession, input: PromptInput, phase: SpecPhaseRestriction): PromptInput {
+  if (!s.planMode || phase.allowedWritePaths.length === 0) return input;
+  return { ...input, extraContext: [...(input.extraContext ?? []), specPlanModeBlock(phase.allowedWritePaths)] };
 }
 
 // ───────────────────────────── flow results ─────────────────────────────
@@ -1132,9 +1314,15 @@ async function executeTask(
         try {
           // A press during the hook kills it. One that already came (it interrupted the task) is
           // not passed on: the hook is meant to run with status `interrupted`, and an aborted
-          // signal would skip it before it starts. Such a hook cannot be cancelled (known gap:
-          // the REPL exposes no signal for a later press, only the command's, which stays aborted).
-          post = await hooks.runner.runTaskHook(signal?.aborted ? { ws: hctx.ws, sessionId: hctx.sessionId } : hctx, 'PostTaskExec', postInfo);
+          // signal would skip it before it starts. It runs under the host's NEXT press instead
+          // (REPL: nextPressSignal, r5 P1), so a press still kills it (also with timeout 0); a
+          // host without one (spec CLI) runs it without a signal.
+          const later = signal?.aborted ? rt.nextPressSignal?.() : undefined;
+          post = await hooks.runner.runTaskHook(
+            signal?.aborted ? { ws: hctx.ws, sessionId: hctx.sessionId, ...(later ? { signal: later } : {}) } : hctx,
+            'PostTaskExec',
+            postInfo,
+          );
         } catch (e) {
           rt.print(`⚠ PostTaskExec hooks for task ${t.id} failed: ${e instanceof Error ? e.message : String(e)}`);
         }
@@ -1221,6 +1409,14 @@ export async function runSpecTasks(rt: SpecRuntime, name: string, sel: TaskSelec
     notFound(rt, name);
     return { status: 'error', outcomes: [], remainingRequired: 0, message: `spec '${name}' not found` };
   }
+  const planRefusal = (): string => `${PLAN_MODE_RUN_REFUSED} Exit plan mode (/plan or Shift+Tab), then run ${rt.commandPrefix} run ${s.name} again.`;
+  if (rt.planMode) {
+    // Kiro's plan mode is the read-only planner (00 §2.5, 03 §5.4); a task session in it could
+    // implement nothing, and one without it would edit code the user asked not to touch (T3)
+    const msg = planRefusal();
+    rt.print(msg);
+    return { status: 'error', outcomes: [], remainingRequired: 0, message: msg };
+  }
   if (!s.docs.tasks.nonEmpty) {
     const msg = `Spec '${s.name}' has no tasks.md yet. Continue the spec with ${rt.commandPrefix} ${s.name}`;
     rt.print(msg);
@@ -1262,6 +1458,13 @@ export async function runSpecTasks(rt: SpecRuntime, name: string, sel: TaskSelec
       let idx = 0;
       const worker = async (): Promise<void> => {
         while (!stop && idx < tasks.length) {
+          if (rt.planMode) {
+            // the user turned plan mode on during the run (Shift+Tab while a task session was the
+            // chat's; it carries back to the chat): no further task starts (T3)
+            stop = true;
+            rt.print(planRefusal());
+            break;
+          }
           const t = tasks[idx++]!;
           let o: TaskOutcome;
           try {
@@ -1323,6 +1526,21 @@ function commandSignalOf(host: ReplHost): AbortSignal | undefined {
 }
 
 /**
+ * A signal the REPL's NEXT Ctrl+C aborts (repl/types.ts ReplContext.nextPressSignal, read
+ * duck-typed like {@link commandSignalOf}); undefined for hosts without it.
+ */
+function nextPressSignalOf(host: ReplHost): AbortSignal | undefined {
+  const f = (host as { nextPressSignal?: unknown }).nextPressSignal;
+  if (typeof f !== 'function') return undefined;
+  const s: unknown = f.call(host);
+  return s && typeof s === 'object' && typeof (s as AbortSignal).addEventListener === 'function' && 'aborted' in s ? (s as AbortSignal) : undefined;
+}
+
+/** What the REPL runtime prints when a Ctrl+C cancelled the start of a flow's continuation (r5 P1). */
+export const CONTINUATION_CANCELLED_NOTICE =
+  'Ctrl+C: the chat keeps its own conversation; the spec conversation was not carried over (the spec documents are saved).';
+
+/**
  * SpecRuntime over a ReplHost: questions through ask/confirm/choose, turns through runTurn (full
  * REPL rendering and y/n/t approvals), task sessions via host.createSession + replaceSession
  * (restored afterwards), one task at a time; the REPL command's Ctrl+C signal stops task runs,
@@ -1334,11 +1552,14 @@ export function createReplRuntime(host: ReplHost, deps: ReplRuntimeDeps = {}): S
    * Create a session under the command's Ctrl+C as its start signal (K3, session/startSignal.ts):
    * a press while it runs its agentSpawn hooks (which may never end with timeout 0) kills them and
    * cancels the start. Not a press an earlier step of the command handled (the signal stays
-   * aborted; it would cancel every later start at once).
+   * aborted; it would cancel every later start at once): after one, the start runs under the NEXT
+   * press (ReplContext.nextPressSignal, r5 P1), so a later phase session or the continuation that
+   * a hook keeps from starting is still cancelled by a press (G0 holds: only a new press cancels).
    */
   const createUnderPress = (o: Partial<KiroSessionOptions>): Promise<KiroSession> => {
     const sig = commandSignalOf(host);
-    return withStartSignal(sig && !sig.aborted ? sig : undefined, () => host.createSession(o));
+    const start = sig ? (sig.aborted ? nextPressSignalOf(host) : sig) : undefined;
+    return withStartSignal(start, () => host.createSession(o));
   };
   const port: SessionPort = {
     active: () => host.session,
@@ -1347,6 +1568,10 @@ export function createReplRuntime(host: ReplHost, deps: ReplRuntimeDeps = {}): S
     create: createUnderPress,
     activate: (s) => host.replaceSession(s),
     run: (_s, input) => host.runTurn(input),
+    // a phase record the continuation (or a later phase record) holds in full (T5)
+    discard: (s) => {
+      discardSpecRecord(host.ws, s.id);
+    },
   };
   const driver = new SpecSessionDriver(port, { phaseOptions: { origin: 'spec' }, finalOptions: {} });
   const factory = deps.hookRunnerFactory ?? ((hooks: readonly KiroHook[]) => new HookRunner([...hooks]));
@@ -1361,11 +1586,21 @@ export function createReplRuntime(host: ReplHost, deps: ReplRuntimeDeps = {}): S
     get signal() {
       return commandSignalOf(host);
     },
+    nextPressSignal: () => nextPressSignalOf(host),
+    get planMode() {
+      return host.session.planMode === true;
+    },
     print: (t) => host.print(t),
     ask: (q) => host.ask(q),
     confirm: (q, d) => host.confirm(q, d),
     choose: (q, o) => host.choose(q, o),
     runSpecTurn(input, phase, o) {
+      // T4 (backstop of the /spec command's own check): a phase session forked from a tangent and
+      // the continuation after it would replace the tangent; /tangent could not return to main
+      const cur = host.session;
+      if (cur.tangent !== undefined && !driver.openSessions.includes(cur) && !canSetSpecPhase(cur)) {
+        return Promise.resolve({ stopReason: 'error', isError: true, text: '', error: SPEC_IN_TANGENT_ERROR, permissionDenials: [] });
+      }
       // The command's Ctrl+C signal when this turn was requested and not aborted yet: a press while
       // the driver starts the turn's phase session (Claude Code spawning) cancels the turn before
       // it is sent. A press an earlier turn handled does not cancel the later ones.
@@ -1374,8 +1609,10 @@ export function createReplRuntime(host: ReplHost, deps: ReplRuntimeDeps = {}): S
     },
     async openTaskSession(): Promise<TaskSessionHandle> {
       const prev = host.session;
-      // created under the run's start signal (executeTask), the command's Ctrl+C by default
-      const child = await host.createSession({ origin: 'spec' });
+      // created under the run's start signal (executeTask), the command's Ctrl+C by default; with
+      // the chat's trust as it is (T1: never the launch --trust-tools / agent allowedTools again)
+      const trust = trustOf(prev);
+      const child = await host.createSession({ origin: 'spec', ...(trust ? { initialTrust: trust } : {}) });
       let closed = false;
       return {
         get sessionId() {
@@ -1386,6 +1623,10 @@ export function createReplRuntime(host: ReplHost, deps: ReplRuntimeDeps = {}): S
           try {
             return await host.runTurn(input);
           } finally {
+            // the task session was the chat's: a restriction the user added in it (Shift+Tab into
+            // plan mode, `/tools untrust` at its approval prompt) holds for the chat and so for
+            // the later tasks of the run (runSpecTasks stops at plan mode)
+            carryRestrictions(child, prev);
             host.replaceSession(prev);
           }
         },
@@ -1393,7 +1634,10 @@ export function createReplRuntime(host: ReplHost, deps: ReplRuntimeDeps = {}): S
         async close(): Promise<void> {
           if (closed) return;
           closed = true;
-          if (host.session === child) host.replaceSession(prev);
+          if (host.session === child) {
+            carryRestrictions(child, prev);
+            host.replaceSession(prev);
+          }
           await child.close();
         },
       };
@@ -1404,7 +1648,11 @@ export function createReplRuntime(host: ReplHost, deps: ReplRuntimeDeps = {}): S
       if (!hooks.some((h) => h.trigger === 'PreTaskExec' || h.trigger === 'PostTaskExec')) return undefined;
       return { runner: factory(hooks), sessionId: s.id };
     },
-    finish: () => driver.finish('keep'),
+    finish: async () => {
+      // a Ctrl+C cancelled the continuation's start: the chat is back in its own session (r5 P1)
+      await driver.finish('keep');
+      if (driver.continuationCancelled) host.print(CONTINUATION_CANCELLED_NOTICE);
+    },
   };
   if (editor) rt.openEditor = editor;
   return rt;

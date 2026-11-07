@@ -170,8 +170,10 @@ describe('crew start / status / open / stop (08 §3.8)', { skip: PY ? false : 'n
       const run = path.join(fe.cs, 'run');
       const ready = JSON.parse(fs.readFileSync(path.join(run, 'ready.json'), 'utf8'));
       // W1: the READY object plus who the gateway is (its pid outlives it): start time and boot;
-      // K7: and that it leads its own process group (setsid), where a crash leaves its children
-      const identity = process.platform === 'linux' ? { pid, startTime: procStart(pid), bootId: bootId(), pgid: pid } : { pid };
+      // K7: and that it leads its own process group (setsid), where a crash leaves its children;
+      // C1: and the HOME / KIROCREW_KIRO_BIN those children inherit (what tells them this crew's)
+      const env = { HOME: fe.home, KIROCREW_KIRO_BIN: path.join(fe.cs, 'bin', 'kiro-claude') };
+      const identity = process.platform === 'linux' ? { pid, startTime: procStart(pid), bootId: bootId(), pgid: pid, env } : { pid };
       assert.deepEqual(ready, { port, token: `tok-${pid}`, pid, home: kcHome(fe), kiroClaude: identity });
       assert.equal(fs.readFileSync(path.join(run, 'token'), 'utf8'), `tok-${pid}\n`);
       for (const f of ['ready.json', 'token', 'gateway.out', 'gateway.err']) assert.equal(fs.statSync(path.join(run, f)).mode & 0o777, 0o600, f);

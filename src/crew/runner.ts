@@ -99,7 +99,13 @@ export interface CrewSys {
    * Returns false when nothing was signalled (another process, gone, or not permitted).
    */
   kill(pid: number, signal: NodeJS.Signals, startTime: number | undefined): boolean;
-  /** Linux `/proc` scan; empty elsewhere. */
+  /**
+   * Linux `/proc` scan; empty elsewhere. There is deliberately no `ps` fallback (C2): what
+   * `crew stop` signals from this list (orphan agents, a gateway's tree, a crashed gateway's
+   * leftovers) is proven this crew's by each process's environment, which `ps` cannot give back
+   * unambiguously (macOS `ps -E` space-joins it onto the command line, for this user's processes
+   * only), and its start times are whole seconds; off Linux those steps signal nothing.
+   */
   listProcesses(): ProcessInfo[];
   /** {@link ProcessInfo.startTime} of `pid`; undefined when it does not exist or is unknown (not Linux). */
   startTime(pid: number): number | undefined;

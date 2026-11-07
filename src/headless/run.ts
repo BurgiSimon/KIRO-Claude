@@ -26,12 +26,25 @@
  * stdout); 3 MCP startup; 130 interrupted (Ctrl+C). Authentication failures print
  * `You are not logged in, please log in with <prog> login` (00 §2.1, Q `cli/mod.rs:145-150`).
  * Ctrl+C interrupts the turn (first press) or closes the session (second press).
+ *
+ * SIGHUP / SIGTERM during the run, and SIGINT / SIGHUP / SIGTERM while the session starts, close
+ * the session first (SessionEnd hooks, its record saved, its lock released; a start still running
+ * its agentSpawn hooks is cancelled through its start signal, leaving nothing; the children running
+ * at the signal still get it, and SIGKILL with their surviving group members after the lifecycle
+ * grace, r4 #11), bounded by
+ * repl/exitSignals.ts SIGNAL_CLOSE_GRACE_MS, then kiro-claude dies of the signal as the REPL does
+ * ({@link ExitSignals}, r5 P4). From the signal on nothing more is printed and no status is
+ * returned: the exit status is the signal's, as before (the lifecycle forwarder used to end the
+ * process at once, without the close). Not on Windows, and not with `installSignalHandlers: false`.
  */
 
 import type { CliContext, KiroSession, SessionEvent, SessionUI, TurnResult } from '../types.js';
 import { isAuthError } from '../claude/auth.js';
+import { shutdownTrackedChildren } from '../claude/lifecycle.js';
 import { loadCreateSession, type CreateSessionFn, type FrontEndSessionOptions } from '../cli/entries.js';
 import { readAll } from '../cli/io.js';
+import { ExitSignals } from '../repl/exitSignals.js';
+import { withStartSignal } from '../session/startSignal.js';
 import { classifyHeadlessInput, expandSkillForSession } from './local.js';
 import { JsonRenderer, TextRenderer, type HeadlessRenderer } from './render.js';
 
@@ -53,6 +66,11 @@ export interface RunHeadlessOptions {
   mcpStartupTimeoutMs?: number;
   /** Poll interval for `requireMcpStartup` (default 250 ms). */
   mcpPollMs?: number;
+  /**
+   * Handle SIGHUP / SIGTERM (and SIGINT during the start) by closing the session before dying of
+   * the signal (see module doc). Default true; embedders with their own handling pass false.
+   */
+  installSignalHandlers?: boolean;
 }
 
 /** Message for an authentication failure (00 §2.1). */
@@ -154,11 +172,40 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<number> {
   };
 
   let session: KiroSession | undefined;
+  // SIGHUP / SIGTERM, and SIGINT until the session is up: close it, then die of the signal (r5 P4).
+  // The children running at the signal (Claude Code, a hook command) still get the signal's
+  // SIGTERM and, after claude/lifecycle.ts's grace, SIGKILL with any member of their groups that
+  // survives it (r4 #11), as when the lifecycle forwarder handled the signal: the session is
+  // closed first (close() marks it closed at once, so nothing respawns Claude Code or sends the
+  // prompt), and its SessionEnd hooks, started after that, are not signalled.
+  const exits =
+    opts.installSignalHandlers !== false && process.platform !== 'win32'
+      ? new ExitSignals(async () => {
+          if (!session) return;
+          const closing = session.close();
+          await Promise.all([closing, shutdownTrackedChildren()]);
+        }, [ctx.stdin, ctx.stdout, ctx.stderr])
+      : undefined;
+  /** `p`'s outcome, unless a signal came in meanwhile: the session is closing, the signal ends the process. */
+  const held = async <T>(p: Promise<T>): Promise<T> => {
+    let v: T;
+    try {
+      v = await p;
+    } catch (e) {
+      if (exits?.received) await exits.die();
+      throw e;
+    }
+    if (exits?.received) await exits.die();
+    return v;
+  };
   try {
     const create = opts.createSession ?? (await loadCreateSession());
-    session = await create({ ...opts.sessionOptions, ws: ctx.ws, ui, interactive: false, origin: 'headless' });
+    // a signal while its agentSpawn hooks run cancels the start (startSignal.ts): nothing stays
+    session = await withStartSignal(exits?.startSignal, () => create({ ...opts.sessionOptions, ws: ctx.ws, ui, interactive: false, origin: 'headless' }));
     await session.start();
   } catch (e) {
+    if (exits?.received) return exits.die();
+    exits?.dispose();
     const msg = errText(e);
     // Session errors may carry their exit code (agent not found ⇒ 4, 01 §3).
     const code = typeof (e as { exitCode?: unknown }).exitCode === 'number' ? ((e as { exitCode: number }).exitCode) : 1;
@@ -174,6 +221,8 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<number> {
     if (session) await session.close().catch(() => undefined);
     return code;
   }
+  if (exits?.received) return exits.die();
+  exits?.ready();
 
   // Ctrl+C: first ⇒ interrupt the turn, second ⇒ close the session. Closed stdout ⇒ interrupt.
   // Closed stderr (tool lines, notices) ⇒ only diagnostics are lost: the turn goes on and its
@@ -212,7 +261,7 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<number> {
 
     if (opts.requireMcpStartup) {
       const timeout = opts.mcpStartupTimeoutMs ?? ctx.settings.getNumber('mcp.noInteractiveTimeout', 30_000);
-      const problem = await waitForMcpStartup(s, timeout, opts.mcpPollMs);
+      const problem = await held(waitForMcpStartup(s, timeout, opts.mcpPollMs));
       if (problem) {
         fatal(problem);
         if (localCommand) renderer.localFailed(localCommand, problem);
@@ -223,7 +272,7 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<number> {
     if (action.kind === 'session-local') {
       let text: string;
       try {
-        text = await action.run(s);
+        text = await held(action.run(s));
       } catch (e) {
         const message = `error: ${action.command}: ${errText(e)}`;
         fatal(message);
@@ -245,10 +294,10 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<number> {
 
     let result: TurnResult;
     try {
-      let step = await gen.next();
+      let step = await held(gen.next());
       while (!step.done) {
         renderer.event(step.value);
-        step = await gen.next();
+        step = await held(gen.next());
       }
       result = step.value;
     } catch (e) {
@@ -276,6 +325,9 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<number> {
     if (typeof stdoutEmitter.removeListener === 'function') stdoutEmitter.removeListener('error', onStdoutError);
     renderer.finish();
     await s.close().catch(() => undefined);
+    // a signal during the close: the signal ends the process, not a status
+    if (exits?.received) await exits.die();
+    exits?.dispose();
     // after close: SessionEnd hook warnings are written to stderr too
     if (typeof stderrEmitter.removeListener === 'function') stderrEmitter.removeListener('error', onStderrError);
   }

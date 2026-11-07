@@ -11,8 +11,9 @@
  *    record of origin `repl`) is the user's conversation and survives a quit; only a spec-phase
  *    copy (origin `spec`) is dropped as a duplicate. `resumeId()` names the record close() kept.
  *  - #10: a saved record with turns never forks the whole source: a last turn cancelled before
- *    any answer pins at its user line, a trailing compaction pins at the last turn (transferred
- *    copy, `/chat load` of an export without a transcript).
+ *    any answer pins at its user line, a trailing compaction pins where Claude resumes it (r5 S2;
+ *    here two turns: the last answer, which the compaction kept verbatim, VERIFIED 2.1.319)
+ *    (transferred copy, `/chat load` of an export without a transcript).
  */
 import { describe, it, before } from 'node:test';
 import assert from 'node:assert/strict';

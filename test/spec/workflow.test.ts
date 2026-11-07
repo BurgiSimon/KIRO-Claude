@@ -554,8 +554,14 @@ test('run: required tasks in plan order, fresh child session per task, [-] while
       ['x', ' ', ' ', 'x', 'x'],
     );
     assert.equal(r.remainingRequired, 0);
-    // one fresh session per task (no specPhase, no fork), each closed; REPL session restored
-    assert.deepEqual(host.created, [{ origin: 'spec' }, { origin: 'spec' }, { origin: 'spec' }]);
+    // one fresh session per task (no specPhase, no fork), each closed; REPL session restored; each
+    // starts from the chat's trust (r5 T1: never the launch --trust-tools again)
+    const chatTrust = { trust: { trustAll: false, allowedTools: [], rules: [] }, agent: 'kiro_default' };
+    assert.deepEqual(host.created, [
+      { origin: 'spec', initialTrust: chatTrust },
+      { origin: 'spec', initialTrust: chatTrust },
+      { origin: 'spec', initialTrust: chatTrust },
+    ]);
     assert.ok(host.sessions.slice(1).every((s) => s.closed && s.prompts.length === 1));
     assert.equal(host.session, original);
     const p = host.sessions[1]!.prompts[0]!;

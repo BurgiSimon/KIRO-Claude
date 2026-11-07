@@ -12,7 +12,9 @@
  *  2. Hard rules: tools kiro-claude never exposes ⇒ deny; Kiro-scope invariants (invariants.ts,
  *     incl. `.kiroignore`) deny ⇒ `Kiro does not allow this operation: <path>`; plan mode +
  *     mutating call ⇒ `Plan mode is read-only. Exit plan mode (/plan or Shift+Tab) to make
- *     changes.`; agent `tools` selection (P1 enforcement of `@srv/tool` partial selections,
+ *     changes.` (except, in a spec phase, an `fs_write` of only that phase's allowed paths: the
+ *     phase sessions of a plan-mode chat run in plan mode and still write their documents); agent
+ *     `tools` selection (P1 enforcement of `@srv/tool` partial selections,
  *     excluded MCP tools, `subagent/<name>` lists) ⇒ deny; spec phase: an `fs_write` outside
  *     the phase's allowed paths ⇒ `Spec phase <name>: only <paths> may be written now`, one
  *     inside them is auto-allowed unless policy denies (03 §1.11.3).
@@ -53,6 +55,7 @@ import type {
   PermissionResult,
 } from '../claude/protocol.js';
 import type {
+  AgentTrust,
   ApprovalRequest,
   ApprovalResponse,
   GateDecision,
@@ -149,6 +152,39 @@ function unrevoke(t: SessionTrust, name: string): void {
   if (!t.revokedTools?.length) return;
   const norm = normalizeV2Name(name);
   t.revokedTools = t.revokedTools.filter((x) => x !== name && x !== norm);
+}
+
+function cloneRule(r: PermissionRule): PermissionRule {
+  const c: PermissionRule = { ...r };
+  if (r.match) c.match = [...r.match];
+  if (r.exclude) c.exclude = [...r.exclude];
+  return c;
+}
+
+/**
+ * A deep copy of session trust (KiroSessionOptions.initialTrust: a session that continues a chat
+ * starts with the chat's trust as it is): trust-all, per-tool trust, V3 session rules,
+ * `/tools untrust` revocations and the other agents' trust. Nothing is shared with `t`, so a
+ * later `t` / `/tools` change in either session does not reach the other.
+ */
+export function cloneTrust(t: SessionTrust): SessionTrust {
+  const out: SessionTrust = {
+    trustAll: t.trustAll === true,
+    allowedTools: [...(t.allowedTools ?? [])],
+    rules: (t.rules ?? []).map(cloneRule),
+  };
+  if (t.revokedTools?.length) out.revokedTools = [...t.revokedTools];
+  if (t.byAgent) {
+    const by: Record<string, AgentTrust> = {};
+    for (const [name, a] of Object.entries(t.byAgent)) {
+      const e: AgentTrust = { allowedTools: [...(a.allowedTools ?? [])], rules: (a.rules ?? []).map(cloneRule) };
+      if (a.revokedTools?.length) e.revokedTools = [...a.revokedTools];
+      // agent names come from config files: never let one become a prototype key
+      Object.defineProperty(by, name, { value: e, enumerable: true, writable: true, configurable: true });
+    }
+    if (Object.keys(by).length) out.byAgent = by;
+  }
+  return out;
 }
 
 // ───────────────────────────── deps ─────────────────────────────
@@ -708,7 +744,10 @@ export class Gate {
     const ws = this.deps.ws;
     const inv = checkInvariants(call, ws, this.deps.isIgnored ? { isIgnored: (p) => this.deps.isIgnored!(p) } : undefined);
     if (inv?.effect === 'deny') return { kind: 'deny', reason: inv.reason, reasons: [inv.reason] };
-    if (this.deps.planMode() && call.mutating) return { kind: 'deny', reason: PLAN_MODE_DENY, reasons: [PLAN_MODE_DENY] };
+    // plan mode denies every mutating call. The one exception is a spec phase of a plan-mode chat
+    // (its phase sessions take the chat's plan mode, SpecSessionDriver): a write of that phase's own
+    // documents, every path named and allowed, goes on to the spec-phase rule below (T2)
+    if (this.deps.planMode() && call.mutating && !this.isSpecPhaseWrite(call)) return { kind: 'deny', reason: PLAN_MODE_DENY, reasons: [PLAN_MODE_DENY] };
     const sel = this.selectionDenial(call);
     if (sel) return { kind: 'deny', reason: sel, reasons: [sel] };
     let specAllowed = false;
@@ -736,6 +775,12 @@ export class Gate {
       reasons = [inv.reason, ...(verdict.kind === 'ask' ? verdict.reasons : [])];
     }
     return { kind, reasons };
+  }
+
+  /** `call` writes only files the current spec phase allows (and names at least one). */
+  private isSpecPhaseWrite(call: KiroToolCall): boolean {
+    const phase = this.deps.specPhase();
+    return !!phase && call.capability === 'fs_write' && !call.mcp && call.subjects.length > 0 && phase.allowedWritePaths.length > 0 && this.specAllows(call, phase.allowedWritePaths);
   }
 
   private specAllows(call: KiroToolCall, allowedWritePaths: string[]): boolean {
