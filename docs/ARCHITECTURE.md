@@ -114,8 +114,26 @@ tasks). Approval is a menu choice; the model never moves on by itself.
   resolves to nothing, nor a path with `..` right after a link; and the document's real path must
   stay inside the workspace. A `.kiro`, `.kiro/specs` or feature folder that is a symbolic link
   resolving inside the workspace keeps working. A refused write gets the spec-phase denial with
-  the reason in parentheses, in plan mode too. kiro-claude's own reads of the documents and its
-  `tasks.md` box updates still follow such a link (known gap).
+  the reason in parentheses, in plan mode too. kiro-claude's own reads and writes of spec files
+  follow the same rules (`spec/docfs.ts`): the listing and status, `view`, the task context, a
+  `#spec:<name>` reference in chat (each refused document or folder is a notice instead), the
+  `tasks.md` repair after a turn, the box updates of a run and `.config.kiro` never go through a
+  link at a document, through a link above it that resolves to nothing, or outside the workspace
+  (reads use `O_NOFOLLOW`; writes rename over the path itself, never a link's target). Such a
+  document is marked `refused` with the reason: `list` and `status` show the phase `refused` and
+  say why, `view` prints the reason instead of the text, and it is never drafted over as if it
+  were missing. Its checkpoint offers no Approve and `approve` refuses it (a headless flow ends
+  with an error there); a revision turn still runs and the gate denies its write. The same holds
+  for every phase of a spec with any refused file, also an input document (`requirements.md`
+  under review of the design) or `.config.kiro` (the spec's type and workflow are then unknown):
+  each checkpoint names every reason and offers no Approve, and no phase is drafted from it.
+  `run` and `sync` (whose turn also builds on requirements and design) of a spec with a refused
+  file, `analyze` with a refused requirements document, and `new` under a `.kiro/specs` that is
+  linked out of the workspace (or dangling) are refused with the reason. Such a `.kiro/specs` is
+  not enumerated either: `list` and `status` print why instead. A task whose spec file becomes a
+  link during the run (before it starts, or while its session starts) fails with the reason, and
+  the link's target is left alone. A link swapped into a folder between the check and the I/O is
+  not ruled out (the same window as the gate's).
 * **Tangents.** A spec command that runs spec turns (`/spec new`, `approve`, `revise`, `analyze`,
   `sync`, and resuming a spec that still has a document to draft or review) is refused inside a
   tangent: the continuation it hands over would replace the tangent, and `/tangent` could no
@@ -190,6 +208,23 @@ journal); Claude Code keeps its own transcript, which kiro-claude resumes and fo
   Code's reason (`No messages to compact`, `Not enough messages to compact.`) and prints no
   success line. Over ACP, `commands/execute compact` answers `{success:false}` with that reason
   and the compaction status is `failed`.
+* **A compaction that does not compact.** Claude Code reports one it started and did not finish
+  (refused, failed, interrupted) as a failed status with a reason and no boundary, also for an
+  automatic compaction inside a prompt turn, after which the turn goes on. The session publishes
+  the end of every compaction it reported started: `finished`, or `compaction_failed` with
+  Claude's reason. One Claude never ends is ended at Claude's next output (Claude streams nothing
+  while it compacts), so its end comes before the answer, or when the turn ends. The chat closes
+  `Summarizing the conversation history...` with one plain line, `Compaction failed: <reason>`
+  (`Compaction cancelled.` after Ctrl+C), and the answer follows; a refused `/compact` prints
+  Claude's reason once as a plain line, not `Kiro is having trouble responding right now`. Over
+  ACP the automatic compaction's `_kiro.dev/compaction/status` `started` gets a `failed` end with
+  the reason in `summary` and `reason`, sent just before the turn's next frame or before the
+  prompt response when nothing follows, and the prompt answers what Claude answered. KiroCrew
+  then neither waits for an end nor ends a turn that is still running: it reads a `failed` inside
+  a turn as the start of a 60 s post-failure budget and gives up on the turn only after 60 s
+  with no frame, so the frame goes out with the one that ends Claude's silence after the
+  failure (a steer's queued or cleared answer does not end it). Its dashboard drops the text
+  streamed before a compaction terminal, which is why the end never follows the answer.
 
 ## Ctrl+C and signals
 

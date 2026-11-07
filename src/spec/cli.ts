@@ -20,6 +20,14 @@
  * warnings go to stderr; assistant text and results (list, status, findings, run summary) to
  * stdout (00 §2.5 "Headless output"). Exit codes: 0 ok, 1 failure/stopped run, 2 usage error.
  *
+ * Spec files are read and written through spec/docfs.ts (review X1): a document (or
+ * `.config.kiro`) that is a symbolic link, not a regular file, behind a link that resolves to
+ * nothing or outside the workspace is never read or written. `list` / `status` show such a spec
+ * with the phase `refused` and print why on stderr; `status <name>` marks the document and says
+ * why; `view` of it is an error (exit 1); `new`, `run`, `sync`, `analyze` and `approve` refuse
+ * with the reason (spec/workflow.ts). A `.kiro/specs` linked out of the workspace is not
+ * enumerated: `list` and `status` without a name are an error with the reason (exit 1).
+ *
  * Ctrl+C during `spec run`: the first press stops scheduling and interrupts the running tasks.
  * The PostTaskExec hooks of a task it interrupted run under the NEXT press, as in the REPL
  * (SpecRuntime.nextPressSignal, {@link NextPress}): the second press kills them with their process
@@ -51,7 +59,8 @@ import { allHooksFor } from '../config/hooks.js';
 import { loadAgents, selectAgent } from '../config/agents.js';
 import { HookRunner } from '../hooks/runner.js';
 import { SPEC_DOC_FILES, type SpecDocKind, type TaskSelection, type WorkflowType } from './model.js';
-import { formatSpecList, formatSpecStatus, isValidSpecName, listSpecs, loadSpec, normalizeSpecName, specSummaryJson } from './store.js';
+import { formatSpecList, formatSpecRefusals, formatSpecStatus, isValidSpecName, listSpecs, loadSpec, normalizeSpecName, specSummaryJson, specsDirRefused } from './store.js';
+import { specRefusalText } from './docfs.js';
 import {
   SpecSessionDriver,
   discardSpecRecord,
@@ -569,18 +578,32 @@ export async function runSpecCommandWith(args: string[], ctx: CliContext, deps: 
     switch (sub) {
       case 'list':
       case 'ls': {
+        // a .kiro/specs linked out of the workspace (docfs) is not listed: its entries are another folder's
+        const dirWhy = specsDirRefused(ctx.ws);
+        if (dirWhy) {
+          ctx.stderr.write(`error: ${specRefusalText(dirWhy)}\n`);
+          return 1;
+        }
         const all = listSpecs(ctx.ws);
         if (format !== 'plain') ctx.stdout.write(`${json(all.map(specSummaryJson))}\n`);
         else if (all.length === 0) ctx.stderr.write(`No specs found in ${ctx.ws.workspaceRoot}/.kiro/specs. Create one with: ${ctx.progName} spec new <name>\n`);
         else ctx.stdout.write(`${formatSpecList(all)}\n`);
+        // a spec with files kiro-claude does not read (phase `refused`, docfs): why, as a warning
+        for (const l of formatSpecRefusals(all)) ctx.stderr.write(`${l}\n`);
         return 0;
       }
       case 'status': {
         if (!pos[0]) {
+          const dirWhy = specsDirRefused(ctx.ws);
+          if (dirWhy) {
+            ctx.stderr.write(`error: ${specRefusalText(dirWhy)}\n`);
+            return 1;
+          }
           const all = listSpecs(ctx.ws);
           if (format !== 'plain') ctx.stdout.write(`${json(all.map(specSummaryJson))}\n`);
           else if (all.length === 0) ctx.stderr.write(`No specs found in ${ctx.ws.workspaceRoot}/.kiro/specs. Create one with: ${ctx.progName} spec new <name>\n`);
           else ctx.stdout.write(`${formatSpecList(all)}\n`);
+          for (const l of formatSpecRefusals(all)) ctx.stderr.write(`${l}\n`);
           return 0;
         }
         const spec = loadSpec(ctx.ws, pos[0]);
@@ -615,6 +638,12 @@ export async function runSpecCommandWith(args: string[], ctx: CliContext, deps: 
         }
         if (doc === 'requirements' && spec.specType === 'bugfix') doc = 'bugfix';
         doc ??= spec.awaitingApproval ?? [...spec.order].reverse().find((k) => spec.docs[k].nonEmpty);
+        // a document kiro-claude does not read (a symbolic link, …: docfs) is never printed
+        const refused = spec.docs[doc ?? spec.order[0]!].refused;
+        if (refused) {
+          ctx.stderr.write(`error: ${specRefusalText(refused)}\n`);
+          return 1;
+        }
         if (!doc || spec.texts[doc] === undefined || !spec.docs[doc].nonEmpty) {
           ctx.stderr.write(`error: ${SPEC_DOC_FILES[doc ?? spec.order[0]!]} has not been written yet\n`);
           return 1;

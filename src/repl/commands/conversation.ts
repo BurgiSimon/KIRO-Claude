@@ -4,7 +4,8 @@
  * (01 §5.11, 06 §6.4 Classic strings; V3 errors), /rewind [N] (00 §2.5, §8 C25: it names the
  * saved record that keeps the original conversation). /compact prints its success line only for
  * a compaction Claude made: a failed one (Claude's "No messages to compact", "Not enough messages
- * to compact.") is the turn's error.
+ * to compact.") is the turn's error, which the renderer prints as Claude's reason on one plain
+ * line (after `Compaction failed: …` closed a started compaction, it is not repeated; r5x X2).
  */
 
 import { SessionStore, sessionsDir } from '../../session/store.js';

@@ -11,7 +11,10 @@
  *    needed. Used for settings, the session index (00 §7 "Atomic writes (temp + rename)") and
  *    any file another process may read concurrently. When no mode is given, an existing
  *    target's permission bits are preserved. A symlinked target is written through (the
- *    link survives; see {@link resolveWriteTarget}).
+ *    link survives; see {@link resolveWriteTarget}), unless `followLinks: false` is passed:
+ *    then the rename replaces the path itself (a link there is replaced, its target untouched).
+ *  - {@link readRegularFileNoFollow} reads a regular file without following a symbolic link at
+ *    the path itself (O_NOFOLLOW), for files whose links must not be followed (spec documents).
  */
 
 import * as fs from 'node:fs';
@@ -61,6 +64,37 @@ export function readTextIfExists(p: string): string | undefined {
     const code = errCode(e);
     if (code === 'ENOENT' || code === 'ENOTDIR' || code === 'EISDIR') return undefined;
     throw e;
+  }
+}
+
+/**
+ * Read `p` as UTF-8 only when it is a regular file, never through a symbolic link AT `p`: it is
+ * opened with O_NOFOLLOW (and O_NONBLOCK, so a FIFO cannot block) and checked with fstat on the
+ * open descriptor, so a link swapped in after a caller's lstat is not followed either. Links in
+ * its folders are followed. `undefined` when it does not exist (`ENOENT`, `ENOTDIR`). Throws
+ * `ELOOP` when `p` is a symbolic link, `EFTYPE` when it is not a regular file, and other errors
+ * (e.g. `EACCES`) as they are. Where the platform has no O_NOFOLLOW (Windows) an lstat check
+ * before the open stands in for it.
+ */
+export function readRegularFileNoFollow(p: string): string | undefined {
+  const c = fs.constants;
+  const noFollow = c.O_NOFOLLOW ?? 0;
+  let fd: number;
+  try {
+    if (!noFollow && fs.lstatSync(p).isSymbolicLink()) {
+      throw Object.assign(new Error(`ELOOP: too many symbolic links encountered, open '${p}'`), { code: 'ELOOP', path: p });
+    }
+    fd = fs.openSync(p, c.O_RDONLY | noFollow | (c.O_NONBLOCK ?? 0));
+  } catch (e) {
+    const code = errCode(e);
+    if (code === 'ENOENT' || code === 'ENOTDIR') return undefined;
+    throw e;
+  }
+  try {
+    if (!fs.fstatSync(fd).isFile()) throw Object.assign(new Error(`EFTYPE: not a regular file, open '${p}'`), { code: 'EFTYPE', path: p });
+    return fs.readFileSync(fd, 'utf8');
+  } finally {
+    fs.closeSync(fd);
   }
 }
 
@@ -371,16 +405,20 @@ export function resolveWriteTarget(p: string): string {
  * Parent directories are created. `opts.mode` sets the exact permission bits of the result;
  * without it an existing file's bits are kept (new files get the default 0666 & ~umask).
  * If `p` is a symbolic link, the file it points to is replaced and the link is kept
- * (dotfile setups often symlink `~/.kiro/settings/*.json`).
+ * (dotfile setups often symlink `~/.kiro/settings/*.json`). With `opts.followLinks: false` a
+ * link at `p` is never followed: the rename replaces `p` itself (the link, not its target), and
+ * only a regular file's permission bits are kept. Links in `p`'s folders are followed either way.
  */
-export function writeFileAtomic(p: string, data: string | Uint8Array, opts: { mode?: number } = {}): void {
-  const target = resolveWriteTarget(p);
+export function writeFileAtomic(p: string, data: string | Uint8Array, opts: { mode?: number; followLinks?: boolean } = {}): void {
+  const follow = opts.followLinks !== false;
+  const target = follow ? resolveWriteTarget(p) : path.resolve(p);
   const dir = path.dirname(target);
   mkdirp(dir);
   let mode = opts.mode;
   if (mode === undefined) {
     try {
-      mode = fs.statSync(target).mode & 0o7777;
+      const st = follow ? fs.statSync(target) : fs.lstatSync(target);
+      mode = follow || st.isFile() ? st.mode & 0o7777 : undefined;
     } catch {
       mode = undefined;
     }

@@ -63,6 +63,21 @@
  *    a second Ctrl+C kills it. Likewise the REPL runtime starts a phase session or the
  *    continuation that comes after a press under the next press (r5 P1); a cancelled
  *    continuation start gives the chat its own session back with a notice.
+ *  - Spec files are read and written only through spec/docfs.ts (review X1): a document that is a
+ *    symbolic link, not a regular file, behind a link that resolves to nothing, or outside the
+ *    workspace is never read or written by the workflow itself (the tasks.md repair, box updates,
+ *    re-lint, sync diff, task context). Such a "refused" document is never drafted (`✗ Cannot
+ *    draft …`); its checkpoint names the reason and offers no Approve (headless: the flow ends with
+ *    an error); a revision turn still runs (the gate denies its write through the link, with the
+ *    reason). The same holds for every phase of a spec with ANY refused file (an input document
+ *    such as requirements.md, or `.config.kiro`, whose type and workflow kiro-claude then does
+ *    not know): no phase is drafted from it, every checkpoint names each reason and offers no
+ *    Approve, and `approve` refuses. `analyze` with a refused phase-1 document (the one file it
+ *    reads), and `sync` (it builds on requirements and design too) and `run` of a spec with any
+ *    refused file are refused before any turn; a
+ *    task fails with the reason when a spec file became refused during the run (before its box
+ *    is touched, or while its session started, so its context never silently lacks a document;
+ *    a box that cannot be ticked fails it too, and the target is left alone).
  *
  * The workflow talks to its host only through {@link SpecRuntime}; {@link createReplRuntime}
  * adapts a ReplHost (slash commands) and spec/cli.ts builds a headless one.
@@ -88,8 +103,8 @@ import { cloneTrust } from '../policy/gate.js';
 import { journalPath } from '../session/kiroFiles.js';
 import { isSessionStartCancelled, withStartSignal } from '../session/startSignal.js';
 import { SessionStore, sessionsDir } from '../session/store.js';
-import { writeFileAtomic } from '../util/fsx.js';
 import { shlexSplit } from '../util/shlex.js';
+import { SpecFileRefusedError, readSpecFile, specRefusalText, writeSpecFile } from './docfs.js';
 import {
   SPEC_DOC_FILES,
   formatTaskLine,
@@ -137,6 +152,7 @@ import {
   resolveSpecDir,
   specContextBlock,
   specDocPath,
+  specRefusals,
   summarizeSpecDir,
   type LoadedSpec,
   type SpecSummary,
@@ -200,9 +216,10 @@ export interface SpecRuntime {
    */
   readonly signal?: AbortSignal | undefined;
   /**
-   * A signal the host's NEXT Ctrl+C aborts (REPL: ReplContext.nextPressSignal), for work that runs
-   * after {@link signal} fired and stays aborted: the PostTaskExec hooks of an interrupted task.
-   * Absent (spec CLI): such work runs without a signal.
+   * A signal the host's NEXT Ctrl+C aborts (REPL: ReplContext.nextPressSignal; spec CLI: its
+   * NextPress, spec/cli.ts), for work that runs after {@link signal} fired and stays aborted: the
+   * PostTaskExec hooks of an interrupted task. Absent (the spec CLI's other commands, which run
+   * no tasks; test runtimes): such work runs without a signal.
    */
   nextPressSignal?(): AbortSignal | undefined;
   /**
@@ -652,6 +669,23 @@ interface FlowCtx {
   autoApprove: boolean;
   quick: boolean;
   trace: FlowTransition[];
+  /** The refusal {@link reportDoc} just printed (the checkpoint after it does not repeat it). */
+  reported?: string | undefined;
+}
+
+/** Why kiro-claude does not read or write document `doc` of the spec folder `dir` (docfs), else undefined. */
+function docRefusal(dir: string, doc: SpecDocKind): string | undefined {
+  return summarizeSpecDir(dir).docs[doc].refused;
+}
+
+/**
+ * The first reason kiro-claude does not read some file of the spec folder `dir` (its folder,
+ * `.config.kiro`, any document: docfs), else undefined. A phase is never drafted then: its
+ * prompt has the model build on the other documents (and the spec's type and workflow come from
+ * `.config.kiro`), which kiro-claude could not vouch for.
+ */
+function specRefusal(dir: string): string | undefined {
+  return summarizeSpecDir(dir).refused;
 }
 
 function out(rt: SpecRuntime, text: string): void {
@@ -733,29 +767,42 @@ function errorResult(name: string, message: string): FlowResult {
 
 // ───────────────────────────── phases ─────────────────────────────
 
-/** Normalize tasks.md after a turn that may have written it (03 §1.6.6). */
+/**
+ * Normalize tasks.md after a turn that may have written it (03 §1.6.6). A refused tasks.md (a
+ * symbolic link, …: docfs) is neither read nor written; the reason is printed.
+ */
 function repairTasks(rt: SpecRuntime, dir: string): void {
   const file = specDocPath(dir, 'tasks');
-  let text: string;
+  let text: string | undefined;
   try {
-    text = fs.readFileSync(file, 'utf8');
-  } catch {
+    text = readSpecFile(file);
+  } catch (e) {
+    if (e instanceof SpecFileRefusedError) rt.print(`⚠ tasks.md was not repaired: ${e.message}`);
     return;
   }
+  if (text === undefined) return;
   const n = normalizeTasksText(text);
   if (n.changedLines > 0 && n.text !== text) {
     try {
-      writeFileAtomic(file, n.text);
+      writeSpecFile(file, n.text);
       rt.print(repairMessage('tasks.md', n.changedLines));
-    } catch {
+    } catch (e) {
       // leave it
+      if (e instanceof SpecFileRefusedError) rt.print(`⚠ tasks.md was not repaired: ${e.message}`);
     }
   }
 }
 
+/** The document has content kiro-claude may read (false for a refused one). */
 function docReady(c: FlowCtx, doc: SpecDocKind): boolean {
   const s = summarizeSpecDir(c.dir);
   return s.docs[doc].nonEmpty;
+}
+
+/** Why the flow cannot go on with `doc` that is not ready: its refusal, else "<file> was not written". */
+function notWritten(c: FlowCtx, doc: SpecDocKind): string {
+  const why = docRefusal(c.dir, doc);
+  return why ? specRefusalText(why) : `${SPEC_DOC_FILES[doc]} was not written`;
 }
 
 async function draftPhase(c: FlowCtx, doc: SpecDocKind): Promise<string | undefined> {
@@ -770,6 +817,12 @@ async function draftPhase(c: FlowCtx, doc: SpecDocKind): Promise<string | undefi
 
 function reportDoc(c: FlowCtx, doc: SpecDocKind): void {
   const file = SPEC_DOC_FILES[doc];
+  const why = docRefusal(c.dir, doc);
+  if (why) {
+    c.rt.print(`⚠ ${specRefusalText(why)}`);
+    c.reported = why;
+    return;
+  }
   if (!docReady(c, doc)) {
     c.rt.print(`⚠ ${file} was not written (expected at ${specDocPath(c.dir, doc)}).`);
     return;
@@ -781,13 +834,19 @@ function reportDoc(c: FlowCtx, doc: SpecDocKind): void {
 type CheckpointDecision = { kind: 'approve' } | { kind: 'revise'; feedback: string } | { kind: 'analyze' } | { kind: 'editor' } | { kind: 'stop' };
 
 async function checkpoint(c: FlowCtx, doc: SpecDocKind, next: SpecDocKind | undefined): Promise<CheckpointDecision> {
+  // a refused document (docfs) is not ready: no Approve, Analyze or $EDITOR; the reason is shown.
+  // Any other refused file of the spec (an input document, `.config.kiro`) is named too and
+  // withholds Approve: the next phase would be drafted from it.
   const exists = docReady(c, doc);
+  const whys = specRefusals(summarizeSpecDir(c.dir));
   if (!c.rt.interactive) {
-    if (c.autoApprove && exists) return { kind: 'approve' };
+    if (c.autoApprove && exists && whys.length === 0) return { kind: 'approve' };
     return { kind: 'stop' };
   }
+  for (const why of whys) if (c.reported !== why) c.rt.print(`⚠ ${specRefusalText(why)}`);
+  c.reported = undefined;
   const options: { label: string; d: CheckpointDecision['kind'] }[] = [];
-  if (exists) options.push({ label: approveLabel(doc, next), d: 'approve' });
+  if (exists && whys.length === 0) options.push({ label: approveLabel(doc, next), d: 'approve' });
   options.push({ label: 'Request changes…', d: 'revise' });
   if (exists && (doc === 'requirements' || doc === 'bugfix')) options.push({ label: 'Analyze requirements', d: 'analyze' });
   if (exists && c.rt.openEditor) options.push({ label: 'Open in $EDITOR', d: 'editor' });
@@ -813,6 +872,8 @@ function readyHint(c: FlowCtx): string {
 function onReady(c: FlowCtx): void {
   const spec = loadSpecDir(c.dir);
   for (const i of spec.lint) c.rt.print(`⚠ ${i.message}`);
+  // a refused file (docfs): `run` will refuse the spec, say why now
+  for (const why of specRefusals(spec)) c.rt.print(`⚠ ${specRefusalText(why)}`);
   c.rt.print(readyHint(c));
 }
 
@@ -825,6 +886,15 @@ async function phaseLoop(c: FlowCtx, start: SpecDocKind, draft: boolean): Promis
   let mustDraft = draft;
   for (let guard = 0; guard < 1000; guard++) {
     if (mustDraft) {
+      // never draft over a document kiro-claude does not read (a symbolic link, …: docfs), nor
+      // from a spec with any other such file ({@link specRefusal})
+      const now = summarizeSpecDir(c.dir);
+      const refused = now.docs[doc].refused ?? now.refused;
+      if (refused) {
+        c.trace.push({ state: 'error', doc });
+        c.rt.print(`✗ Cannot draft ${SPEC_DOC_FILES[doc]}: ${specRefusalText(refused)}`);
+        return result(c, 'error', { awaiting: doc, message: refused });
+      }
       const fail = await draftPhase(c, doc);
       if (fail) {
         c.trace.push({ state: 'error', doc });
@@ -835,18 +905,26 @@ async function phaseLoop(c: FlowCtx, start: SpecDocKind, draft: boolean): Promis
       // write its document is a failure (exit 1), not a document "waiting for review".
       if (!c.rt.interactive && !docReady(c, doc)) {
         c.trace.push({ state: 'error', doc });
-        return result(c, 'error', { awaiting: doc, message: `${SPEC_DOC_FILES[doc]} was not written` });
+        return result(c, 'error', { awaiting: doc, message: notWritten(c, doc) });
       }
     }
     const next = nextDoc(c.order, doc);
     if (c.quick && next) {
       if (!docReady(c, doc)) {
         c.trace.push({ state: 'error', doc });
-        return result(c, 'error', { awaiting: doc, message: `${SPEC_DOC_FILES[doc]} was not written` });
+        return result(c, 'error', { awaiting: doc, message: notWritten(c, doc) });
       }
       doc = next;
       mustDraft = true;
       continue;
+    }
+    // Headless: a document kiro-claude does not read cannot be reviewed or approved (exit 1),
+    // nor one of a spec with any other such file
+    const refused = c.rt.interactive ? undefined : (docRefusal(c.dir, doc) ?? specRefusal(c.dir));
+    if (refused) {
+      c.trace.push({ state: 'error', doc });
+      if (c.reported !== refused) c.rt.print(`✗ ${specRefusalText(refused)}`);
+      return result(c, 'error', { awaiting: doc, message: refused });
     }
     c.trace.push({ state: 'review', doc });
     const d = await checkpoint(c, doc, next);
@@ -992,6 +1070,15 @@ export async function resumeSpec(rt: SpecRuntime, name: string, opts: ResumeOpti
       const c = flowCtx(rt, s, { autoApprove: opts.autoApprove === true });
       return phaseLoop(c, s.awaitingApproval, false);
     }
+    // a first document kiro-claude does not read (its folder linked out of the workspace, …), or
+    // a spec with any other such file (`.config.kiro`: its type and workflow are unknown), is
+    // never drafted: say so before asking what the spec covers
+    const refused = s.docs[s.order[0]!].refused ?? s.refused;
+    if (refused) {
+      const msg = `✗ Cannot draft ${SPEC_DOC_FILES[s.order[0]!]}: ${specRefusalText(refused)}`;
+      rt.print(msg);
+      return errorResult(s.name, refused);
+    }
     let desc = opts.description ?? '';
     if (!desc && rt.interactive) desc = (await rt.ask(`What should the spec "${s.name}" cover?`)).trim();
     if (!desc) {
@@ -1007,7 +1094,10 @@ export async function resumeSpec(rt: SpecRuntime, name: string, opts: ResumeOpti
 async function stepThroughTasks(rt: SpecRuntime, s: SpecSummary, opts: ResumeOptions): Promise<FlowResult> {
   const spec = loadSpecDir(s.dir);
   const trace: FlowTransition[] = [];
-  const tasks = spec.tasks!;
+  // a file kiro-claude does not read (docfs): running tasks is refused (runSpecTasks), say why now
+  for (const why of specRefusals(spec)) rt.print(`⚠ ${specRefusalText(why)}`);
+  if (!spec.tasks) return errorResult(s.name, spec.refused ?? 'tasks.md could not be read');
+  const tasks = spec.tasks;
   const p = taskProgress(tasks);
   rt.print(`${s.name}: ${p.done}/${p.total} tasks done (required ${p.requiredDone}/${p.requiredTotal})`);
   if (!rt.interactive) {
@@ -1016,10 +1106,12 @@ async function stepThroughTasks(rt: SpecRuntime, s: SpecSummary, opts: ResumeOpt
   }
   const next = planTasks(planRun(tasks, { kind: 'next' }))[0];
   const options: { label: string; act: () => Promise<unknown> }[] = [];
-  if (next) options.push({ label: `Run next task: ${taskLabel(next)}`, act: () => runSpecTasks(rt, s.name, { kind: 'next' }) });
-  if (p.requiredDone < p.requiredTotal) options.push({ label: 'Run all remaining required tasks', act: () => runSpecTasks(rt, s.name, { kind: 'scope', includeOptional: false }) });
-  if (p.done < p.total) options.push({ label: 'Run all remaining tasks (include optional *)', act: () => runSpecTasks(rt, s.name, { kind: 'scope', includeOptional: true }) });
-  options.push({ label: 'Select tasks…', act: () => selectAndRun(rt, s.name) });
+  // a refused file: runSpecTasks would refuse every run, so none is offered (the review is)
+  const runnable = !spec.refused;
+  if (runnable && next) options.push({ label: `Run next task: ${taskLabel(next)}`, act: () => runSpecTasks(rt, s.name, { kind: 'next' }) });
+  if (runnable && p.requiredDone < p.requiredTotal) options.push({ label: 'Run all remaining required tasks', act: () => runSpecTasks(rt, s.name, { kind: 'scope', includeOptional: false }) });
+  if (runnable && p.done < p.total) options.push({ label: 'Run all remaining tasks (include optional *)', act: () => runSpecTasks(rt, s.name, { kind: 'scope', includeOptional: true }) });
+  if (runnable) options.push({ label: 'Select tasks…', act: () => selectAndRun(rt, s.name) });
   options.push({
     label: 'Review tasks.md (checkpoint)',
     act: () => withFinish(rt, () => phaseLoop(flowCtx(rt, s, { autoApprove: opts.autoApprove === true }), 'tasks', false)),
@@ -1054,9 +1146,18 @@ export async function approveSpec(rt: SpecRuntime, name: string, opts: ResumeOpt
     return result(c, 'ready');
   }
   if (!s.awaitingApproval) {
-    const msg = `Nothing to approve yet: ${SPEC_DOC_FILES[s.phase]} has not been written.`;
+    // a spec file kiro-claude does not read (its folder a dangling link, …: docfs) is the reason,
+    // not a document "not written yet"
+    const msg = s.refused ? `✗ Spec '${s.name}' cannot continue: ${specRefusalText(s.refused)}` : `Nothing to approve yet: ${SPEC_DOC_FILES[s.phase]} has not been written.`;
     rt.print(msg);
-    return errorResult(s.name, msg);
+    return errorResult(s.name, s.refused ?? msg);
+  }
+  // a document kiro-claude does not read (a symbolic link, …: docfs) is never approved, nor one
+  // of a spec with any other such file: the next phase would be drafted from it
+  const refused = s.docs[s.awaitingApproval].refused ?? s.refused;
+  if (refused) {
+    rt.print(`✗ Cannot approve ${SPEC_DOC_FILES[s.awaitingApproval]}: ${specRefusalText(refused)}`);
+    return errorResult(s.name, refused);
   }
   const c = flowCtx(rt, s, { autoApprove: opts.autoApprove === true, ...(opts.description ? { desc: opts.description } : {}) });
   c.trace.push({ state: 'approved', doc: s.awaitingApproval });
@@ -1069,9 +1170,11 @@ export async function reviseSpec(rt: SpecRuntime, name: string, feedback: string
   if (!s) return notFound(rt, name);
   const doc: SpecDocKind | undefined = s.awaitingApproval ?? (s.phase === 'execution' || s.phase === 'done' ? 'tasks' : undefined);
   if (!doc) {
-    const msg = `Nothing to revise yet: ${SPEC_DOC_FILES[s.phase as SpecDocKind]} has not been written.`;
+    const msg = s.refused
+      ? `✗ Spec '${s.name}' cannot continue: ${specRefusalText(s.refused)}`
+      : `Nothing to revise yet: ${SPEC_DOC_FILES[s.phase as SpecDocKind]} has not been written.`;
     rt.print(msg);
-    return errorResult(s.name, msg);
+    return errorResult(s.name, s.refused ?? msg);
   }
   if (!feedback.trim()) return errorResult(s.name, 'Feedback is required');
   const c = flowCtx(rt, s, { autoApprove: opts.autoApprove === true });
@@ -1110,6 +1213,12 @@ async function analyzeWithin(c: FlowCtx, o: { autoApply: boolean }): Promise<Ana
   const rt = c.rt;
   const doc: SpecDocKind = c.prompt.specType === 'bugfix' ? 'bugfix' : 'requirements';
   const file = SPEC_DOC_FILES[doc];
+  const refused = docRefusal(c.dir, doc);
+  if (refused) {
+    const msg = `✗ Cannot analyze ${file}: ${specRefusalText(refused)}`;
+    rt.print(msg);
+    return { status: 'error', findings: [], answers: [], message: refused };
+  }
   if (!docReady(c, doc)) {
     const msg = `No ${file} yet. Start with ${rt.commandPrefix} new <feature-name>`;
     rt.print(msg);
@@ -1167,8 +1276,17 @@ async function analyzeWithin(c: FlowCtx, o: { autoApply: boolean }): Promise<Ana
     rt.print(`✗ Updating ${file} failed: ${fail2}`);
     return { status: 'error', findings, answers, message: fail2 };
   }
-  // re-lint the ids (03 §1.8 step 3)
-  const text = fs.readFileSync(specDocPath(c.dir, doc), 'utf8');
+  // re-lint the ids (03 §1.8 step 3); never through a link the turn left there (docfs)
+  let text: string;
+  try {
+    const t = readSpecFile(specDocPath(c.dir, doc));
+    if (t === undefined) throw new Error(`${file} no longer exists`);
+    text = t;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    rt.print(`✗ Could not re-read ${file}: ${msg}`);
+    return { status: 'error', findings, answers, message: msg };
+  }
   const ids = doc === 'bugfix' ? parseBugfix(text).criteriaIds : parseRequirements(text).criteriaIds;
   const missing = answers.flatMap((a) => a.finding.requirements).filter((id) => !ids.includes(id));
   rt.print(`${file} updated (${ids.length} criteria)`);
@@ -1196,11 +1314,31 @@ export async function syncSpec(rt: SpecRuntime, name: string): Promise<{ status:
     notFound(rt, name);
     return { status: 'error', changes: [] };
   }
+  // tasks.md kiro-claude does not read (a symbolic link, …: docfs): nothing to compare or repair
+  const read = (): string | { error: string } => {
+    try {
+      return readSpecFile(s.docs.tasks.path) ?? { error: 'tasks.md no longer exists' };
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : String(e) };
+    }
+  };
+  // nor a spec with any other such file: the sync turn compares tasks.md "with requirements/design"
+  // and adds tasks for their uncovered criteria (prompts.syncPrompt), so it builds on them
+  const refused = s.docs.tasks.refused ?? s.refused;
+  if (refused) {
+    rt.print(`✗ Cannot sync tasks.md: ${specRefusalText(refused)}`);
+    return { status: 'error', changes: [] };
+  }
   if (!s.docs.tasks.nonEmpty) {
     rt.print(`Spec '${s.name}' has no tasks.md yet.`);
     return { status: 'error', changes: [] };
   }
-  const before = parseTasks(fs.readFileSync(s.docs.tasks.path, 'utf8'));
+  const t0 = read();
+  if (typeof t0 !== 'string') {
+    rt.print(`✗ Cannot sync tasks.md: ${t0.error}`);
+    return { status: 'error', changes: [] };
+  }
+  const before = parseTasks(t0);
   const c = flowCtx(rt, s, {});
   return withFinish(rt, async () => {
     const r = await specTurn(rt, specInput(c, syncPrompt({ dir: s.dir, ws: rt.ws.workspaceRoot })), restrictionFor(c, 'tasks'));
@@ -1210,7 +1348,12 @@ export async function syncSpec(rt: SpecRuntime, name: string): Promise<{ status:
       return { status: 'error' as const, changes: [] };
     }
     repairTasks(rt, s.dir);
-    const after = parseTasks(fs.readFileSync(s.docs.tasks.path, 'utf8'));
+    const t1 = read();
+    if (typeof t1 !== 'string') {
+      rt.print(`✗ Sync: could not re-read tasks.md: ${t1.error}`);
+      return { status: 'error' as const, changes: [] };
+    }
+    const after = parseTasks(t1);
     const changes: string[] = [];
     for (const t of after.tasks) {
       const b = before.byId.get(t.id);
@@ -1254,14 +1397,19 @@ function printWarnings(rt: SpecRuntime, ws: readonly HookWarning[]): void {
   for (const w of ws) rt.print(w.message);
 }
 
-function setBox(rt: SpecRuntime, file: string, t: SpecTask, box: TaskBox): boolean {
+/**
+ * Set task `t`'s box in tasks.md; undefined when done, else why not (printed): the task or the
+ * file is gone (`refused` absent), or tasks.md is refused (a symbolic link, …: docfs; its target
+ * is neither read nor written).
+ */
+function setBox(rt: SpecRuntime, file: string, t: SpecTask, box: TaskBox): { refused?: string } | undefined {
   try {
     const r = writeTaskStatus(file, t.id, box, { expectHash: t.textHash });
     if (r.stale) rt.print(`⚠ Task ${t.id} changed in tasks.md since the run started.`);
-    return true;
+    return undefined;
   } catch (e) {
     rt.print(`⚠ ${e instanceof Error ? e.message : String(e)}`);
-    return false;
+    return e instanceof SpecFileRefusedError ? { refused: e.why } : {};
   }
 }
 
@@ -1305,9 +1453,13 @@ async function executeTask(
     }
     hookPrompts = pre.agentPrompts;
   }
-  const finishTask = async (o: TaskOutcome, session?: TaskSessionHandle): Promise<TaskOutcome> => {
+  const finishTask = async (done: TaskOutcome, session?: TaskSessionHandle): Promise<TaskOutcome> => {
+    let o = done;
     try {
-      setBox(rt, file, t, o.status === 'completed' ? 'x' : ' ');
+      // a completed task whose box cannot be ticked because tasks.md became a file kiro-claude
+      // does not write (a link the turn left, docfs) is not reported as completed: the run stops
+      const boxFail = setBox(rt, file, t, o.status === 'completed' ? 'x' : ' ');
+      if (boxFail?.refused && o.status === 'completed') o = { ...o, status: 'failed', reason: `its box could not be ticked: ${boxFail.refused}` };
       if (hooks && hctx) {
         const postInfo = { ...info, status: hookStatus(o.status) };
         let post: Awaited<ReturnType<HookRunnerLike['runTaskHook']>> | undefined;
@@ -1315,8 +1467,8 @@ async function executeTask(
           // A press during the hook kills it. One that already came (it interrupted the task) is
           // not passed on: the hook is meant to run with status `interrupted`, and an aborted
           // signal would skip it before it starts. It runs under the host's NEXT press instead
-          // (REPL: nextPressSignal, r5 P1), so a press still kills it (also with timeout 0); a
-          // host without one (spec CLI) runs it without a signal.
+          // (SpecRuntime.nextPressSignal: the REPL's, r5 P1, and the spec CLI's NextPress), so a
+          // press still kills it (also with timeout 0); a host without one runs it without a signal.
           const later = signal?.aborted ? rt.nextPressSignal?.() : undefined;
           post = await hooks.runner.runTaskHook(
             signal?.aborted ? { ws: hctx.ws, sessionId: hctx.sessionId, ...(later ? { signal: later } : {}) } : hctx,
@@ -1348,7 +1500,15 @@ async function executeTask(
     return o;
   };
 
-  if (!setBox(rt, file, t, '-')) return { id: t.id, title: t.title, status: 'failed', reason: 'task is no longer in tasks.md' };
+  // a spec file that became one kiro-claude does not read during the run (a link a task left,
+  // docfs): the task is not started (its box is not touched, its documents are not read)
+  const refusedNow = summarizeSpecDir(spec.dir).refused;
+  if (refusedNow) {
+    rt.print(`✗ Task ${t.id} failed: ${specRefusalText(refusedNow)}`);
+    return { id: t.id, title: t.title, status: 'failed', reason: refusedNow };
+  }
+  const boxFail = setBox(rt, file, t, '-');
+  if (boxFail) return { id: t.id, title: t.title, status: 'failed', reason: boxFail.refused ?? 'task is no longer in tasks.md' };
   let session: TaskSessionHandle;
   try {
     // the run's Ctrl+C is the start signal of the task session (session/startSignal.ts, K3): a
@@ -1365,6 +1525,9 @@ async function executeTask(
   // could not interrupt a session it did not know yet, so do not start the turn at all.
   if (signal?.aborted) return finishTask({ id: t.id, title: t.title, status: 'interrupted' }, session);
   const s = summarizeSpecDir(spec.dir);
+  // a file that became one kiro-claude does not read while the session started (a parallel
+  // task's turn left a link): the task's context would silently lack it, so the task fails
+  if (s.refused) return finishTask({ id: t.id, title: t.title, status: 'failed', reason: specRefusalText(s.refused) }, session);
   const ctxBlock = specContextBlock(rt.ws, s);
   const input: PromptInput = {
     text: taskExecutionPrompt({
@@ -1417,6 +1580,13 @@ export async function runSpecTasks(rt: SpecRuntime, name: string, sel: TaskSelec
     rt.print(msg);
     return { status: 'error', outcomes: [], remainingRequired: 0, message: msg };
   }
+  // a spec file kiro-claude does not read or write (a symbolic link, …: docfs): the run would tick
+  // boxes in tasks.md and put the documents into each task's context, so nothing runs
+  if (s.refused) {
+    const msg = `✗ Spec '${s.name}' cannot run: ${specRefusalText(s.refused)}`;
+    rt.print(msg);
+    return { status: 'error', outcomes: [], remainingRequired: 0, message: msg };
+  }
   if (!s.docs.tasks.nonEmpty) {
     const msg = `Spec '${s.name}' has no tasks.md yet. Continue the spec with ${rt.commandPrefix} ${s.name}`;
     rt.print(msg);
@@ -1424,7 +1594,12 @@ export async function runSpecTasks(rt: SpecRuntime, name: string, sel: TaskSelec
   }
   repairTasks(rt, s.dir);
   const spec: LoadedSpec = loadSpecDir(s.dir);
-  const parsed = spec.tasks!;
+  if (spec.refused || !spec.tasks) {
+    const msg = spec.refused ? `✗ Spec '${s.name}' cannot run: ${specRefusalText(spec.refused)}` : `✗ Spec '${s.name}': tasks.md could not be read`;
+    rt.print(msg);
+    return { status: 'error', outcomes: [], remainingRequired: 0, message: msg };
+  }
+  const parsed = spec.tasks;
   const plan = planRun(parsed, sel);
   if (plan.unknownIds.length) {
     const msg = `Unknown task ${plan.unknownIds.length === 1 ? 'id' : 'ids'}: ${plan.unknownIds.join(', ')}`;
@@ -1483,7 +1658,15 @@ export async function runSpecTasks(rt: SpecRuntime, name: string, sel: TaskSelec
   } finally {
     signal?.removeEventListener('abort', onAbort);
   }
-  const after = taskProgress(parseTasks(fs.readFileSync(s.docs.tasks.path, 'utf8')));
+  // the progress after the run, never through a link a task left at tasks.md (docfs): then the
+  // plan's own view, with the reason
+  let after = taskProgress(parsed);
+  try {
+    const t = readSpecFile(s.docs.tasks.path);
+    if (t !== undefined) after = taskProgress(parseTasks(t));
+  } catch (e) {
+    rt.print(`⚠ ${e instanceof Error ? e.message : String(e)}`);
+  }
   const remainingRequired = after.requiredTotal - after.requiredDone;
   const count = (st: TaskOutcomeStatus): number => outcomes.filter((o) => o.status === st).length;
   const bad = outcomes.filter((o) => o.status !== 'completed');

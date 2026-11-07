@@ -24,13 +24,22 @@
  * left first instead (SPEC_TANGENT_LEFT; it holds nothing the main conversation lacks). `list`,
  * `status`, `view` and task runs work in a tangent.
  *
+ * A spec document (or `.config.kiro`) that is a symbolic link, not a regular file, behind a link
+ * that resolves to nothing or outside the workspace is never read or written by kiro-claude
+ * (spec/docfs.ts, review X1): `list` / `status` show the phase `refused` and why, `status <name>`
+ * marks the document, `view` of it prints the reason instead, and the flows refuse or stop with
+ * it (spec/workflow.ts); `run` without a scope refuses such a spec before asking one. A
+ * `.kiro/specs` linked out of the workspace is not listed: `list`, `status` and the pickers print
+ * the reason instead.
+ *
  * Not reproduced (gap): the V3 full-screen reader (Ctrl+X line comments) and "spec mode" for
  * later free-form turns (needs a REPL hook; ReplHost has none).
  */
 
 import type { ReplHost, SlashCommand } from '../types.js';
 import { SPEC_DOC_FILES, type SpecDocKind, type TaskSelection, type WorkflowType } from './model.js';
-import { formatSpecList, formatSpecStatus, isValidSpecName, listSpecs, loadSpec, normalizeSpecName, resolveSpecDir, summarizeSpec } from './store.js';
+import { formatSpecList, formatSpecRefusals, formatSpecStatus, isValidSpecName, listSpecs, loadSpec, normalizeSpecName, resolveSpecDir, specsDirRefused, summarizeSpec } from './store.js';
+import { specRefusalText } from './docfs.js';
 import { SessionStore, sessionsDir } from '../session/store.js';
 import {
   SPEC_IN_TANGENT_REFUSED,
@@ -169,7 +178,9 @@ function parseDoc(v: string | undefined): SpecDocKind | undefined {
 async function pickSpec(host: ReplHost, question: string, filter?: (s: ReturnType<typeof listSpecs>[number]) => boolean, empty?: string): Promise<string | undefined> {
   const all = listSpecs(host.ws).filter((s) => !filter || filter(s));
   if (all.length === 0) {
-    host.print(empty ?? 'No specs yet. Start one with /spec new <feature-name>');
+    // a .kiro/specs linked out of the workspace (docfs) is not listed: say why, not "no specs"
+    const dirWhy = specsDirRefused(host.ws);
+    host.print(dirWhy ? `✗ ${specRefusalText(dirWhy)}` : (empty ?? 'No specs yet. Start one with /spec new <feature-name>'));
     return undefined;
   }
   if (all.length === 1 && filter) return all[0]!.name;
@@ -297,9 +308,11 @@ async function cmdRun(host: ReplHost, rt: SpecRuntime, args: string[]): Promise<
     host.print(`${p.error}\nUsage: /spec run <feature-name> [<task-id>…|--next|--all|--include-optional]`);
     return;
   }
-  const name = p.name ?? (await pickSpec(host, 'Run which spec?', (s) => s.docs.tasks.nonEmpty, 'No spec has a tasks.md yet. Create one with /spec new <feature-name>'));
+  const name = p.name ?? (await pickSpec(host, 'Run which spec?', (s) => s.docs.tasks.nonEmpty || !!s.docs.tasks.refused, 'No spec has a tasks.md yet. Create one with /spec new <feature-name>'));
   if (!name) return;
   let sel = p.sel;
+  // a spec with a file kiro-claude does not read (docfs) cannot run: say why before asking a scope
+  if (!sel && summarizeSpec(host.ws, name)?.refused) sel = { kind: 'scope', includeOptional: false };
   if (!sel) {
     const i = await host.choose(`Which tasks of ${name}?`, [...RUN_SCOPE_LABELS]);
     if (i === undefined || i === 3) return;
@@ -334,6 +347,12 @@ function cmdView(host: ReplHost, args: string[]): void {
     const cands = spec.order.filter((k) => spec.docs[k].nonEmpty);
     doc = spec.awaitingApproval ?? cands[cands.length - 1];
   }
+  // a document kiro-claude does not read (a symbolic link, …: docfs) is never printed
+  const refused = spec.docs[doc ?? spec.order[0]!].refused;
+  if (refused) {
+    host.print(`✗ ${specRefusalText(refused)}`);
+    return;
+  }
   if (!doc || !spec.docs[doc].nonEmpty) {
     host.print(`${SPEC_DOC_FILES[doc ?? spec.order[0]!]} has not been written yet.`);
     return;
@@ -341,10 +360,20 @@ function cmdView(host: ReplHost, args: string[]): void {
   host.print(`[${spec.docs[doc].path}]\n${(spec.texts[doc] ?? '').replace(/\s+$/, '')}`);
 }
 
+/** The progress table, then why a spec with the phase `refused` is not read (docfs). */
+function printList(host: ReplHost): void {
+  const dirWhy = specsDirRefused(host.ws);
+  if (dirWhy) {
+    host.print(`✗ ${specRefusalText(dirWhy)}`);
+    return;
+  }
+  const all = listSpecs(host.ws);
+  host.print(all.length ? [formatSpecList(all), ...formatSpecRefusals(all)].join('\n') : 'No specs yet. Start one with /spec new <feature-name>');
+}
+
 function cmdStatus(host: ReplHost, name: string | undefined): void {
   if (!name) {
-    const all = listSpecs(host.ws);
-    host.print(all.length ? formatSpecList(all) : 'No specs yet. Start one with /spec new <feature-name>');
+    printList(host);
     return;
   }
   const spec = loadSpec(host.ws, name);
@@ -370,11 +399,9 @@ async function runSpec(args: string[], host: ReplHost): Promise<void> {
       host.print(SPEC_USAGE);
       return;
     case 'list':
-    case 'ls': {
-      const all = listSpecs(host.ws);
-      host.print(all.length ? formatSpecList(all) : 'No specs yet. Start one with /spec new <feature-name>');
+    case 'ls':
+      printList(host);
       return;
-    }
     case 'status':
       cmdStatus(host, rest[0]);
       return;
@@ -393,7 +420,7 @@ async function runSpec(args: string[], host: ReplHost): Promise<void> {
     case 'analyze-requirements':
     case 'analyze': {
       if (await tangentRefuses(host)) return;
-      const name = rest[0] ?? (await pickSpec(host, 'Analyze which spec?', (s) => s.docs.requirements.nonEmpty || s.docs.bugfix.nonEmpty, 'No spec has requirements yet. Create one with /spec new <feature-name>'));
+      const name = rest[0] ?? (await pickSpec(host, 'Analyze which spec?', (s) => s.docs.requirements.nonEmpty || s.docs.bugfix.nonEmpty || !!s.docs.requirements.refused || !!s.docs.bugfix.refused, 'No spec has requirements yet. Create one with /spec new <feature-name>'));
       if (!name) return;
       remember(host, name);
       await analyzeRequirements(rt, name);
@@ -426,7 +453,7 @@ async function runSpec(args: string[], host: ReplHost): Promise<void> {
     }
     case 'sync': {
       if (await tangentRefuses(host)) return;
-      const name = await resolveName(host, rest[0], 'Sync which spec?', (s) => s.docs.tasks.nonEmpty);
+      const name = await resolveName(host, rest[0], 'Sync which spec?', (s) => s.docs.tasks.nonEmpty || !!s.docs.tasks.refused);
       if (!name) return;
       remember(host, name);
       await syncSpec(rt, name);

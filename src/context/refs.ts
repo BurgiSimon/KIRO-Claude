@@ -25,7 +25,9 @@
  *
  * `#` providers ({@link expandHashRefs}, 03 §4 grammar; skipped inside code, after
  * non-whitespace, for `# ` and for Markdown headings `^#{1,6}\s`):
- *  - `#spec:<name>` ⇒ the spec's requirements.md / bugfix.md / design.md / tasks.md;
+ *  - `#spec:<name>` ⇒ the spec's requirements.md / bugfix.md / design.md / tasks.md, read under
+ *    the rules of kiro-claude's own spec I/O (spec/docfs: a linked document, a spec folder or
+ *    `.kiro/specs` linked out of the workspace or to nothing is not read; each is a notice);
  *  - `#steering:<file>` and bare `#<name>` of a manual/auto steering file ⇒ `steeringNames`
  *    (the caller injects bodies through SteeringActivator, once per session);
  *  - bare `#<name>` resolution order: steering → spec → existing file → existing directory →
@@ -42,6 +44,7 @@ import { execFile } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { PromptFile, SteeringFile, WorkspaceContext } from '../types.js';
+import { specFileRefused, specFolderRefused, specRefusalText, specsRootRefused } from '../spec/docfs.js';
 import { shlexSplit } from '../util/shlex.js';
 import { truncateBytes, utf8SafePrefixLength } from '../util/text.js';
 import { compareBytes } from './tokens.js';
@@ -177,6 +180,14 @@ function statSafe(p: string): fs.Stats | undefined {
   }
 }
 
+function lstatSafe(p: string): fs.Stats | undefined {
+  try {
+    return fs.lstatSync(p);
+  } catch {
+    return undefined;
+  }
+}
+
 /** Resolve an unquoted token, dropping trailing punctuation until something exists. */
 function resolveToken(token: string, cwd: string, quoted: boolean): { abs: string; typed: string; st: fs.Stats } | undefined {
   let t = token;
@@ -217,10 +228,23 @@ function xmlAttr(s: string): string {
  * Reads up to `maxBytes + 1` bytes sequentially whatever size `stat` reports: files under
  * `/proc` or `/sys` report size 0, and files can grow or shrink while being read.
  */
-export function readTextForRef(abs: string, maxBytes = MAX_FILE_REF_BYTES): { content?: string; truncated?: boolean; binary?: boolean } {
-  const fd = fs.openSync(abs, 'r');
+export function readTextForRef(
+  abs: string,
+  maxBytes = MAX_FILE_REF_BYTES,
+  noFollow = false,
+): { content?: string; truncated?: boolean; binary?: boolean } {
+  // noFollow: a symbolic link at `abs` is not followed (ELOOP) and anything but a regular file is
+  // refused (EFTYPE) on the open descriptor; on Windows (no O_NOFOLLOW) an lstat check stands in
+  let fd: number;
+  if (noFollow) {
+    if (process.platform === 'win32' && fs.lstatSync(abs).isSymbolicLink()) throw Object.assign(new Error(`${abs} is a symbolic link`), { code: 'ELOOP' });
+    fd = fs.openSync(abs, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+  } else {
+    fd = fs.openSync(abs, 'r');
+  }
   let buf: Buffer;
   try {
+    if (noFollow && !fs.fstatSync(fd).isFile()) throw Object.assign(new Error(`${abs} is not a regular file`), { code: 'EFTYPE' });
     const want = Math.max(0, Math.floor(maxBytes)) + 1;
     buf = Buffer.alloc(want);
     let off = 0;
@@ -474,16 +498,37 @@ function resolveSpecDir(specsDir: string, name: string): string | undefined {
   }
 }
 
-/** `<spec name=… path=…>` block with each existing spec document as `[abs]\ncontent`. */
-export function formatSpecBlock(name: string, dir: string, expand: (body: string, baseDir: string) => string, baseDir: string): string | undefined {
+/**
+ * `<spec name=… path=…>` block with each existing spec document as `[abs]\ncontent`. A document
+ * kiro-claude itself must not read (spec/docfs: a symbolic link at it, not a regular file, or a
+ * real path outside the workspace) is left out and its reason pushed to `refused`; it is opened
+ * with O_NOFOLLOW, so a link that appears after the check is not followed either.
+ */
+export function formatSpecBlock(
+  name: string,
+  dir: string,
+  expand: (body: string, baseDir: string) => string,
+  baseDir: string,
+  refused: string[] = [],
+): string | undefined {
   const parts: string[] = [];
   for (const doc of SPEC_DOCS) {
     const p = path.join(dir, doc);
-    if (!statSafe(p)?.isFile()) continue;
+    const st = lstatSafe(p);
+    if (!st) continue;
+    const why = specFileRefused(p);
+    if (why) {
+      refused.push(why);
+      continue;
+    }
+    if (!st.isFile()) continue;
     let r: ReturnType<typeof readTextForRef>;
     try {
-      r = readTextForRef(p);
-    } catch {
+      r = readTextForRef(p, MAX_FILE_REF_BYTES, true);
+    } catch (e) {
+      const code = typeof e === 'object' && e !== null && 'code' in e ? String((e as { code: unknown }).code) : '';
+      if (code === 'ELOOP') refused.push(`${p} is a symbolic link`);
+      else if (code === 'EFTYPE') refused.push(`${p} is not a regular file`);
       continue;
     }
     if (r.content === undefined) continue;
@@ -556,9 +601,18 @@ export async function expandHashRefs(text: string, opts: HashRefsOptions): Promi
       return false;
     }
     if (!once(`spec:${dir}`)) return true;
-    const block = formatSpecBlock(name, dir, expand, ws.workspaceRoot);
+    // the rules of kiro-claude's own spec I/O (spec/docfs, r5x X1): a spec folder linked out of
+    // the workspace or to nothing, and a linked or outside document, are not read
+    const folderWhy = (opts.specsDir === undefined ? specsRootRefused(ws.workspaceRoot) : undefined) ?? specFolderRefused(dir);
+    if (folderWhy) {
+      out.notices.push(`Spec '${name}' was not read: ${specRefusalText(folderWhy)}`);
+      return true;
+    }
+    const refused: string[] = [];
+    const block = formatSpecBlock(name, dir, expand, ws.workspaceRoot, refused);
+    for (const why of refused) out.notices.push(`Spec '${name}': a document was left out: ${specRefusalText(why)}`);
     if (block) out.blocks.push(block);
-    else out.notices.push(`Spec '${name}' has no requirements, design or tasks documents`);
+    else if (refused.length === 0) out.notices.push(`Spec '${name}' has no requirements, design or tasks documents`);
     return true;
   };
   const addPath = (token: string, quoted: boolean, kind: 'any' | 'file' | 'dir', fromBare: boolean): boolean => {

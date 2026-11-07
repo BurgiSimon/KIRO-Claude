@@ -149,6 +149,14 @@ export class TextRenderer implements HeadlessRenderer {
         if (e.state === 'started') this.stderr.write('Compacting conversation...\n');
         else this.stderr.write('✔ Conversation compacted\n');
         return;
+      case 'compaction_failed': {
+        // closes 'Compacting conversation...' with the REPL's wording (r5x X2); C0/C1 controls
+        // and escape sequences of Claude's reason are dropped
+        const why = e.reason.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '').trim();
+        const line = e.cancelled ? 'Compaction cancelled.' : !why || /^compaction failed\.?$/i.test(why) ? 'Compaction failed.' : `Compaction failed: ${why}`;
+        this.stderr.write(`${line}\n`);
+        return;
+      }
       case 'rate_limit':
         if (e.status === 'rejected') {
           const when = e.resetsAt ? ` (resets ${new Date(e.resetsAt * (e.resetsAt < 1e12 ? 1000 : 1)).toISOString()})` : '';

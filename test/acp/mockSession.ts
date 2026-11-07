@@ -8,7 +8,8 @@
  *
  * Script steps (`MockTurn.steps`):
  *  { text } | { thinking } | { tool: MockTool } | { todos } | { raw } | { sleepMs } |
- *  { result: Partial<TurnResult> } | { subagent } | { compaction: true }
+ *  { result: Partial<TurnResult> } | { subagent } | { compaction: true } |
+ *  { compactionFailed: reason } (started, then compaction_failed) | { compactionFailedOnly: reason }
  * Text templates: `{{history}}` (earlier user texts, ` | `), `{{steers}}` (steers received
  * this turn), `{{user}}` (this prompt's text).
  */
@@ -66,7 +67,11 @@ export type MockStep =
   | { sleepMs: number }
   | { result: Partial<TurnResult> }
   | { subagent: { state: 'started' | 'finished'; agentType: string; toolUseId?: string; description?: string; prompt?: string; isError?: boolean; error?: string } }
-  | { compaction: true };
+  | { compaction: true }
+  /** An automatic compaction that fails: `compaction` `started`, then `compaction_failed` with this reason. */
+  | { compactionFailed: string }
+  /** A `compaction_failed` alone (no `started` before it). */
+  | { compactionFailedOnly: string };
 
 export interface MockTurn {
   match?: RegExp;
@@ -293,6 +298,11 @@ export class MockSession extends EventEmitter implements KiroSession {
           yield { type: 'compaction', state: 'started' };
           yield { type: 'compaction', state: 'finished', preTokens: 5000, postTokens: 1000 };
           yield { type: 'raw', frame: { type: 'user', isSynthetic: true, message: { role: 'user', content: 'This session is being continued.\n\nSummary:\nauto summary' } } };
+        } else if ('compactionFailed' in step) {
+          yield { type: 'compaction', state: 'started' };
+          yield { type: 'compaction_failed', reason: step.compactionFailed };
+        } else if ('compactionFailedOnly' in step) {
+          yield { type: 'compaction_failed', reason: step.compactionFailedOnly };
         } else if ('tool' in step) {
           if (!toolsAllowed) continue;
           const t = step.tool;

@@ -81,7 +81,13 @@
  * under a result that says success; VERIFIED 2.1.319: "Not enough messages to compact." for a
  * session holding only local-command entries, e.g. after an `/effort` or a refused `/compact`),
  * and the session's compacting state ends with that status (the next compaction is reported
- * from its start).
+ * from its start). Every compaction published `started` ends with `finished` (its boundary) or
+ * `compaction_failed` (r5x X2): Claude's failed status in any turn (an automatic compaction
+ * inside a prompt turn fails and the turn goes on), with its `compact_error` as the reason;
+ * Claude's next main-thread output (`stream_event`, `assistant`) with the compaction still open
+ * (Claude streams nothing while it compacts: it ended without saying so, and its end goes before
+ * that output); or the turn's end with it still open (interrupted: `cancelled`; the child died,
+ * or Claude never ended it).
  * `prompt()`'s result carries the usage of all its Claude turns (redirects, continuations).
  *
  * Streaming: `text_delta` / `thinking_delta` from `stream_event`s (top level only); a complete
@@ -1799,8 +1805,16 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
 
   private onFrame(frame: ClaudeFrame): void {
     const f = frame as Record<string, unknown>;
-    this.publish({ type: 'raw', frame });
     const t = this.turn;
+    // Claude streams nothing of its own while it compacts (VERIFIED 2.1.319 /compact: status,
+    // init, boundary, summary only): main-thread output while a compaction is open means it
+    // ended without a boundary or a status saying so. Its end goes before that output (r5x X2
+    // verifier: KiroCrew drops the text streamed before a compaction terminal, and the REPL
+    // would print the failure under the answer)
+    if (this.compacting && (f.type === 'stream_event' || f.type === 'assistant') && !f.parent_tool_use_id) {
+      this.endCompaction('', t, 'Claude Code did not finish the compaction');
+    }
+    this.publish({ type: 'raw', frame });
     if (t && !t.lineSeen && lineActivity(f, t.userUuid)) t.lineSeen = true;
     try {
       // the subagent of an asked Agent call is running although no approval was seen: list it
@@ -1879,17 +1893,18 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
           this.compacting = true;
           this.publish({ type: 'compaction', state: 'started' });
         } else if (f.status !== 'compacting' && f.compact_result === 'failed') {
-          // the compaction ended without a boundary (refused, interrupted): the next one is
-          // reported from its start. A `/compact` Claude refused (VERIFIED 2.1.319: a session
-          // holding only local-command entries, "Not enough messages to compact.", under a result
-          // that says success) fails with that reason (toTurnResult; an interrupted one is
-          // cancelled all the same)
-          this.compacting = false;
+          // the compaction ended without a boundary (refused, failed, interrupted): its end is
+          // published (r5x X2, in any turn: an automatic one inside a prompt turn goes on) and the
+          // next one is reported from its start. A `/compact` Claude refused (VERIFIED 2.1.319: a
+          // session holding only local-command entries, "Not enough messages to compact.", under
+          // a result that says success) fails with that reason (toTurnResult; an interrupted one
+          // is cancelled all the same)
+          const why = typeof f.compact_error === 'string' ? f.compact_error.trim() : '';
           if (t && t.kind === 'compact') {
-            const why = typeof f.compact_error === 'string' ? f.compact_error.trim() : '';
             t.localCommandError ??= why || 'Compaction failed';
             t.compactRefused = true;
           }
+          this.endCompaction(why, t);
         }
         break;
       case 'compact_boundary': {
@@ -1912,6 +1927,21 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       default:
         break;
     }
+  }
+
+  /**
+   * The end of a compaction reported `started` that did not compact (r5x X2): `compaction_failed`
+   * with Claude's reason, as a turn's error words it (`localFailureText`: a `/compact` refused
+   * while a restored history is pending says why, as the turn's error does), else `Compaction
+   * cancelled` when the turn was interrupted, else `fallback`. Nothing when none is open, so
+   * every `started` gets one end.
+   */
+  private endCompaction(why: string, t: TurnState | undefined, fallback = 'Compaction failed'): void {
+    if (!this.compacting) return;
+    this.compacting = false;
+    const cancelled = this.turnAbort?.signal.aborted === true;
+    const reason = why ? (t ? this.localFailureText(t, why) : why) : cancelled ? 'Compaction cancelled' : fallback;
+    this.publish({ type: 'compaction_failed', reason, ...(cancelled ? { cancelled: true } : {}) });
   }
 
   private onStream(f: StreamEventFrame, t: TurnState | undefined): void {
@@ -2443,6 +2473,9 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       } catch (e) {
         failure = e;
       } finally {
+        // a compaction still open when the turn's frames end (interrupted, the child died, or
+        // Claude never ended it) did not compact: its end goes with the turn (r5x X2)
+        this.endCompaction('', t, 'Claude Code did not finish the compaction');
         sink.close();
       }
     })();

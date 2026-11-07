@@ -20,6 +20,13 @@
  * are shown dim when `chat.showThinking` (default true). A response after a tool call gets a
  * fresh `> `.
  *
+ * A compaction prints `Summarizing the conversation history...`, then its end: the success line,
+ * or one plain `Compaction failed: <reason>` line (`Compaction cancelled.` for an interrupted
+ * one), also for an automatic compaction inside a prompt turn, whose answer follows. A `/compact`
+ * Claude refuses prints Claude's reason as a plain line (once), not the failed-answer line
+ * `Kiro is having trouble responding right now: …` (DECISION: the research has no Kiro wording
+ * for either; r5x X2).
+ *
  * Descriptions for Claude tools without a Q twin (Glob, WebFetch, WebSearch, Agent, Skill)
  * are DECISIONs in Q's style. Tool output is previewed (20 lines) unless
  * `chat.autoExpandToolOutput`.
@@ -396,6 +403,8 @@ export class TurnRenderer {
   private trailingNewlines = 2;
   private renderedText = false;
   private text = '';
+  /** The reason this turn's `compaction_failed` line showed (a refused `/compact` says it once). */
+  private compactionFailure: string | undefined;
   private readonly glyphs: Glyphs;
   /** Per-stream sanitizers: a sequence split across deltas is completed, not shown in parts. */
   private readonly textSan = new TerminalSanitizer();
@@ -447,6 +456,7 @@ export class TurnRenderer {
     this.thinking = false;
     this.renderedText = false;
     this.text = '';
+    this.compactionFailure = undefined;
     this.shown.clear();
     this.startedAt.clear();
   }
@@ -636,6 +646,17 @@ export class TurnRenderer {
           this.write(`${c.green('✔ Conversation history has been compacted successfully!')}${tok}\n\n`);
         }
         return;
+      case 'compaction_failed': {
+        // closes 'Summarizing the conversation history...' with one plain line (r5x X2)
+        this.endResponse();
+        this.newline();
+        const why = stripTerminalControls(ev.reason).trim();
+        this.compactionFailure = why;
+        // no reason of Claude's (the session's own `Compaction failed`): no "Compaction failed: Compaction failed"
+        const line = ev.cancelled ? 'Compaction cancelled.' : !why || /^compaction failed\.?$/i.test(why) ? 'Compaction failed.' : `Compaction failed: ${why}`;
+        this.write(`${c.yellow(line)}\n\n`);
+        return;
+      }
       case 'notice':
         this.notice(ev.level, ev.message);
         return;
@@ -684,6 +705,13 @@ export class TurnRenderer {
     if (result.isError) {
       this.newline();
       const msg = stripTerminalControls(result.error ?? result.text ?? 'unknown error').trim() || 'unknown error';
+      if (result.localCommand === 'compact') {
+        // a /compact Claude refused (or whose compaction failed) is no failed answer: Claude's
+        // reason as one plain line, unless the compaction's failed end just said it (r5x X2)
+        if (msg !== this.compactionFailure) this.write(`${c.yellow(msg)}\n`);
+        this.blankLine();
+        return;
+      }
       this.write(`${c.red(c.bold(`Kiro is having trouble responding right now: ${msg}`))}\n\n`);
       return;
     }

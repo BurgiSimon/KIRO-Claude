@@ -39,6 +39,13 @@
  * A refused subject that names an allowed document (or lies under an allowed folder, or matches
  * an allowed pattern) carries a `refused` explanation; the gate appends it to its spec-phase
  * denial, so the model and the user see why the phase cannot write its own document.
+ *
+ * kiro-claude's OWN reads and writes of spec files (review X1: listing, status, view, the task
+ * context, the tasks.md repair, box updates, `.config.kiro`) follow the same subject rules:
+ * {@link specFileRefusal} for a document or `.config.kiro` (a link at it, anything there that is
+ * not a regular file, a link above it that resolves to nothing, a real path outside the
+ * workspace) and {@link specFolderRefusal} for a spec folder or `.kiro/specs` (a link at the
+ * folder is followed when it resolves inside the workspace). src/spec/docfs.ts applies them.
  */
 
 import * as fs from 'node:fs';
@@ -71,7 +78,12 @@ function isLink(p: string): boolean {
  * link were a plain folder inside the workspace.
  */
 export function unresolvedLinkAbove(p: string): string | undefined {
-  let cur = path.dirname(path.resolve(p));
+  return unresolvedLinkFrom(path.dirname(path.resolve(p)));
+}
+
+/** Like {@link unresolvedLinkAbove}, starting at `start` itself (a folder that may be the link). */
+function unresolvedLinkFrom(start: string): string | undefined {
+  let cur = start;
   for (;;) {
     try {
       fs.realpathSync.native(cur);
@@ -109,6 +121,53 @@ export function dotDotAfterLink(raw: string, cwd: string, env: NodeJS.ProcessEnv
   return undefined;
 }
 
+/** `p` reaches the symbolic link `link` that resolves to nothing. */
+function danglingWhy(p: string, link: string): string {
+  return `${p}: the symbolic link ${link} resolves to nothing (dangling, or a loop)`;
+}
+
+/** `p` (canonical `c`) is outside the workspace `base`. */
+function outsideWhy(p: string, c: string, base: string): string {
+  return `${p}${c === p ? ' is' : ` resolves to ${c},`} outside the workspace ${base}`;
+}
+
+/** Dangling link `unresolved` on the way to `p`, else `p`'s real path outside `base`. */
+function placeRefusal(p: string, unresolved: string | undefined, base: string): string | undefined {
+  if (unresolved) return danglingWhy(p, unresolved);
+  const c = realpathDeep(p);
+  return isSubpath(c, realpathDeep(base)) ? undefined : outsideWhy(p, c, base);
+}
+
+/**
+ * Why kiro-claude itself must not read or write `file`, a document or the `.config.kiro` of a
+ * spec folder in the workspace `workspaceRoot` (module doc, review X1); undefined when it may,
+ * also when `file` does not exist yet (and may be created). Refused: a symbolic link at `file`
+ * (also one to another document of the folder), anything at `file` that is not a regular file,
+ * a symbolic link above it that resolves to nothing, a real path outside the workspace.
+ */
+export function specFileRefusal(file: string, workspaceRoot: string): string | undefined {
+  const p = path.resolve(file);
+  let st: fs.Stats | undefined;
+  try {
+    st = fs.lstatSync(p);
+  } catch {
+    // missing (or unreadable): the folder rules decide
+  }
+  if (st?.isSymbolicLink()) return `${p} is a symbolic link`;
+  if (st && !st.isFile()) return `${p} is not a regular file`;
+  return placeRefusal(p, unresolvedLinkAbove(p), workspaceRoot);
+}
+
+/**
+ * Why kiro-claude itself must not use the spec folder `dir` (or `.kiro/specs`) of the workspace
+ * `workspaceRoot`: a symbolic link at it or above it that resolves to nothing, or a real path
+ * outside the workspace. A folder that is a link resolving inside the workspace may be used.
+ */
+export function specFolderRefusal(dir: string, workspaceRoot: string): string | undefined {
+  const p = path.resolve(dir);
+  return placeRefusal(p, unresolvedLinkFrom(p), workspaceRoot);
+}
+
 /** The path a write tool's input names as written (before toolmap resolved it), else `fallback`. */
 function rawPathOf(call: Pick<KiroToolCall, 'claudeName' | 'input'>, fallback: string): string {
   const v = call.claudeName === 'NotebookEdit' ? call.input.notebook_path : call.input.file_path;
@@ -141,13 +200,13 @@ export function checkSpecWrite(
     const linked = isLink(lexS);
     const unresolved = linked ? undefined : unresolvedLinkAbove(lexS);
     if (linked) why = `${lexS} is a symbolic link`;
-    else if (unresolved) why = `${lexS}: the symbolic link ${unresolved} resolves to nothing (dangling, or a loop)`;
+    else if (unresolved) why = danglingWhy(lexS, unresolved);
     else {
       const raw = single ? rawPathOf(call, s) : s;
       const dd = single ? dotDotAfterLink(raw, cwd, ws.env) : undefined;
       if (dd) why = `${raw} has '..' after the symbolic link ${dd}`;
     }
-    if (!why && !isSubpath(c, anchor)) why = `${lexS}${c === lexS ? ' is' : ` resolves to ${c},`} outside the workspace ${base}`;
+    if (!why && !isSubpath(c, anchor)) why = outsideWhy(lexS, c, base);
     let matched = false;
     let note: string | undefined;
     for (const e of allowed) {

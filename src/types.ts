@@ -552,6 +552,15 @@ export type SessionEvent =
     }
   | { type: 'todo_update'; todos: TodoItem[] }
   | { type: 'compaction'; state: 'started' | 'finished'; preTokens?: number; postTokens?: number }
+  /**
+   * The end of a compaction reported `started` that did not compact (manual or automatic): Claude
+   * reported it failed (`system/status` `compact_result: 'failed'`, no boundary: refused, failed
+   * or interrupted; `reason` = its `compact_error`), or the turn ended with it still open.
+   * `cancelled`: the turn was interrupted. Every `started` ends with exactly one `finished` or
+   * `compaction_failed`. A type of its own, so a consumer that knows only `started` / `finished`
+   * never shows it as a success.
+   */
+  | { type: 'compaction_failed'; reason: string; cancelled?: boolean }
   | { type: 'notice'; level: 'info' | 'warn' | 'error'; message: string }
   | {
       type: 'subagent';

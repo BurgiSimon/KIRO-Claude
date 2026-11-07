@@ -15,12 +15,13 @@
  *  - §1.7.2 run scope: "All remaining required tasks" (default) / include optional / selection.
  *
  * Everything here is pure text processing except {@link writeTaskStatus} (re-read + atomic
- * write). Unknown text is preserved byte for byte: edits replace single box characters.
+ * write, through spec/docfs.ts: never through a symbolic link at tasks.md or out of the
+ * workspace, review X1). Unknown text is preserved byte for byte: edits replace single box
+ * characters.
  */
 
 import { createHash } from 'node:crypto';
-import * as fs from 'node:fs';
-import { writeFileAtomic } from '../util/fsx.js';
+import { readSpecFile, writeSpecFile } from './docfs.js';
 
 // ───────────────────────────── types (03 §1.6.1) ─────────────────────────────
 
@@ -628,15 +629,18 @@ export interface WriteStatusResult {
 
 /**
  * Re-read tasks.md, set the box of `id`, write atomically (03 §1.6.4). Throws when the file or
- * the id is gone.
+ * the id is gone, and docfs.SpecFileRefusedError when tasks.md is refused (a symbolic link, not a
+ * regular file, behind a link that resolves to nothing, outside the workspace: its target is
+ * neither read nor written).
  */
 export function writeTaskStatus(file: string, id: string, box: TaskBox, opts: { expectHash?: string } = {}): WriteStatusResult {
-  const text = fs.readFileSync(file, 'utf8');
+  const text = readSpecFile(file);
+  if (text === undefined) throw new Error(`${file} no longer exists`);
   const parsed = parseTasks(text);
   const t = parsed.byId.get(id);
   if (!t) throw new Error(`task ${id} is no longer in ${file}`);
   const { text: next, changes } = applyBoxChange(text, id, box);
-  if (next !== text) writeFileAtomic(file, next);
+  if (next !== text) writeSpecFile(file, next);
   const res: WriteStatusResult = { changes };
   if (opts.expectHash && opts.expectHash !== t.textHash) res.stale = true;
   return res;

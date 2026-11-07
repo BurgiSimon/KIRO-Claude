@@ -108,3 +108,17 @@ test('local renderers', () => {
     ].join('\n'),
   );
 });
+
+test('a failed compaction closes "Compacting conversation..." on stderr (r5x X2)', () => {
+  const { r, out, err } = text();
+  r.event({ type: 'compaction', state: 'started' });
+  r.event({ type: 'compaction_failed', reason: 'Not enough messages to compact.\x1b[31m\x07' });
+  assert.equal(err.text, 'Compacting conversation...\nCompaction failed: Not enough messages to compact.\n');
+  r.event({ type: 'compaction', state: 'started' });
+  r.event({ type: 'compaction_failed', reason: 'Compaction cancelled', cancelled: true });
+  r.event({ type: 'compaction', state: 'started' });
+  r.event({ type: 'compaction_failed', reason: 'Compaction failed' });
+  assert.ok(err.text.endsWith('Compacting conversation...\nCompaction cancelled.\nCompacting conversation...\nCompaction failed.\n'));
+  assert.ok(!err.text.includes('✔'));
+  assert.equal(out.text, '');
+});

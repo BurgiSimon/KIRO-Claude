@@ -153,7 +153,10 @@ documents in `.kiro/specs/<feature>/`.
 * `/spec run` in chat runs one task at a time;
   `kiro-claude spec run` runs up to `kiroClaude.spec.maxParallelTasks` tasks of a wave at once.
 * A spec document that is a symbolic link is never written by a phase (the write is denied, with
-  the reason). A `.kiro`, `.kiro/specs` or feature folder that is a symbolic link works when it
+  the reason), nor read or written by kiro-claude itself: `list` and `status` show it as
+  `refused` and say why, `view` prints the reason instead of the text, `run`, `sync` and
+  `analyze` refuse to use it, `#spec:<name>` in chat leaves it out with a notice, and no phase of
+  that spec is approved or drafted (its checkpoints say why). A `.kiro`, `.kiro/specs` or feature folder that is a symbolic link works when it
   resolves inside the workspace; one that points outside it is refused the same way.
 * Ctrl+C stops a run before its next task and interrupts the running one; the next Ctrl+C kills
   the PostTaskExec hooks of a task it interrupted. In `kiro-claude spec run` that second Ctrl+C

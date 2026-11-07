@@ -14,7 +14,8 @@
  * written with its first user line, like the real claude) / --resume-session-at (a uuid the
  * transcript does not hold fails with `No message found with message.uuid of: <uuid>`, exit 1),
  * a compacted transcript loaded from its last compact boundary like the real claude 2.1.319 (the
- * summary and the messages the compaction kept verbatim; older uuids are not found).
+ * summary and the messages the compaction kept verbatim; older uuids are not found), and a
+ * scripted automatic compaction that fails (the `autoCompact` step, as 2.1.319 reports one).
  *
  * Turns are scripted with $FAKE_CLAUDE_SCRIPT (JSON file) or $FAKE_CLAUDE_SCRIPT_JSON (inline).
  * See test/fixtures/README.md for the script format and every FAKE_CLAUDE_* variable.
@@ -1486,6 +1487,27 @@ function main() {
     overloaded: 'API Error: Repeated 529 Overloaded errors',
   };
 
+  /**
+   * `{autoCompact:"failed", error?, durationMs?}`: an automatic compaction between two requests of
+   * the turn that fails. Real claude 2.1.319 reports a compaction that did not happen as
+   * `system/status` `compacting`, then `{status:null, compact_result:"failed", compact_error}` and
+   * no boundary or summary (VERIFIED for the manual refusal, r5 #8 verifier; the same frames for an
+   * automatic one, whose `compact_error` texts are UNVERIFIED), and the turn goes on. Interrupted
+   * while it runs: `compact_result:"failed"` with no `compact_error`, then the interrupted result.
+   * Only the failure is scripted (no automatic compaction that succeeds).
+   */
+  async function autoCompact(t, step) {
+    if (step.autoCompact !== 'failed') {
+      process.stderr.write(`fake-claude: autoCompact ${JSON.stringify(step.autoCompact)} is not supported (only "failed")\n`);
+      return;
+    }
+    closeMessage(t, 'end_turn'); // it runs between two requests: the open message is complete
+    emit({ type: 'system', subtype: 'status', status: 'compacting', session_id: sessionId, uuid: uuid() });
+    const done = await sleep(Number(step.durationMs ?? (env.FAKE_CLAUDE_COMPACT_MS || 5)), t.signal);
+    const error = done ? tpl(String(step.error ?? 'Conversation too long. Press esc twice to go up a few messages and try again.'), t) : undefined;
+    emit({ type: 'system', subtype: 'status', status: null, compact_result: 'failed', ...(error !== undefined ? { compact_error: error } : {}), session_id: sessionId, uuid: uuid() });
+  }
+
   async function runScripted(t) {
     const picked = pickTurn(t.userText);
     log({ event: 'turn', index: picked.index, userText: t.userText });
@@ -1507,6 +1529,8 @@ function main() {
         t.inTools = false;
       } else if (step.sleepMs !== undefined) {
         await sleep(Number(step.sleepMs), t.signal);
+      } else if (step.autoCompact !== undefined) {
+        await autoCompact(t, step);
       } else if (step.error !== undefined) {
         closeMessage(t, 'end_turn');
         const text = tpl(step.text ?? step.message ?? API_ERROR_TEXT[step.error] ?? `API Error: ${step.error}`, t);

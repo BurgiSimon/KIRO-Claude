@@ -16,6 +16,17 @@
  *  - §1.11.1 status rows `name  type  phase  done/total`; §1.11.2 state derived from files:
  *    the phase is the first missing/empty document of the type's order, else `execution` while
  *    required tasks remain, else `done`; the document before the missing one awaits approval.
+ *
+ * Every read and write here goes through spec/docfs.ts (review X1; the research is silent on
+ * links in spec folders, so this is the safest reading): a document or `.config.kiro` that is a
+ * symbolic link (or not a regular file, or behind a link that resolves to nothing, or outside the
+ * workspace) is never read; its {@link SpecDocInfo.refused} and the spec's
+ * {@link SpecSummary.refused} say why. Such a document counts as present when the phase is
+ * derived (it is never offered for drafting as if it were missing), has no known content
+ * (`nonEmpty` false) and is left out of the loaded texts and the context block. A spec folder
+ * linked out of the workspace (or dangling) is listed with its reason, and nothing in it is read;
+ * a `.kiro` or `.kiro/specs` linked out of the workspace (or dangling) is not enumerated at all
+ * ({@link specsDirRefused}: the list commands print why instead).
  */
 
 import { randomUUID } from 'node:crypto';
@@ -23,7 +34,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { WorkspaceContext } from '../types.js';
 import { expandFileRefs } from '../config/steering.js';
-import { writeFileAtomic } from '../util/fsx.js';
+import { SpecFileRefusedError, readSpecFile, specFileRefused, specFolderRefused, specRefusalText, specsRootRefused, writeSpecFile } from './docfs.js';
 import {
   SPEC_DOC_FILES,
   formatTaskLine,
@@ -61,6 +72,12 @@ export interface SpecDocInfo {
   nonEmpty: boolean;
   bytes: number;
   mtimeMs: number;
+  /**
+   * Why kiro-claude does not read this document (docfs.specFileRefused): it is a symbolic link,
+   * not a regular file, behind a link that resolves to nothing, or outside the workspace. It may
+   * still exist (`exists`); its content is unknown (`nonEmpty` false).
+   */
+  refused?: string;
 }
 
 export interface SpecSummary {
@@ -80,6 +97,11 @@ export interface SpecSummary {
   /** Document whose checkpoint is pending (exists, next one missing). */
   awaitingApproval?: SpecDocKind;
   progress?: TaskProgress;
+  /**
+   * The first reason kiro-claude does not read something of this spec: its folder, its
+   * `.config.kiro`, or a document (each document's own reason is `docs[k].refused`).
+   */
+  refused?: string;
 }
 
 export const SPEC_NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -88,6 +110,15 @@ export const CONFIG_FILE = '.config.kiro';
 /** `<workspaceRoot>/.kiro/specs`. */
 export function specsDir(ws: Pick<WorkspaceContext, 'workspaceRoot'>): string {
   return path.join(ws.workspaceRoot, '.kiro', 'specs');
+}
+
+/**
+ * Why `.kiro/specs` itself is not used (a `.kiro` or `.kiro/specs` linked out of the workspace
+ * or to nothing: docfs), else undefined. {@link listSpecs} then lists nothing (the entries are
+ * another folder's) and the list commands print this reason instead.
+ */
+export function specsDirRefused(ws: Pick<WorkspaceContext, 'workspaceRoot'>): string | undefined {
+  return specsRootRefused(ws.workspaceRoot);
 }
 
 export function isValidSpecName(name: string): boolean {
@@ -104,32 +135,53 @@ export function normalizeSpecName(raw: string): string {
     .replace(/^-+|-+$/g, '');
 }
 
-/** Existing spec folder for `name` (exact, then case-insensitive); never escapes the specs dir. */
+/**
+ * Existing spec folder for `name` (exact, then case-insensitive); never escapes the specs dir.
+ * A folder link that resolves to nothing (dangling, a loop) is found too, so the commands can say
+ * why it cannot be used ({@link SpecSummary.refused}).
+ */
 export function resolveSpecDir(ws: Pick<WorkspaceContext, 'workspaceRoot'>, name: string): string | undefined {
   const n = name.trim().replace(/[\\/]+$/, '');
   if (n === '' || n === '.' || n === '..' || /[\\/]/.test(n)) return undefined;
   const root = specsDir(ws);
   const direct = path.join(root, n);
+  if (isSpecFolderEntry(direct)) return direct;
+  // a .kiro/specs linked out of the workspace is not enumerated (the exact name above still is
+  // found, so its commands can say why)
+  if (specsDirRefused(ws)) return undefined;
   try {
-    if (fs.statSync(direct).isDirectory()) return direct;
-  } catch {
-    // fall through
-  }
-  try {
-    const hit = fs.readdirSync(root, { withFileTypes: true }).find((e) => e.isDirectory() && e.name.toLowerCase() === n.toLowerCase());
+    const hit = fs.readdirSync(root, { withFileTypes: true }).find((e) => (e.isDirectory() || e.isSymbolicLink()) && e.name.toLowerCase() === n.toLowerCase() && isSpecFolderEntry(path.join(root, e.name)));
     return hit ? path.join(root, hit.name) : undefined;
   } catch {
     return undefined;
   }
 }
 
+/** `p` is a directory (also through a link), or a symbolic link that resolves to nothing. */
+function isSpecFolderEntry(p: string): boolean {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    try {
+      return fs.lstatSync(p).isSymbolicLink();
+    } catch {
+      return false;
+    }
+  }
+}
+
 // ───────────────────────────── .config.kiro (03 §1.3) ─────────────────────────────
 
-/** Read `.config.kiro`; null when missing or unusable. Legacy `generationMode` ⇒ workflowType. */
+/**
+ * Read `.config.kiro`; null when missing, unusable or refused (a symbolic link, …: docfs).
+ * Legacy `generationMode` ⇒ workflowType.
+ */
 export function readSpecConfig(dir: string): SpecConfig | null {
   let raw: unknown;
   try {
-    raw = JSON.parse(fs.readFileSync(path.join(dir, CONFIG_FILE), 'utf8').replace(/^﻿/, ''));
+    const text = readSpecFile(path.join(dir, CONFIG_FILE));
+    if (text === undefined) return null;
+    raw = JSON.parse(text.replace(/^﻿/, ''));
   } catch {
     return null;
   }
@@ -154,13 +206,16 @@ export function formatSpecConfig(cfg: SpecConfig): string {
   return `{${entries.map(([k, v]) => `${JSON.stringify(k)}: ${JSON.stringify(v)}`).join(', ')}}`;
 }
 
+/** Write `.config.kiro` (docfs: refused through a link; throws SpecFileRefusedError). */
 export function writeSpecConfig(dir: string, cfg: SpecConfig): void {
-  writeFileAtomic(path.join(dir, CONFIG_FILE), formatSpecConfig(cfg));
+  writeSpecFile(path.join(dir, CONFIG_FILE), formatSpecConfig(cfg));
 }
 
 /**
  * Create `.kiro/specs/<name>/` with its `.config.kiro` (the adapter creates the folder itself, no
- * permission prompt — 03 §1.2). Throws when the name is invalid or the folder already exists.
+ * permission prompt — 03 §1.2). Throws when the name is invalid, the folder already exists, or
+ * the folder would not be a usable spec folder (a `.kiro` or `.kiro/specs` that is a link
+ * resolving outside the workspace or to nothing: docfs.specFolderRefused).
  */
 export function createSpecFolder(
   ws: Pick<WorkspaceContext, 'workspaceRoot'>,
@@ -169,6 +224,8 @@ export function createSpecFolder(
 ): string {
   if (!isValidSpecName(name)) throw new Error(`invalid spec name '${name}' (use kebab-case, e.g. user-authentication)`);
   const dir = path.join(specsDir(ws), name);
+  const why = specFolderRefused(dir);
+  if (why) throw new Error(specRefusalText(why));
   if (fs.existsSync(dir)) throw new Error(`spec '${name}' already exists (${dir})`);
   fs.mkdirSync(dir, { recursive: true });
   writeSpecConfig(dir, { specId: opts.specId ?? randomUUID(), workflowType: opts.workflowType, specType: opts.specType });
@@ -184,53 +241,93 @@ export function docOrder(specType: SpecType, workflowType: WorkflowType): SpecDo
   return ['requirements', 'design', 'tasks'];
 }
 
+/** Metadata of one document (lstat: never through a link at it); `refused` per docfs. */
 function docInfo(p: string): SpecDocInfo {
+  const none: SpecDocInfo = { path: p, exists: false, nonEmpty: false, bytes: 0, mtimeMs: 0 };
+  let st: fs.Stats | undefined;
   try {
-    const st = fs.statSync(p);
-    if (!st.isFile()) return { path: p, exists: false, nonEmpty: false, bytes: 0, mtimeMs: 0 };
-    let nonEmpty = st.size > 0;
-    if (nonEmpty && st.size < 4096) nonEmpty = fs.readFileSync(p, 'utf8').trim() !== '';
-    return { path: p, exists: true, nonEmpty, bytes: st.size, mtimeMs: st.mtimeMs };
+    st = fs.lstatSync(p);
   } catch {
-    return { path: p, exists: false, nonEmpty: false, bytes: 0, mtimeMs: 0 };
+    // missing
   }
+  const refused = specFileRefused(p);
+  if (refused) return { ...none, exists: st !== undefined, mtimeMs: st?.mtimeMs ?? 0, refused };
+  if (!st || !st.isFile()) return none;
+  const info: SpecDocInfo = { path: p, exists: true, nonEmpty: st.size > 0, bytes: st.size, mtimeMs: st.mtimeMs };
+  if (info.nonEmpty && st.size < 4096) info.nonEmpty = (readDoc(info) ?? '').trim() !== '';
+  return info;
 }
 
 function hasText(p: string): boolean {
   return docInfo(p).nonEmpty;
 }
 
-function readText(p: string): string | undefined {
+/**
+ * The text of document `d` (BOM removed) through docfs; undefined when it is refused, missing or
+ * unreadable. A refusal found only now (a link that appeared since `d` was taken) is recorded on `d`.
+ */
+function readDoc(d: SpecDocInfo): string | undefined {
+  if (d.refused) return undefined;
   try {
-    return fs.readFileSync(p, 'utf8').replace(/^﻿/, '');
-  } catch {
+    return readSpecFile(d.path)?.replace(/^﻿/, '');
+  } catch (e) {
+    if (e instanceof SpecFileRefusedError) {
+      d.refused = e.why;
+      d.nonEmpty = false;
+    }
     return undefined;
   }
 }
 
+/**
+ * Every distinct reason kiro-claude does not read something of spec `s` (its folder, its
+ * `.config.kiro`, each document): empty when nothing is refused.
+ */
+export function specRefusals(s: Pick<SpecSummary, 'refused' | 'docs'>): string[] {
+  return [...new Set([s.refused, ...(Object.keys(SPEC_DOC_FILES) as SpecDocKind[]).map((k) => s.docs[k].refused)].filter((r): r is string => !!r))];
+}
+
+/** A refused document that exists counts as present for the phase (never drafted over as missing). */
+function present(d: SpecDocInfo): boolean {
+  return d.nonEmpty || (d.refused !== undefined && d.exists);
+}
+
 /** Summary of one spec folder (never throws). */
 export function summarizeSpecDir(dir: string): SpecSummary {
-  const config = readSpecConfig(dir);
+  // a folder linked out of the workspace (or to nothing): nothing in it is read
+  const folderWhy = specFolderRefused(dir);
+  const config = folderWhy ? null : readSpecConfig(dir);
+  const configWhy = folderWhy ? undefined : specFileRefused(path.join(dir, CONFIG_FILE));
   const docs = {} as Record<SpecDocKind, SpecDocInfo>;
-  for (const k of Object.keys(SPEC_DOC_FILES) as SpecDocKind[]) docs[k] = docInfo(path.join(dir, SPEC_DOC_FILES[k]));
+  for (const k of Object.keys(SPEC_DOC_FILES) as SpecDocKind[]) {
+    const p = path.join(dir, SPEC_DOC_FILES[k]);
+    docs[k] = folderWhy ? { path: p, exists: fs.existsSync(p), nonEmpty: false, bytes: 0, mtimeMs: 0, refused: folderWhy } : docInfo(p);
+  }
   const specType: SpecType = config?.specType ?? (docs.bugfix.nonEmpty ? 'bugfix' : 'feature');
   const workflowType: WorkflowType = config?.workflowType ?? 'requirements-first';
   const order = docOrder(specType, workflowType);
   const s: SpecSummary = { name: path.basename(dir), dir, config, specType, workflowType, docs, order, phase: order[0]! };
   if (docs.tasks.nonEmpty) {
-    const text = readText(docs.tasks.path);
+    const text = readDoc(docs.tasks);
     if (text !== undefined) s.progress = taskProgress(parseTasks(text));
   }
-  const idx = order.findIndex((d) => !docs[d].nonEmpty);
+  const idx = order.findIndex((d) => !present(docs[d]));
   if (idx >= 0) {
     s.phase = order[idx]!;
     if (idx > 0) s.awaitingApproval = order[idx - 1]!;
+  } else if (docs.tasks.refused) {
+    // tasks.md exists but is not read: it is the document under review, never drafted over
+    s.phase = 'tasks';
+    s.awaitingApproval = 'tasks';
   } else if (!s.progress || s.progress.total === 0) {
     s.phase = 'tasks';
     s.awaitingApproval = order[1]!;
   } else {
     s.phase = s.progress.requiredDone < s.progress.requiredTotal ? 'execution' : 'done';
   }
+  const docWhy = [...order, ...(Object.keys(SPEC_DOC_FILES) as SpecDocKind[])].map((k) => docs[k].refused).find((r) => r !== undefined);
+  const refused = folderWhy ?? configWhy ?? docWhy;
+  if (refused) s.refused = refused;
   return s;
 }
 
@@ -240,9 +337,14 @@ export function summarizeSpec(ws: Pick<WorkspaceContext, 'workspaceRoot'>, name:
   return dir ? summarizeSpecDir(dir) : undefined;
 }
 
-/** Every spec folder under `.kiro/specs` (hidden folders skipped), sorted by name. */
+/**
+ * Every spec folder under `.kiro/specs` (hidden folders skipped), sorted by name; also a folder
+ * link that resolves to nothing (listed with its {@link SpecSummary.refused} reason). Nothing when
+ * `.kiro/specs` itself is refused ({@link specsDirRefused}): its entries are not read.
+ */
 export function listSpecs(ws: Pick<WorkspaceContext, 'workspaceRoot'>): SpecSummary[] {
   const root = specsDir(ws);
+  if (specsDirRefused(ws)) return [];
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(root, { withFileTypes: true });
@@ -250,17 +352,9 @@ export function listSpecs(ws: Pick<WorkspaceContext, 'workspaceRoot'>): SpecSumm
     return [];
   }
   return entries
-    .filter((e) => !e.name.startsWith('.') && (e.isDirectory() || (e.isSymbolicLink() && isDir(path.join(root, e.name)))))
+    .filter((e) => !e.name.startsWith('.') && (e.isDirectory() || (e.isSymbolicLink() && isSpecFolderEntry(path.join(root, e.name)))))
     .map((e) => summarizeSpecDir(path.join(root, e.name)))
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-}
-
-function isDir(p: string): boolean {
-  try {
-    return fs.statSync(p).isDirectory();
-  } catch {
-    return false;
-  }
 }
 
 // ───────────────────────────── loaded spec ─────────────────────────────
@@ -276,14 +370,15 @@ export interface LoadedSpec extends SpecSummary {
   lint: LintIssue[];
 }
 
-/** Read and parse every document of a spec folder. */
+/** Read and parse every document of a spec folder (refused documents are left out: `docs[k].refused`). */
 export function loadSpecDir(dir: string): LoadedSpec {
   const s = summarizeSpecDir(dir);
   const out: LoadedSpec = { ...s, texts: {}, criteriaIds: [], lint: [] };
   for (const k of Object.keys(SPEC_DOC_FILES) as SpecDocKind[]) {
     if (!s.docs[k].exists) continue;
-    const t = readText(s.docs[k].path);
+    const t = readDoc(s.docs[k]);
     if (t !== undefined) out.texts[k] = t;
+    else if (s.docs[k].refused) out.refused ??= s.docs[k].refused;
   }
   if (out.texts.requirements !== undefined && s.docs.requirements.nonEmpty) out.requirements = parseRequirements(out.texts.requirements);
   if (out.texts.bugfix !== undefined && s.docs.bugfix.nonEmpty) out.bugfix = parseBugfix(out.texts.bugfix);
@@ -315,15 +410,16 @@ function xmlAttr(s: string): string {
 
 /**
  * `<spec name=… path=…>` block with the requirements (or bugfix), design and tasks documents, each
- * as `[abs path]\ncontent`, `#[[file:…]]` references expanded (03 §1.10.8, §4 `#spec:`).
+ * as `[abs path]\ncontent`, `#[[file:…]]` references expanded (03 §1.10.8, §4 `#spec:`). A refused
+ * document (`docs[k].refused`, also one found refused only now) is never read into it.
  */
 export function specContextBlock(ws: WorkspaceContext, spec: Pick<SpecSummary, 'name' | 'dir' | 'docs' | 'specType'>): string | undefined {
   const kinds: SpecDocKind[] = spec.specType === 'bugfix' ? ['bugfix', 'design', 'tasks'] : ['requirements', 'bugfix', 'design', 'tasks'];
   const parts: string[] = [];
   for (const k of kinds) {
     const d = spec.docs[k];
-    if (!d.exists || !d.nonEmpty) continue;
-    const raw = readText(d.path);
+    if (!d.exists || !d.nonEmpty || d.refused) continue;
+    const raw = readDoc({ ...d });
     if (raw === undefined) continue;
     let body = raw.replace(/\r\n?/g, '\n');
     try {
@@ -339,8 +435,12 @@ export function specContextBlock(ws: WorkspaceContext, spec: Pick<SpecSummary, '
 
 // ───────────────────────────── formatting ─────────────────────────────
 
-/** Phase column: `new`, `<doc> ✓` (document written, next pending), `tasks ✓`, `done`. */
-export function phaseLabel(s: Pick<SpecSummary, 'phase' | 'awaitingApproval' | 'order'>): string {
+/**
+ * Phase column: `new`, `<doc> ✓` (document written, next pending), `tasks ✓`, `done`; `refused`
+ * when kiro-claude does not read some of the spec's files ({@link formatSpecRefusals} says why).
+ */
+export function phaseLabel(s: Pick<SpecSummary, 'phase' | 'awaitingApproval' | 'order'> & { refused?: string | undefined }): string {
+  if (s.refused) return 'refused';
   if (s.phase === 'done') return 'done';
   if (s.phase === 'execution') return 'tasks ✓';
   if (s.awaitingApproval) return `${s.awaitingApproval} ✓`;
@@ -360,6 +460,14 @@ export function formatSpecList(specs: readonly SpecSummary[]): string {
   return rows
     .map((r) => r.map((c, i) => (i < 3 ? c + ' '.repeat(widths[i]! - [...c].length) : c)).join('  '))
     .join('\n');
+}
+
+/**
+ * One `⚠ <name>: <why>: <rule>` line per spec of `specs` that has a refusal (empty when none):
+ * printed after {@link formatSpecList} (a warning, never a row of the table).
+ */
+export function formatSpecRefusals(specs: readonly Pick<SpecSummary, 'name' | 'refused'>[]): string[] {
+  return specs.filter((s) => s.refused).map((s) => `⚠ ${s.name}: ${specRefusalText(s.refused!)}`);
 }
 
 /** Short description of a phase document's content ("8 requirements, 41 criteria"). */
@@ -398,7 +506,7 @@ export function formatSpecStatus(spec: LoadedSpec, opts: { showTasks?: boolean }
   for (const k of spec.order) {
     const d = spec.docs[k];
     const file = SPEC_DOC_FILES[k];
-    lines.push(`  ${file.padEnd(16)}${d.nonEmpty ? `✓  ${docSummary(spec, k)}` : '—  not written yet'}`);
+    lines.push(`  ${file.padEnd(16)}${d.refused ? '⚠  not read (below)' : d.nonEmpty ? `✓  ${docSummary(spec, k)}` : '—  not written yet'}`);
   }
   const phase =
     spec.phase === 'execution'
@@ -406,7 +514,9 @@ export function formatSpecStatus(spec: LoadedSpec, opts: { showTasks?: boolean }
       : spec.phase === 'done'
         ? 'done'
         : spec.awaitingApproval
-          ? `${SPEC_DOC_FILES[spec.awaitingApproval]} awaiting approval (next: ${SPEC_DOC_FILES[spec.phase]})`
+          ? spec.awaitingApproval === spec.phase
+            ? `${SPEC_DOC_FILES[spec.phase]} awaiting approval`
+            : `${SPEC_DOC_FILES[spec.awaitingApproval]} awaiting approval (next: ${SPEC_DOC_FILES[spec.phase]})`
           : `drafting ${SPEC_DOC_FILES[spec.phase]}`;
   lines.push(`Phase: ${phase}`);
   if (spec.tasks) {
@@ -420,6 +530,11 @@ export function formatSpecStatus(spec: LoadedSpec, opts: { showTasks?: boolean }
   if (spec.lint.length) {
     lines.push('');
     for (const i of spec.lint) lines.push(`⚠ ${i.message}`);
+  }
+  const why = specRefusals(spec);
+  if (why.length) {
+    lines.push('');
+    for (const w of why) lines.push(`⚠ ${specRefusalText(w)}`);
   }
   return lines.join('\n');
 }
@@ -436,5 +551,6 @@ export function specSummaryJson(s: SpecSummary): Record<string, unknown> {
     awaitingApproval: s.awaitingApproval ?? null,
     documents: Object.fromEntries(s.order.map((k) => [k, s.docs[k].nonEmpty])),
     progress: s.progress ?? null,
+    refused: s.refused ?? null,
   };
 }

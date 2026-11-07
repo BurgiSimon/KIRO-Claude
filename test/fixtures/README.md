@@ -175,6 +175,7 @@ closes it; `num_turns` counts messages):
 | `{"tool": {"name": "Bash", "input": {…}, "result"?: "…" \| {…}, "is_error"?: bool, "tool_use_result"?: any, "id"?: "toolu_x", "durationMs"?: n, "permission"?: "allow"\|"ask"\|"deny", "cancelAfterMs"?: n, "agent_id"?: "…", "agent_type"?: "…", "parent_tool_use_id"?: "…"}}` | one tool call through the gate (above). `result` defaults per tool (`(Bash completed with no output)`, `1\tcontents of <file_path>`, …). `durationMs` = interruptible run time. `cancelAfterMs` = if `can_use_tool` is not answered in time, send `control_cancel_request` and abort the turn. `agent_*` = call made inside a subagent. |
 | `{"parallel": [toolSpec, toolSpec, …]}` | several tool_use blocks in one message; gates run concurrently; results emitted in order |
 | `{"sleepMs": n}` | wait (interruptible) |
+| `{"autoCompact": "failed", "error"?: "…", "durationMs"?: n}` | an automatic compaction between two requests of the turn that fails, as claude 2.1.319 reports one: the open assistant message ends, `system/status` `compacting`, then after `durationMs` (default `FAKE_CLAUDE_COMPACT_MS`, 5 ms; interruptible) `system/status` `{status:null, compact_result:"failed", compact_error:<error>}`; no boundary, summary or transcript entry, and the turn goes on with the next step. `error` defaults to `Conversation too long. Press esc twice to go up a few messages and try again.` (the frames are VERIFIED for the manual refusal; the texts of an automatic failure are UNVERIFIED). Interrupted while it runs: `compact_result:"failed"` with no `compact_error`, then the interrupted result. Only the failure is scripted |
 | `{"error": "authentication_failed" \| "rate_limit" \| "billing_error" \| "overloaded" \| …, "text"?: "…"}` | synthetic assistant frame with top-level `error` (`Not logged in · Please run /login` for auth), then result `is_error:true`, `terminal_reason:"api_error"`; remaining steps skipped |
 | `{"result": {…}}` | fields merged into this turn's result frame (e.g. `{"stop_reason":"refusal"}`) |
 | `{"control": {"subtype": "elicitation", …}}` | send a CLI→host control_request and wait; the raw answer is available as `{{lastControlResponse}}` |
@@ -280,7 +281,8 @@ not leak settings into each other.
 
 ### Known differences from the real CLI
 
-* No real model, tools, MCP connections, subagents, background tasks or auto-compaction.
+* No real model, tools, MCP connections, subagents, background tasks or auto-compaction (an
+  automatic compaction that fails can be scripted: the `autoCompact` step).
 * Hook callback `timeout` is not enforced; `onFailure:"continue"` + error = no decision.
 * `--agents`, `--plugin-dir`, `--append-system-prompt-file`, `--system-prompt-snapshot`, `--add-dir`,
   `--setting-sources` are accepted and logged (inspect `argv` in the log) but have no effect.

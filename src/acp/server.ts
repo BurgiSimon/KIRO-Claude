@@ -52,6 +52,20 @@
  * servers, a `_kiro.dev/metadata` and `available_commands_update` (08b §4.4); `_session/steer`
  * answers `{queued:true}` before its `AgentExecutionUserMessageQueued` notification.
  *
+ * Compaction status (05 §4.5.4, §7.11; r5x X2): a manual `/compact` sends `started`, then
+ * `completed{summary}` or `failed` with the reason. An automatic compaction inside a prompt turn
+ * sends `started` when Claude starts it, `completed{summary}` once its summary is seen, or
+ * `failed` when it did not compact: Claude reported it failed (the session's
+ * `compaction_failed`), or it is still open when the turn ends (`Compaction cancelled` for a
+ * cancelled turn). Every `started` gets its end before the prompt response, and the response is
+ * what Claude answered (a failed compaction does not fail the turn). A `failed` frame carries the
+ * reason in `summary` (05 §4.5.4) and also in `reason`, the key KiroCrew reads for the notice of
+ * a failure inside a turn (KC acp/compaction_errors.py; kiro-cli sends no reason, so this is an
+ * addition). An automatic compaction's `failed` goes out just before the session's next frame of
+ * the turn, or before the response when nothing follows ({@link AcpServer.flushCompactionFailure});
+ * a frame that answers the client (a steer queued or cleared) does not count. A compaction Claude
+ * never ends is ended by the session at Claude's next output, so its `failed` precedes the answer.
+ *
  * Permission flow (05 §6.1, 08 KC-ACP-11/12): the gate inside the session asks this server's
  * `requestApproval`; it makes sure the `tool_call` frame went out first, sends
  * `session/request_permission` with kiro-cli's three options and maps the outcome:
@@ -494,6 +508,12 @@ class TurnCtx {
   compactionPending = false;
   compactionSummary: string | undefined;
   compactionStarted = false;
+  /**
+   * The reason of an auto-compaction that failed (the session's `compaction_failed`), whose
+   * `failed` status waits for the session's next frame or the turn's end (r5x X2, see
+   * {@link AcpServer.flushCompactionFailure}).
+   */
+  compactionFailure: string | undefined;
   /** A manual compaction's compact_boundary was seen: Claude compacted the conversation. */
   compacted = false;
   readonly startedAt = Date.now();
@@ -856,11 +876,45 @@ export class AcpServer {
   }
 
   private update(sessionId: string, update: Record<string, unknown>): void {
+    this.flushCompactionFailure(sessionId);
     this.conn.notify('session/update', { sessionId, update });
   }
 
-  private kiroUpdate(sessionId: string, update: Record<string, unknown>): void {
+  /**
+   * `release` false: a frame that answers the client during the turn (a steer queued or cleared),
+   * not one of Claude's: it does not release a held compaction failure (r5x X2 verifier: sent
+   * with it during Claude's silence after the failure, it would start KiroCrew's 60 s
+   * post-failure clock there).
+   */
+  private kiroUpdate(sessionId: string, update: Record<string, unknown>, release = true): void {
+    if (release) this.flushCompactionFailure(sessionId);
     this.conn.notify('_kiro.dev/session/update', { sessionId, update });
+  }
+
+  /** `_kiro.dev/compaction/status` `failed`: the reason in `summary` (05 §4.5.4) and `reason`. */
+  private notifyCompactionFailed(sessionId: string, reason: string): void {
+    this.conn.notify('_kiro.dev/compaction/status', { sessionId, status: { type: 'failed' }, summary: reason, reason });
+  }
+
+  /**
+   * r5x X2: the `failed` status of an auto-compaction that failed inside a prompt turn goes out
+   * just before the session's next frame of that turn (or at its end, {@link settleAutoCompaction}),
+   * not when Claude reports it. KiroCrew reads a `failed` inside a turn as the start of a 60 s
+   * post-failure budget: no frame for 60 s (and no tool in flight) and it ends the turn itself as
+   * `error: compaction failed`, resetting the session (KC acp/client_turn.py,
+   * acp/session_handle_dispatch.py `_COMPACTION_FAILED_TURN_BUDGET`). Claude goes on after a failed
+   * auto-compaction, and the request that follows can be silent for a long time (a long context,
+   * API retries); sent with the frame that ends that silence, the failure never makes KiroCrew
+   * abandon a turn that is still running. The order stays what happened: what came before the
+   * failure, the failure, the answer after it (the dashboard drops text streamed before a
+   * compaction terminal and keeps the text after it, KC dashboard/chat_turn/session_events.py).
+   */
+  private flushCompactionFailure(sessionId: string): void {
+    const turn = this.sessions.get(sessionId)?.turn;
+    const reason = turn?.compactionFailure;
+    if (turn === undefined || reason === undefined) return;
+    turn.compactionFailure = undefined;
+    this.notifyCompactionFailed(sessionId, reason);
   }
 
   private getSession(sessionId: unknown): AcpSessionState {
@@ -1565,7 +1619,7 @@ export class AcpServer {
     st.steers.push({ id, text });
     const content = st.steers.map((s) => s.text).join('\n\n');
     return respondThen({ queued: true }, () => {
-      this.kiroUpdate(st.id, { sessionUpdate: 'AgentExecutionUserMessageQueued', messageId: id, content });
+      this.kiroUpdate(st.id, { sessionUpdate: 'AgentExecutionUserMessageQueued', messageId: id, content }, false);
     });
   }
 
@@ -1586,7 +1640,7 @@ export class AcpServer {
     if (dropped.length === 0 && written.length === 0) return { cleared: true };
     for (const [, w] of written) w.clearing = true;
     const report = (ids: string[]): void => {
-      if (ids.length && !st.closed) this.kiroUpdate(st.id, { sessionUpdate: 'AgentExecutionUserMessageCleared', messageIds: ids });
+      if (ids.length && !st.closed) this.kiroUpdate(st.id, { sessionUpdate: 'AgentExecutionUserMessageCleared', messageIds: ids }, false);
     };
     return respondThen({ cleared: true }, () => {
       if (written.length === 0) return report(dropped);
@@ -1868,6 +1922,7 @@ export class AcpServer {
           return;
         }
         if (ev.state === 'started') {
+          this.flushCompactionFailure(st.id);
           turn.compactionStarted = true;
           this.conn.notify('_kiro.dev/compaction/status', { sessionId: st.id, status: { type: 'started' }, summary: null });
         } else if (turn.compactionSummary !== undefined) {
@@ -1875,6 +1930,16 @@ export class AcpServer {
         } else {
           turn.compactionPending = true;
         }
+        return;
+      case 'compaction_failed':
+        // a manual one is reported from its turn's result (runCompaction); an auto-compaction's
+        // `failed` goes out before the session's next frame (flushCompactionFailure); one that
+        // was never reported started has nothing to end
+        if (st.manualCompaction || !turn.compactionStarted) return;
+        turn.compactionStarted = false;
+        turn.compactionPending = false;
+        turn.compactionSummary = undefined;
+        turn.compactionFailure = ev.reason;
         return;
       case 'subagent': {
         // The list is the CURRENT one: KiroCrew reads kiro-cli's as a full snapshot rebuilt on every
@@ -1925,6 +1990,26 @@ export class AcpServer {
     turn.compactionStarted = false;
     this.conn.notify('_kiro.dev/compaction/status', { sessionId: st.id, status: { type: 'completed' }, summary: turn.compactionSummary ?? '' });
     turn.compactionSummary = undefined;
+  }
+
+  /**
+   * At the end of a prompt turn, before its response (r5x X2): an auto-compaction finished whose
+   * summary was not seen is `completed`; one still open ends `failed` (`Compaction cancelled` for
+   * a cancelled turn, else `Claude Code did not finish the compaction`: the session publishes its
+   * own end first whenever it can, so this is for a turn whose events stopped, e.g. a child that
+   * never answered the cancel); a held failure goes out. KiroCrew waits for the end of every
+   * `started` ("the provider layer guarantees a terminal arrives", KC
+   * dashboard/chat_turn/session_events.py). Nothing for a closed session.
+   */
+  private settleAutoCompaction(st: AcpSessionState, turn: TurnCtx): void {
+    if (turn.compactionPending || (turn.compactionStarted && turn.compactionSummary !== undefined)) this.finishAutoCompaction(st, turn);
+    else if (turn.compactionStarted) {
+      turn.compactionStarted = false;
+      turn.compactionFailure ??= turn.cancelled || st.closed ? 'Compaction cancelled' : 'Claude Code did not finish the compaction';
+    }
+    const reason = turn.compactionFailure;
+    turn.compactionFailure = undefined;
+    if (reason !== undefined && !st.closed) this.notifyCompactionFailed(st.id, reason);
   }
 
   /** Raw Claude frames: result/usage hints, subagent tool frames, compaction summaries. */
@@ -2122,6 +2207,7 @@ export class AcpServer {
   }
 
   private notifySubagents(st: AcpSessionState): void {
+    this.flushCompactionFailure(st.id);
     this.conn.notify('_kiro.dev/subagent/list_update', { sessionId: st.id, subagents: [...st.subagents.values()] });
   }
 
@@ -2167,6 +2253,7 @@ export class AcpServer {
         // 05 §4.6 step 5: no result within the grace period after cancel — answer now, then
         // restart the child with --resume (the stuck turn would block this session's queue forever)
         this.log.warn(`acp[${st.id}]: no result ${this.timings.cancelGraceMs} ms after cancel; answering cancelled and restarting Claude Code`);
+        this.settleAutoCompaction(st, turn);
         this.failOpenTools(st);
         turn.detached = true;
         this.endTurn(st, turn);
@@ -2178,7 +2265,7 @@ export class AcpServer {
     } catch (e) {
       failure = e;
     }
-    if (turn.compactionPending || (turn.compactionStarted && turn.compactionSummary !== undefined)) this.finishAutoCompaction(st, turn);
+    this.settleAutoCompaction(st, turn);
     this.failOpenTools(st);
     this.endTurn(st, turn);
     if (st.closed || turn.cancelled) {
@@ -2388,7 +2475,7 @@ export class AcpServer {
     const cancelled = !ok && (turn.cancelled || st.closed);
     if (st.closed) return { ok, cancelled, reason };
     if (ok) this.conn.notify('_kiro.dev/compaction/status', { sessionId: st.id, status: { type: 'completed' }, summary: turn.compactionSummary ?? '' });
-    else this.conn.notify('_kiro.dev/compaction/status', { sessionId: st.id, status: { type: 'failed' }, summary: reason });
+    else this.notifyCompactionFailed(st.id, reason);
     if (stuck) {
       await this.replaceStuckSession(st, stuck);
       if (st.closed) return { ok, cancelled, reason };
