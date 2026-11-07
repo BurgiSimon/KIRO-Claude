@@ -358,11 +358,17 @@ export interface HookRunnerLike {
 /**
  * What `/hooks run <name>` actually ran ({@link KiroSession.runManualHook}): the Manual hook
  * {@link HookRunnerLike.runManual} picked (exact name, then case-insensitive). `agent`: its prompt,
- * which the caller sends as a user turn (03 §2.5); `command`: its output; `disabled`: nothing ran
- * (the session already showed the warning); `not-found`: no Manual hook has that name (hooks of
- * other triggers never run here).
+ * which the caller sends as a user turn (03 §2.5); `command`: its output; `cancelled`: the
+ * caller's signal aborted the command (Ctrl+C), which was killed with its process group, output
+ * dropped; `disabled`: nothing ran (the session already showed the warning); `not-found`: no
+ * Manual hook has that name (hooks of other triggers never run here).
  */
-export type ManualHookRun = { kind: 'agent'; prompt: string } | { kind: 'command'; output: string } | { kind: 'disabled' } | { kind: 'not-found' };
+export type ManualHookRun =
+  | { kind: 'agent'; prompt: string }
+  | { kind: 'command'; output: string }
+  | { kind: 'cancelled' }
+  | { kind: 'disabled' }
+  | { kind: 'not-found' };
 
 // ───────────────────────────── Gate / approvals ─────────────────────────────
 
@@ -469,8 +475,8 @@ export interface SessionRecord {
    * Context for this conversation's next user turn: the summary (`/tangent merge`) or last
    * exchange (`/tangent tail`) of a tangent that returned into it (01 §5.11, 06 §6.4). Kept on
    * the record so it reaches THIS conversation even after a quit, a `/chat save` + `/chat load` or
-   * another tangent (which gets a copy, as a fork of this history); consumed by its next prompt
-   * that Claude receives.
+   * a fork of it (another tangent, a spec-phase session: each gets a copy, as a fork of this
+   * history); removed once the line of its next prompt is written to Claude.
    */
   pendingContext?: string[];
 }
@@ -690,9 +696,10 @@ export interface KiroSession extends EventEmitter {
   /**
    * /hooks run: what ran, tagged ({@link ManualHookRun}): a command hook's output, or an
    * agent-action hook's prompt, which the caller sends as a user turn (the session does not
-   * queue it); hook warnings (e.g. disabled) are shown as notices.
+   * queue it); hook warnings (e.g. disabled) are shown as notices. `signal` (the REPL's command
+   * signal, aborted by Ctrl+C) kills a running command hook: the run answers `cancelled`.
    */
-  runManualHook(name: string): Promise<ManualHookRun>;
+  runManualHook(name: string, o?: { signal?: AbortSignal }): Promise<ManualHookRun>;
 
   /** /chat save; returns the written path. */
   exportTo(path: string, force: boolean): Promise<string>;

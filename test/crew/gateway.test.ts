@@ -10,7 +10,7 @@ import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { readState } from '../../src/crew/state.js';
-import { defaultSys } from '../../src/crew/runner.js';
+import { defaultSys, type CrewSys, type ProcessInfo } from '../../src/crew/runner.js';
 import { cloneFakeEnv, crew, freePort, makeFakeEnv, realPython, type FakeEnv } from './helpers.js';
 
 const PY = realPython();
@@ -39,6 +39,81 @@ function gatewayPid(fe: FakeEnv): number | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** Start time of a process (`/proc/<pid>/stat` field 22, clock ticks since boot). */
+function procStart(pid: number): number | undefined {
+  try {
+    const s = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const v = Number(s.slice(s.lastIndexOf(')') + 1).trim().split(/\s+/)[19]);
+    return Number.isInteger(v) ? v : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Running = not gone and not a zombie (a zombie has an empty cmdline). */
+function running(pid: number): boolean {
+  try {
+    return fs.readFileSync(`/proc/${pid}/cmdline`).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** `pid` still runs the process that had start time `start` (not a later one reusing the pid). */
+function stillRuns(pid: number, start: number | undefined): boolean {
+  return running(pid) && procStart(pid) === start;
+}
+
+type Proc = ProcessInfo & { startTime?: number };
+
+/**
+ * The real CrewSys, except that pid `g` (the gateway) is reused `delayMs` after the real gateway
+ * has gone: by an unrelated process U (`uAlive`; else U has exited already) leading group `g`,
+ * whose children never were in the gateway's tree: V of another crew (another HOME and
+ * KIROCREW_KIRO_BIN) and, with `members: 'both'`, W of this crew (its HOME and KIROCREW_KIRO_BIN,
+ * like a gateway restarted at once). Signals to the reused pid and to V/W are recorded, never sent.
+ * With `hidden`, U (and V/W) belong to another user and /proc hides them (`hidepid`): signal 0
+ * answers EPERM (it exists), its stat cannot be read, it is not listed, and a signal is refused.
+ */
+function reusedPidSys(g: number, o: { delayMs: number; uAlive: boolean; members: 'both' | 'other'; home: string; kiroBin: string; other: string; hidden?: boolean }) {
+  const real = defaultSys;
+  const signals: Array<{ pid: number; signal: string }> = [];
+  const uStart = (procStart(g) ?? 0) + 1000;
+  const V = 2 ** 22 + 101; // above any pid_max: never a real process
+  const W = 2 ** 22 + 102;
+  const ppid = o.uAlive ? g : 1;
+  const sleepArgv = ['/usr/bin/sleep', '30'];
+  const fakes: Proc[] = [
+    { pid: V, ppid, pgid: g, argv: sleepArgv, startTime: uStart + 1, env: { HOME: o.other, KIROCREW_KIRO_BIN: path.join(o.other, '.local', 'share', 'kiro-claude', 'crew', 'bin', 'kiro-claude'), KIROCREW_SPAWNED: '1' } },
+    ...(o.members === 'both' ? [{ pid: W, ppid, pgid: g, argv: sleepArgv, startTime: uStart + 2, env: { HOME: o.home, KIROCREW_KIRO_BIN: o.kiroBin, KIROCREW_SPAWNED: '1' } }] : []),
+  ];
+  const U: Proc = { pid: g, ppid: 1, pgid: g, argv: sleepArgv, startTime: uStart, env: { HOME: o.other, PATH: '/usr/bin:/bin' } };
+  const fakePids = new Set(fakes.map((p) => p.pid));
+  let goneAt: number | undefined;
+  const reused = (): boolean => {
+    if (goneAt === undefined && !real.isAlive(g)) goneAt = Date.now();
+    return goneAt !== undefined && Date.now() - goneAt >= o.delayMs;
+  };
+  const sys = {
+    ...real,
+    isAlive: (pid: number) => (pid === g && reused() ? o.uAlive : fakePids.has(pid) ? reused() : real.isAlive(pid)),
+    startTime: (pid: number) =>
+      pid === g && reused() ? (o.uAlive && !o.hidden ? uStart : undefined) : fakePids.has(pid) ? (o.hidden ? undefined : fakes.find((p) => p.pid === pid)!.startTime) : procStart(pid),
+    kill: (pid: number, signal: NodeJS.Signals) => {
+      if (fakePids.has(pid) || (pid === g && !real.isAlive(g))) {
+        signals.push({ pid, signal });
+        return !o.hidden && reused();
+      }
+      return real.kill(pid, signal);
+    },
+    listProcesses: () => {
+      const list = real.listProcesses();
+      return reused() ? [...list.filter((p) => p.pid !== g), ...(o.hidden ? [] : [...(o.uAlive ? [U] : []), ...fakes])] : list;
+    },
+  } as CrewSys;
+  return { sys, signals, V, W };
 }
 
 describe('crew start / status / open / stop (08 §3.8)', { skip: PY ? false : 'no python3 with sqlite3' }, () => {
@@ -232,6 +307,169 @@ describe('crew start / status / open / stop (08 §3.8)', { skip: PY ? false : 'n
       }
     });
   }
+
+  it('stop: retires a child the gateway starts while it shuts down (not in the snapshot; found in its process group)', { skip: process.platform !== 'linux' ? 'needs /proc' : false }, async () => {
+    const fe = await setUp({ FAKE_GATEWAY_CHILD: 'late' });
+    let child: number | undefined;
+    try {
+      let r = await crew(fe, ['start', '--port', String(await freePort())]);
+      assert.equal(r.code, 0, r.stderr);
+      assert.equal(fs.existsSync(path.join(kcHome(fe), 'fake-gateway-child.json')), false);
+      r = await crew(fe, ['stop']);
+      assert.equal(r.code, 0, r.stderr);
+      assert.match(r.stdout, /^Stopped \(pid \d+\); 0 orphan agent process\(es\) reaped\n$/);
+      child = (JSON.parse(fs.readFileSync(path.join(kcHome(fe), 'fake-gateway-child.json'), 'utf8')) as { pid: number }).pid;
+      assert.equal(running(child), false, 'the late gateway child outlived crew stop');
+    } finally {
+      if (child !== undefined && running(child)) process.kill(child, 'SIGKILL');
+      fe.cleanup();
+    }
+  });
+
+  // G6: once crew stop has seen the gateway go, its pid (and, for a detached gateway, its process
+  // group id) can be taken by any other process. Nothing that never was in the gateway's tree may
+  // be signalled, and the stop is still reported as done.
+  const reuseCases = [
+    { name: 'a --foreground gateway whose pid is reused during the retire wait', foreground: true, delayMs: 300, uAlive: true, members: 'both' },
+    { name: 'a detached gateway whose pid and group are reused during the retire wait', foreground: false, delayMs: 300, uAlive: true, members: 'both' },
+    { name: 'a detached gateway whose pid is reused as soon as it exits', foreground: false, delayMs: 0, uAlive: true, members: 'both' },
+    { name: "a detached gateway whose group id is left to another crew's process as soon as it exits", foreground: false, delayMs: 0, uAlive: false, members: 'other' },
+  ] as const;
+  for (const rc of reuseCases) {
+    it(`stop: ${rc.name} → no foreign process is signalled, the stop is reported`, { skip: process.platform !== 'linux' ? 'needs /proc' : false }, async () => {
+      const fe = await setUp({ FAKE_GATEWAY_CHILD: 'stubborn' });
+      let child: number | undefined;
+      let childStart: number | undefined;
+      let gw: { pid: number; start?: number } | undefined;
+      let fg: Promise<{ code: number; stdout: string; stderr: string }> | undefined;
+      try {
+        const port = await freePort();
+        if (rc.foreground) {
+          fg = crew(fe, ['start', '--foreground', '--port', String(port)]);
+          for (let i = 0; i < 200 && (!gatewayPid(fe) || !fs.existsSync(path.join(kcHome(fe), 'fake-gateway-child.json'))); i++) await new Promise((res) => setTimeout(res, 50));
+        } else {
+          const r = await crew(fe, ['start', '--port', String(port)]);
+          assert.equal(r.code, 0, r.stderr);
+        }
+        const g = gatewayPid(fe)!;
+        assert.ok(g, 'the gateway runs');
+        gw = { pid: g, start: procStart(g) };
+        child = (JSON.parse(fs.readFileSync(path.join(kcHome(fe), 'fake-gateway-child.json'), 'utf8')) as { pid: number }).pid;
+        childStart = procStart(child);
+        const other = path.join(fe.root, 'other-home');
+        const sim = reusedPidSys(g, { ...rc, home: fe.home, kiroBin: path.join(fe.cs, 'bin', 'kiro-claude'), other });
+        const r = await crew(fe, ['stop', '--timeout', '2'], { deps: { sys: sim.sys } });
+        assert.deepEqual(sim.signals, [], `crew stop signalled processes that never were in the gateway's tree (U = ${g}, V = ${sim.V}, W = ${sim.W})`);
+        assert.deepEqual({ code: r.code, stderr: r.stderr }, { code: 0, stderr: '' }, 'the gateway did stop');
+        assert.equal(r.stdout, `Stopped (pid ${g}); 0 orphan agent process(es) reaped\n`);
+        assert.equal(stillRuns(child, childStart), false, "the gateway's own stubborn child outlived crew stop");
+        if (fg) assert.equal((await fg).code, 0);
+      } finally {
+        if (child !== undefined && stillRuns(child, childStart)) process.kill(child, 'SIGKILL');
+        if (gw && stillRuns(gw.pid, gw.start)) process.kill(gw.pid, 'SIGKILL');
+        await fg;
+        fe.cleanup();
+      }
+    });
+  }
+
+  // G6 (verifier): the same, on the paths the cases above do not reach.
+  it('stop: a gateway pid taken by another user\'s process that /proc hides (hidepid) as soon as it exits → gone at once, nothing signalled, the stop is reported', { skip: process.platform !== 'linux' ? 'needs /proc' : false }, async () => {
+    const fe = await setUp();
+    let gw: { pid: number; start?: number } | undefined;
+    try {
+      let r = await crew(fe, ['start', '--port', String(await freePort())]);
+      assert.equal(r.code, 0, r.stderr);
+      const g = gatewayPid(fe)!;
+      gw = { pid: g, start: procStart(g) };
+      const sim = reusedPidSys(g, { delayMs: 0, uAlive: true, members: 'other', hidden: true, home: fe.home, kiroBin: path.join(fe.cs, 'bin', 'kiro-claude'), other: path.join(fe.root, 'other-home') });
+      const t0 = Date.now();
+      r = await crew(fe, ['stop', '--timeout', '5'], { deps: { sys: sim.sys } });
+      assert.deepEqual(sim.signals, [], `crew stop signalled pid ${g} after another user's process took it`);
+      assert.deepEqual({ code: r.code, stderr: r.stderr }, { code: 0, stderr: '' }, 'the gateway did stop');
+      assert.equal(r.stdout, `Stopped (pid ${g}); 0 orphan agent process(es) reaped\n`);
+      assert.ok(Date.now() - t0 < 5000, `crew stop waited ${Date.now() - t0} ms (the --timeout) for a gateway that was gone`);
+    } finally {
+      if (gw && stillRuns(gw.pid, gw.start)) process.kill(gw.pid, 'SIGKILL');
+      fe.cleanup();
+    }
+  });
+
+  it('stop: a gateway that needs the SIGKILL fallback and whose pid is reused the moment it dies → the stop is reported, the new process is not signalled', { skip: process.platform !== 'linux' ? 'needs /proc' : false }, async () => {
+    const fe = await setUp({ FAKE_STOP_IGNORE: '1', FAKE_GATEWAY_MODE: 'ignore-term' });
+    let gw: { pid: number; start?: number } | undefined;
+    try {
+      let r = await crew(fe, ['start', '--port', String(await freePort())]);
+      assert.equal(r.code, 0, r.stderr);
+      const g = gatewayPid(fe)!;
+      gw = { pid: g, start: procStart(g) };
+      const sim = reusedPidSys(g, { delayMs: 0, uAlive: true, members: 'other', home: fe.home, kiroBin: path.join(fe.cs, 'bin', 'kiro-claude'), other: path.join(fe.root, 'other-home') });
+      r = await crew(fe, ['stop', '--timeout', '1'], { deps: { sys: sim.sys } });
+      assert.equal(stillRuns(g, gw.start), false, 'the gateway was killed');
+      assert.deepEqual(sim.signals, [], `crew stop signalled the process that took pid ${g}`);
+      assert.deepEqual({ code: r.code, stderr: r.stderr }, { code: 0, stderr: '' }, 'the gateway did stop');
+      assert.equal(r.stdout, `Stopped (pid ${g}); 0 orphan agent process(es) reaped\n`);
+    } finally {
+      if (gw && stillRuns(gw.pid, gw.start)) process.kill(gw.pid, 'SIGKILL');
+      fe.cleanup();
+    }
+  });
+
+  it("stop: a pid of the gateway's tree that another crew's process (same argv) takes during the retire wait is not signalled; the rest of the tree is retired", { skip: process.platform !== 'linux' ? 'needs /proc' : false }, async () => {
+    const fe = await setUp({ FAKE_GATEWAY_CHILD: 'linger' });
+    let gw: { pid: number; start?: number } | undefined;
+    let child: number | undefined;
+    let childStart: number | undefined;
+    try {
+      let r = await crew(fe, ['start', '--port', String(await freePort())]);
+      assert.equal(r.code, 0, r.stderr);
+      const g = gatewayPid(fe)!;
+      gw = { pid: g, start: procStart(g) };
+      const L = (JSON.parse(fs.readFileSync(path.join(kcHome(fe), 'fake-gateway-child.json'), 'utf8')) as { pid: number }).pid;
+      child = L;
+      childStart = procStart(L);
+      const lInfo = defaultSys.listProcesses().find((p) => p.pid === L)!;
+      assert.ok(lInfo && childStart !== undefined, 'the linger child runs');
+      // F: a stubborn member of the tree (keeps the retire wait polling until the deadline).
+      // X: after L has exited, another crew's process with L's argv takes pid L.
+      const F = 2 ** 22 + 201;
+      const fInfo: Proc = { pid: F, ppid: g, pgid: g, argv: ['/usr/bin/sleep', '30'], startTime: (gw.start ?? 0) + 1, env: { HOME: fe.home, KIROCREW_KIRO_BIN: path.join(fe.cs, 'bin', 'kiro-claude') } };
+      const other = path.join(fe.root, 'other-home');
+      const xInfo: Proc = { pid: L, ppid: 1, pgid: 1, argv: lInfo.argv, startTime: childStart + 1000, env: { HOME: other, KIROCREW_KIRO_BIN: path.join(other, '.local', 'share', 'kiro-claude', 'crew', 'bin', 'kiro-claude'), KIROCREW_SPAWNED: '1' } };
+      const signals: Array<{ pid: number; signal: string }> = [];
+      let fAlive = true;
+      const lGone = (): boolean => !stillRuns(L, childStart);
+      const sys = {
+        ...defaultSys,
+        startTime: (pid: number) => (pid === F ? fInfo.startTime : pid === L && lGone() ? xInfo.startTime : defaultSys.startTime(pid)),
+        isAlive: (pid: number) => (pid === F ? fAlive : pid === L && lGone() ? true : defaultSys.isAlive(pid)),
+        kill: (pid: number, signal: NodeJS.Signals) => {
+          if (pid === F || (pid === L && lGone())) {
+            signals.push({ pid: pid === F ? F : -L, signal });
+            if (pid === F && signal === 'SIGKILL') fAlive = false;
+            return true;
+          }
+          return defaultSys.kill(pid, signal);
+        },
+        listProcesses: () => {
+          const list = defaultSys.listProcesses().filter((p) => p.pid !== L || !lGone());
+          return [...list, ...(fAlive ? [fInfo] : []), ...(lGone() ? [xInfo] : [])];
+        },
+      } as CrewSys;
+      r = await crew(fe, ['stop'], { deps: { sys } });
+      assert.equal(lGone(), true, 'the linger child was retired');
+      assert.deepEqual(signals, [
+        { pid: F, signal: 'SIGTERM' },
+        { pid: F, signal: 'SIGKILL' },
+      ], `only F, of the tree, was signalled (X, which took pid ${L}, is -${L})`);
+      assert.deepEqual({ code: r.code, stderr: r.stderr }, { code: 0, stderr: '' });
+      assert.equal(r.stdout, `Stopped (pid ${g}); 0 orphan agent process(es) reaped\n`);
+    } finally {
+      if (child !== undefined && stillRuns(child, childStart)) process.kill(child, 'SIGKILL');
+      if (gw && stillRuns(gw.pid, gw.start)) process.kill(gw.pid, 'SIGKILL');
+      fe.cleanup();
+    }
+  });
 
   it('stop: reaps orphaned kiro-claude acp processes (KIROCREW_SPAWNED=1, same HOME)', { skip: process.platform !== 'linux' ? 'needs /proc' : false }, async () => {
     const fe = await setUp();

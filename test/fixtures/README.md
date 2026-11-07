@@ -184,9 +184,12 @@ line uuid is the uuid the host sent). With persistence on, the fake mimics the r
 `--session-id` of an existing transcript → `Error: Session ID <id> is already in use.` (exit 1);
 `--resume <unknown>` → `No conversation found with session ID: <id>` + an `error_during_execution`
 result, exit 1; `--resume` keeps id + history; `--fork-session` copies history to a new id (original
-untouched); `--resume-session-at <uuid>` keeps history up to and including that line; `--continue`
-picks the newest transcript of the cwd; `/clear` starts a new transcript. Without persistence any
-`--resume` id is accepted with empty history. Never point `CLAUDE_CONFIG_DIR` at a real config dir.
+untouched) and, like the real claude 2.1.319, writes the fork's transcript only when the fork gets its
+first user line: a fork that exits without one leaves no transcript, so `--resume <fork id>` (or a
+fork of it) reports `No conversation found`; `--resume-session-at <uuid>` keeps history up to and
+including that line; `--continue` picks the newest transcript of the cwd; `/clear` starts a new
+transcript. Without persistence any `--resume` id is accepted with empty history. Never point
+`CLAUDE_CONFIG_DIR` at a real config dir.
 
 ### Environment variables
 

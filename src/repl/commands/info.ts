@@ -60,8 +60,10 @@ export const hooksCommand: BuiltinCommand = {
         return;
       }
       // branch on what the session ran (the Manual hook HookRunner.runManual picks), never on a
-      // same-named hook of another trigger or file (F5)
-      const ran = await r.session.runManualHook(name);
+      // same-named hook of another trigger or file (F5). The hook command runs in kiro-claude,
+      // not in Claude Code, so Ctrl+C reaches it only through the command signal: it kills the
+      // command (G3/G4; the idle session is never stopped for it, F0).
+      const ran = await r.session.runManualHook(name, r.commandSignal ? { signal: r.commandSignal } : {});
       switch (ran.kind) {
         case 'not-found':
           r.write(`\n${c.red(`No manual hook named '${name}'.`)}\n\n`);
@@ -76,6 +78,10 @@ export const hooksCommand: BuiltinCommand = {
           return;
         case 'command':
           r.write(ran.output.trim() ? `\n${ran.output.replace(/\s+$/, '')}\n\n` : `\n${c.gray(`Hook '${name}' produced no output.`)}\n\n`);
+          return;
+        case 'cancelled':
+          // Ctrl+C killed the command; its partial output is dropped (like an interrupted tool)
+          r.write(`\n${c.gray(`Hook '${name}' was cancelled.`)}\n\n`);
           return;
       }
       return;

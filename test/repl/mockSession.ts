@@ -332,14 +332,26 @@ export class MockSession extends EventEmitter implements KiroSession {
     return this.hookList;
   }
 
-  /** Like HookRunner.runManual: a Manual hook of `hookList` by exact, then case-insensitive name. */
-  async runManualHook(name: string): Promise<import('../../src/types.js').ManualHookRun> {
+  /**
+   * Like HookRunner.runManual: a Manual hook of `hookList` by exact, then case-insensitive name.
+   * Records the name only (`manualHookSignals` gets each call's signal). A command hook whose
+   * command is `block` runs until its signal aborts, then answers `cancelled`, like runShell.
+   */
+  readonly manualHookSignals: (AbortSignal | undefined)[] = [];
+  async runManualHook(name: string, o: { signal?: AbortSignal } = {}): Promise<import('../../src/types.js').ManualHookRun> {
     this.rec('runManualHook', name);
+    this.manualHookSignals.push(o.signal);
     const manual = this.hookList.filter((h) => h.trigger === 'Manual');
     const h = manual.find((x) => x.name === name) ?? manual.find((x) => x.name.toLowerCase() === name.toLowerCase());
     if (!h) return { kind: 'not-found' };
     if (!h.enabled) return { kind: 'disabled' };
     if (h.action.type === 'agent') return { kind: 'agent', prompt: h.action.prompt };
+    if (h.action.command === 'block') {
+      const signal = o.signal;
+      if (!signal) return new Promise<never>(() => undefined); // nothing can stop it
+      if (!signal.aborted) await new Promise((r) => signal.addEventListener('abort', r, { once: true }));
+      return { kind: 'cancelled' };
+    }
     return { kind: 'command', output: `output of ${h.name}` };
   }
 

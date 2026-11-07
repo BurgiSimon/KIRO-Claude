@@ -100,6 +100,16 @@ describe('gateway process tree (crew stop)', () => {
     assert.equal(parseProcStat('garbage'), undefined);
   });
 
+  it('parseProcStat reads the start time (field 22); listProcesses and sys.startTime report it (G6: a reused pid differs)', () => {
+    const line = '4242 (py thon) S 1 4242 4242 0 -1 4194560 10 0 0 0 5 3 0 0 20 0 7 0 987654 1234 56';
+    assert.deepEqual(parseProcStat(line), { ppid: 1, pgid: 4242, startTime: 987654 });
+    if (process.platform !== 'linux') return;
+    const me = defaultSys.listProcesses().find((p) => p.pid === process.pid)!;
+    assert.ok(Number.isInteger(me.startTime) && me.startTime! > 0, JSON.stringify(me.startTime));
+    assert.equal(defaultSys.startTime(process.pid), me.startTime);
+    assert.equal(defaultSys.startTime(2 ** 22 + 12345), undefined);
+  });
+
   it('gatewayTree: descendants, the gateway group when it leads one, never this process or its ancestors', () => {
     const P = (pid: number, ppid: number, pgid: number) => ({ pid, ppid, pgid, argv: [`p${pid}`] });
     const procs = [

@@ -1002,3 +1002,59 @@ test('repl: wrapping (--wrap always) and raw output (chat.disableMarkdownRenderi
   assert.ok(!r3.out.includes('secret thoughts'));
   r3.run.t.cleanup();
 });
+
+// ───────────────────────────── Ctrl+C during /hooks run (G3/G4) ─────────────────────────────
+
+const blockingManualHook = {
+  dialect: 'v3' as const,
+  source: 'workspace-file' as const,
+  name: 'slow',
+  trigger: 'Manual' as const,
+  rawTrigger: 'Manual',
+  action: { type: 'command' as const, command: 'block' },
+  timeoutMs: 0,
+  maxOutputBytes: 10240,
+  cacheTtlSec: 0,
+  enabled: true,
+};
+
+for (const presses of [1, 2]) {
+  test(`repl: ${presses === 1 ? 'one Ctrl+C' : 'a double Ctrl+C'} during /hooks run cancels the hook through the command signal and gives the prompt back; the idle session is neither stopped nor abandoned (G3/G4, F0)`, { timeout: 20_000 }, async () => {
+    const s = new MockSession(); // idle: the hook command runs in kiro-claude, not in Claude Code
+    s.hookList = [blockingManualHook];
+    const run = startRepl({ session: s, keepOpen: true });
+    await run.waitFor('> ');
+    run.send('/hooks run slow');
+    await until(() => s.manualHookSignals.length === 1, 5000);
+    const signal = s.manualHookSignals[0];
+    assert.ok(signal, 'the command signal reached the hook');
+    assert.equal(signal.aborted, false);
+    run.send('\u0003');
+    if (presses === 2) run.send('\u0003');
+    await run.waitFor(/Hook 'slow' was cancelled\.\n\n> /, 5000);
+    assert.equal(signal.aborted, true);
+    await sleep(1500); // past the forced-stop grace
+    const out = run.out();
+    assert.ok(!out.includes('did not stop'), `the idle session was stopped:\n${out}`);
+    assert.ok(!out.includes('Failed to execute command'), `the command was abandoned:\n${out}`);
+    assert.equal(s.closed, false, 'the idle session stays open');
+    assert.ok(!out.includes('produced no output'), out);
+    run.send('/session-id');
+    await run.waitFor(/\/session-id\n[\s\S]*> $/, 5000);
+    assert.equal(run.sessions.length, 1, 'nothing to re-create');
+    run.send('/quit');
+    assert.equal(await run.exit, 0);
+    run.t.cleanup();
+  });
+}
+
+test('repl: /hooks run outside a Ctrl+C gets a live command signal and prints the output (G3/G4)', async () => {
+  const s = new MockSession();
+  s.hookList = [{ ...blockingManualHook, name: 'fast', action: { type: 'command', command: 'echo fast' } }];
+  const { out, run } = await runToEnd({ session: s, input: ['/hooks run fast', 'next line'] });
+  assert.ok(out.includes('\noutput of fast\n'), out);
+  assert.equal(s.manualHookSignals.length, 1);
+  assert.ok(s.manualHookSignals[0] instanceof AbortSignal, 'the command signal was passed');
+  assert.equal(s.manualHookSignals[0]!.aborted, false);
+  run.t.cleanup();
+});

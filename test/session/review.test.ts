@@ -271,6 +271,9 @@ describe('review: transferred session copies (08a §4.2)', () => {
       const disk = JSON.parse(fs.readFileSync(path.join(sb.sessionsDir, `${newId}.json`), 'utf8')) as Record<string, unknown>;
       assert.equal(disk.sessionId, newId);
       assert.equal(disk.claudeSessionId, copy.claudeSessionId);
+      // Claude Code writes a fork's transcript only with its first message (VERIFIED 2.1.319;
+      // the fake models it): the copy speaks once, so its own Claude session exists
+      await drain(copy.prompt({ text: 'in the copy' }));
     } finally {
       await closeAll(copy);
     }

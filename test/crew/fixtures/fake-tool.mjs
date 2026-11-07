@@ -20,7 +20,9 @@
 //   FAKE_OPEN_EXIT           exit code of xdg-open/open
 //   FAKE_GATEWAY_CHILD       linger | stubborn → the gateway starts a child in its process group that
 //                            outlives it (like KiroCrew's history-index worker after os._exit);
-//                            linger exits on SIGTERM, stubborn ignores it. Pid in fake-gateway-child.json
+//                            linger exits on SIGTERM, stubborn ignores it. late → the gateway starts a
+//                            SIGTERM-ignoring child only when it is told to stop, just before it exits
+//                            (not in crew stop's snapshot of the tree). Pid in fake-gateway-child.json
 import { spawn, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as http from 'node:http';
@@ -311,20 +313,22 @@ function gateway() {
     err('Traceback (most recent call last):\n  File "gateway.py"\nRuntimeError: fake gateway failure');
     process.exit(1);
   }
+  const startChild = (kind) => {
+    const onTerm = kind === 'linger' ? '() => process.exit(0)' : '() => undefined';
+    const code = `process.on('SIGTERM', ${onTerm}); setInterval(() => undefined, 1000); setTimeout(() => process.exit(0), 60000);`;
+    const ch = spawn(process.execPath, ['-e', code], { stdio: 'ignore' });
+    fs.writeFileSync(path.join(KC_HOME, 'fake-gateway-child.json'), JSON.stringify({ pid: ch.pid }));
+  };
   if (mode === 'ignore-term') process.on('SIGTERM', () => undefined);
   else process.on('SIGTERM', () => {
+    if (env.FAKE_GATEWAY_CHILD === 'late') startChild('stubborn');
     try {
       fs.rmSync(GW_FILE, { force: true });
     } catch {}
     process.exit(0);
   });
   fs.appendFileSync(path.join(KC_HOME, 'gateway.log'), `fake gateway boot pid ${process.pid}\n`);
-  if (env.FAKE_GATEWAY_CHILD === 'linger' || env.FAKE_GATEWAY_CHILD === 'stubborn') {
-    const onTerm = env.FAKE_GATEWAY_CHILD === 'stubborn' ? '() => undefined' : '() => process.exit(0)';
-    const code = `process.on('SIGTERM', ${onTerm}); setInterval(() => undefined, 1000); setTimeout(() => process.exit(0), 60000);`;
-    const ch = spawn(process.execPath, ['-e', code], { stdio: 'ignore' });
-    fs.writeFileSync(path.join(KC_HOME, 'fake-gateway-child.json'), JSON.stringify({ pid: ch.pid }));
-  }
+  if (env.FAKE_GATEWAY_CHILD === 'linger' || env.FAKE_GATEWAY_CHILD === 'stubborn') startChild(env.FAKE_GATEWAY_CHILD);
   err('booting fake gateway');
   if (mode === 'hang') {
     fs.writeFileSync(GW_FILE, JSON.stringify({ pid: process.pid, port: 0 }));

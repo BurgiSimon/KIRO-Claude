@@ -713,17 +713,21 @@ export class HookRunner implements HookRunnerLike {
    * Run a `Manual` hook by name (adapter extension `/hooks run <name>`, 03 §2.5). Exact name first,
    * then case-insensitive. Command ⇒ `output` (stdout on exit 0, else stderr) + `exitCode`; agent
    * action ⇒ `agentPrompt` (the session sends it as a user turn); disabled ⇒ warning.
+   * `ctx.signal` (Ctrl+C in the REPL) kills a running command with its process group (SIGKILL,
+   * so a command that ignores SIGTERM ends too; also with `timeout` 0): `aborted`, no output, no
+   * warning.
    */
   async runManual(
     ctx: HookRunContext,
     name: string,
-  ): Promise<{ found: boolean; output?: string; exitCode?: number; agentPrompt?: string; warnings: HookWarning[] }> {
+  ): Promise<{ found: boolean; output?: string; exitCode?: number; agentPrompt?: string; aborted?: boolean; warnings: HookWarning[] }> {
     const manual = this.hooks.filter((h) => h.trigger === 'Manual');
     const hook = manual.find((h) => h.name === name) ?? manual.find((h) => h.name.toLowerCase() === name.toLowerCase());
     if (!hook) return { found: false, warnings: [] };
     if (!hook.enabled) return { found: true, warnings: [{ hook: hook.name, message: `Hook "${hook.name}" is disabled.` }] };
     if (hook.action.type === 'agent') return { found: true, agentPrompt: hook.action.prompt, warnings: [] };
     const r = await this.runHook(hook, this.event('Manual', ctx), this.opts('none', ctx));
+    if (r.aborted) return { found: true, aborted: true, warnings: [] };
     const out: { found: boolean; output?: string; exitCode?: number; agentPrompt?: string; warnings: HookWarning[] } = {
       found: true,
       warnings: this.warnings([r]),

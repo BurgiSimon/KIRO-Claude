@@ -26,7 +26,9 @@
  *    with `--session-id` instead (VERIFIED with claude 2.1.318: `--resume` of a session with no
  *    messages fails with `No conversation found`); each mode falls back to the other on the
  *    CLI's `already in use` / `No conversation found` start errors, and a lost transcript is
- *    replaced by the `<sid>.jsonl` journal as context (08a §4.2).
+ *    replaced by the `<sid>.jsonl` journal as context (08a §4.2); so is a fork at a message the
+ *    source transcript does not hold (`No message found with message.uuid`: a `/rewind` to a
+ *    turn saved before such a fallback).
  *
  * Tool calls: the gate (policy/gate) answers every PreToolUse `hook_callback`; that is also
  * where `tool_start` (with `trusted` = allowed without asking) or `tool_denied` is emitted, so
@@ -41,10 +43,14 @@
  * Turn text (00 §6.2): `/name args` / `@name args` prompt files (config/prompts), `/<skill> args`
  * inlined (config/skills), userPromptSubmit hooks, `@` and `#` references (context/refs),
  * conditional steering (context/userTurn SteeringActivator), pending context (first-turn hook
- * prompts, restored history; a tangent tail/merge carry queued on the record it returned into,
- * `SessionRecord.pendingContext`, copied into a tangent forked from that record before it spoke
- * again), the plan-mode block, then composeUserTurn. Pending context is given back when Claude
- * never gets the line (cancelled or failed before the send, dropped before it started).
+ * prompts; the restored history of a record whose transcript was lost, kept per record (G2); a
+ * tangent tail/merge carry queued on the record it returned into, `SessionRecord.pendingContext`,
+ * copied into any fork of that record made before it spoke again: a tangent (F9), a spec-phase
+ * session or continuation (G1)), the plan-mode block, then composeUserTurn. The restored history
+ * and the carry leave their queue only once the line is written to Claude (so a session closed
+ * before that saves the record with its carry, G5); first-turn prompts are given back when Claude
+ * never gets the line (cancelled or failed before the send), and all of it when Claude dropped
+ * the line before starting it.
  * `prompt()`'s result carries the usage of all its Claude turns (redirects, continuations).
  *
  * Streaming: `text_delta` / `thinking_delta` from `stream_event`s (top level only); a complete
@@ -506,7 +512,16 @@ export interface KiroSessionInternalOptions extends KiroSessionOptions {
 interface Preset {
   rec: SessionRecord;
   mode: LaunchMode;
-  pendingContext?: string[];
+  /** `<kiro-restored-history>` block for `rec` (an import without a usable transcript). */
+  restoredHistory?: string;
+}
+
+/** The queued context one composed user line carries (composeTurn → runTurn). */
+interface QueuedContext {
+  /** The line was written to Claude: the context it carries leaves its queues. */
+  sent(): void;
+  /** Claude never got the line, or dropped it before starting it: the context is queued again. */
+  unsent(): void;
 }
 
 // ───────────────────────────── the session ─────────────────────────────
@@ -549,7 +564,14 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
 
   private spawnOutputs: string[] = [];
   private firstTurnPrompts: string[] = [];
-  private pendingContext: string[] = [];
+  /**
+   * `<kiro-restored-history>` blocks by Kiro session id: a record whose Claude transcript is gone
+   * (a resume / fork fell back to a fresh Claude session, an import without a usable transcript)
+   * sends its saved history with its next line. It belongs to that record's conversation (G2):
+   * `/clear` drops it, a tangent / rewind fork (a record of its own, with its own fallback)
+   * never sends it, a respawn's fallback for the same record replaces it (one copy).
+   */
+  private readonly restoredHistory = new Map<string, string>();
   private queuedSteer: string[] = [];
   private redirects: string[] = [];
   private pendingEffort: string | undefined;
@@ -609,7 +631,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     agents: Map<string, KiroAgent>;
     agent: KiroAgent;
     mode: LaunchMode;
-    pendingContext?: string[];
+    restoredHistory?: string;
     /** The record was created by this call (deleted again if starting fails). */
     fresh?: boolean;
   }) {
@@ -628,7 +650,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     this.initialMode = init.mode;
     this.fresh = init.fresh === true;
     this.historyKnown = init.mode.kind !== 'new';
-    if (init.pendingContext) this.pendingContext.push(...init.pendingContext);
+    if (init.restoredHistory) this.restoredHistory.set(init.rec.sessionId, init.restoredHistory);
     this.trustState = this.rec.trust;
     this.announcedClaudeId = this.rec.claudeSessionId;
     // unique per object: a second in-process session for the same id (the lock lets this process
@@ -786,6 +808,10 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         forkKind: opts.fork.kind,
         additionalDirectories: opts.additionalDirectories ?? parent?.additionalDirectories ?? [],
         ...(parent ? { title: parent.title, contextRules: parent.contextRules } : {}),
+        // a carry merged into the parent is part of its history (01 §5.11, 06 §6.4) but not yet
+        // of its Claude transcript: this fork (a spec phase / continuation, SpecSessionDriver)
+        // gets its own copy, like a tangent (F9); the parent keeps its copy, delivered once (G1)
+        ...(parent?.pendingContext?.length ? { pendingContext: [...parent.pendingContext] } : {}),
       });
       mode = { kind: 'fork', from: opts.fork.fromClaudeSessionId, ...(opts.fork.at ? { at: opts.fork.at } : {}) };
     }
@@ -838,7 +864,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         agent,
         mode,
         fresh,
-        ...(preset?.pendingContext ? { pendingContext: preset.pendingContext } : {}),
+        ...(preset?.restoredHistory ? { restoredHistory: preset.restoredHistory } : {}),
       });
     } catch (e) {
       // config that throws while wiring the session must not leave the lock (or a new record) behind
@@ -1128,11 +1154,20 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
           this.historyKnown = true;
           return this.spawn({ kind: 'resume' }, attempt + 1);
         }
-        if ((mode.kind === 'resume' || mode.kind === 'fork') && /No conversation found/i.test(text)) {
+        // a fork at a message the source transcript does not hold (a /rewind to a turn saved
+        // before a fallback to a fresh Claude session: its uuid named the lost transcript) is
+        // refused the same way (VERIFIED 2.1.319: `No message found with message.uuid of: <uuid>`,
+        // exit 1): the record's journal, already cut at that turn, is its history (G2)
+        if (
+          (mode.kind === 'resume' || mode.kind === 'fork') &&
+          (/No conversation found/i.test(text) || (mode.kind === 'fork' && mode.at !== undefined && /No message found with message\.uuid/i.test(text)))
+        ) {
           const history = journalHistoryText(readJournal(this.store.dir, this.rec.sessionId));
           if (mode.kind === 'fork') this.rec.claudeSessionId = this.rec.claudeSessionId || randomUUID();
           if (history) {
-            this.pendingContext.push(restoredHistoryBlock(history));
+            // this record's (G2); replaces the block of an earlier fallback of the same record
+            // (a respawn before the first line), so the history is sent once
+            this.restoredHistory.set(this.rec.sessionId, restoredHistoryBlock(history));
             this.uiNotice('warn', 'Claude Code could not find the saved conversation; starting a new one with the saved history as context.');
           }
           this.historyKnown = false;
@@ -1804,17 +1839,18 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
   }
 
   /**
-   * One Claude turn: send `content`, stream mapped events, return the mapped result. `unsent`
-   * (from composeTurn) gives back the queued context `content` consumed when Claude never gets
-   * the line: the turn was aborted or the child could not be (re)started before it was written,
-   * or Claude dropped it before starting it (synthetic result) (F1).
+   * One Claude turn: send `content`, stream mapped events, return the mapped result. `queued`
+   * (from composeTurn) settles the queued context `content` carries: `sent` once the line is
+   * written (it leaves its queue only then, G5); `unsent` when Claude never gets the line (the
+   * turn was aborted or the child could not be (re)started before it was written) or dropped it
+   * before starting it (synthetic result) (F1).
    */
   private async *runTurn(
     content: string | UserContentBlock[],
     kind: TurnState['kind'],
     userText: string,
     images?: { mediaType: string; dataBase64: string }[],
-    unsent?: () => void,
+    queued?: QueuedContext,
   ): AsyncGenerator<SessionEvent, TurnResult> {
     let sent = false;
     let proc!: ClaudeProcess;
@@ -1839,8 +1875,9 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       } catch (e) {
         return this.toTurnResult(t, undefined, e, signal?.aborted === true);
       }
+      queued?.sent();
     } finally {
-      if (!sent) unsent?.();
+      if (!sent) queued?.unsent();
     }
     const sink = new EventSink();
     this.turn = t;
@@ -1888,7 +1925,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       this.sink = undefined;
       tr = this.toTurnResult(t, result, failure, signal?.aborted === true);
       // dropped by Claude before it started: the model never read it (before recordTurn persists)
-      if (result?.synthetic === true) unsent?.();
+      if (result?.synthetic === true) queued?.unsent();
       if (result) this.recordTurn(t, tr, wrote);
       this.toolCalls.clear();
       this.toolUses.clear();
@@ -1942,7 +1979,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
   private async composeTurn(
     input: PromptInput,
     signal?: AbortSignal,
-  ): Promise<{ content: string | UserContentBlock[]; userText: string; images: { mediaType: string; dataBase64: string }[]; unsent: () => void }> {
+  ): Promise<{ content: string | UserContentBlock[]; userText: string; images: { mediaType: string; dataBase64: string }[]; queued: QueuedContext }> {
     const inv = this.expandInvocation(input.text);
     for (const w of inv.warnings) this.uiNotice('warn', w);
     let text = inv.text;
@@ -1997,22 +2034,54 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       ...this.activator.forNames(hash.steeringNames),
       ...(verbatim ? [] : this.activator.forPrompt(text)),
     ];
-    // queued context is taken now and given back by `unsent` when Claude never gets this line
-    // (runTurn; F1), so a cancelled prompt does not lose a tangent carry or a first-turn prompt
+    // Queued context for this line (runTurn settles it, F1). First-turn prompts are taken now and
+    // given back by `unsent` when Claude never gets the line. The record's restored history (G2)
+    // and tangent carry stay queued until the line is written (`sent`): a prompt cancelled, or a
+    // session closed (the REPL's forced stop: close() saves the record, G5), before that keeps
+    // them; a respawn's fallback for this record meanwhile replaces the same block, not a copy.
     const rec = this.rec;
     const firstTurn = this.firstTurnPrompts.splice(0);
-    const pending = this.pendingContext.splice(0);
-    const carried = rec.pendingContext ?? [];
-    delete rec.pendingContext; // written with the turn record
-    const unsent = (): void => {
-      this.firstTurnPrompts.unshift(...firstTurn);
-      this.pendingContext.unshift(...pending);
-      if (carried.length) {
-        rec.pendingContext = [...carried, ...(rec.pendingContext ?? [])];
-        if (rec === this.rec) this.persist(); // a local turn in between may have saved it without
-      }
+    const restored = this.restoredHistory.get(rec.sessionId);
+    const carried = [...(rec.pendingContext ?? [])];
+    let state: 'composed' | 'sent' | 'settled' = 'composed';
+    const queued: QueuedContext = {
+      sent: () => {
+        if (state !== 'composed') return;
+        state = 'sent';
+        if (restored !== undefined && this.restoredHistory.get(rec.sessionId) === restored) this.restoredHistory.delete(rec.sessionId);
+        if (carried.length) {
+          const left = [...(rec.pendingContext ?? [])];
+          for (const c of carried) {
+            const i = left.indexOf(c);
+            if (i >= 0) left.splice(i, 1);
+          }
+          if (left.length) rec.pendingContext = left;
+          else delete rec.pendingContext;
+          // saved now: a fork of this record (spec driver, G1) must not get a delivered carry
+          if (rec === this.rec) this.persist();
+        }
+      },
+      unsent: () => {
+        if (state === 'settled') return;
+        const wasSent = state === 'sent';
+        state = 'settled';
+        this.firstTurnPrompts.unshift(...firstTurn);
+        if (!wasSent) return; // the rest never left its queue
+        // Claude dropped the line before starting it: the model never read any of it
+        if (restored !== undefined && !this.restoredHistory.has(rec.sessionId)) this.restoredHistory.set(rec.sessionId, restored);
+        if (carried.length) {
+          rec.pendingContext = [...carried, ...(rec.pendingContext ?? [])];
+          if (rec === this.rec) this.persist();
+        }
+      },
     };
-    const extraContext: string[] = [...firstTurn, ...pending, ...carried, ...(this.rec.planMode ? [PLAN_MODE_BLOCK] : []), ...(input.extraContext ?? [])];
+    const extraContext: string[] = [
+      ...firstTurn,
+      ...(restored !== undefined ? [restored] : []),
+      ...carried,
+      ...(this.rec.planMode ? [PLAN_MODE_BLOCK] : []),
+      ...(input.extraContext ?? []),
+    ];
     const images = [...(input.images ?? []), ...at.images.map((i) => ({ mediaType: i.mediaType, dataBase64: i.dataBase64 }))];
     const content = composeUserTurn({
       text,
@@ -2024,10 +2093,10 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       images,
     });
     if (content === '' || (Array.isArray(content) && content.length === 0)) {
-      unsent();
+      queued.unsent();
       throw new Error('Cannot send an empty prompt');
     }
-    return { content, userText: input.text, images, unsent };
+    return { content, userText: input.text, images, queued };
   }
 
   async *prompt(input: PromptInput, opts: { signal?: AbortSignal } = {}): AsyncGenerator<SessionEvent, TurnResult> {
@@ -2044,7 +2113,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     this.textJoin = join;
     try {
       let composed = await this.composeTurn(input, abort.signal);
-      let res = yield* this.runTurn(composed.content, 'prompt', composed.userText, composed.images, composed.unsent);
+      let res = yield* this.runTurn(composed.content, 'prompt', composed.userText, composed.images, composed.queued);
       // the prompt's result covers every Claude turn it ran (F6, like ClaudeProcess mergeResults
       // for a steer answered in a turn of its own); text and stop reason are the last turn's
       let total = res;
@@ -2055,7 +2124,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         if (redirect !== undefined) {
           composed = await this.composeTurn({ text: redirect }, abort.signal);
           join.pending = join.tail !== '';
-          res = yield* this.runTurn(composed.content, 'prompt', composed.userText, composed.images, composed.unsent);
+          res = yield* this.runTurn(composed.content, 'prompt', composed.userText, composed.images, composed.queued);
           total = mergeTurnResults(total, res);
           continuations = 0;
           continue;
@@ -2066,7 +2135,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         continuations++;
         composed = await this.composeTurn({ text: cont, skipPromptHooks: true }, abort.signal);
         join.pending = join.tail !== '';
-        res = yield* this.runTurn(composed.content, 'prompt', composed.userText, composed.images, composed.unsent);
+        res = yield* this.runTurn(composed.content, 'prompt', composed.userText, composed.images, composed.queued);
         total = mergeTurnResults(total, res);
       }
       return total;
@@ -2302,6 +2371,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     }
     this.rec.turns = [];
     delete this.rec.pendingContext; // a tangent carry for the conversation just cleared
+    this.restoredHistory.delete(this.rec.sessionId); // and its restored history (G2)
     this.todoMap.clear();
     this.activator.reset();
     this.lastExchange = undefined;
@@ -2393,6 +2463,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       this.lock = parentLock;
       lock.release();
       this.dropRecord(tangent.sessionId);
+      this.restoredHistory.delete(tangent.sessionId);
       await this.restart().catch(() => undefined);
       throw e;
     }
@@ -2444,11 +2515,13 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     this.lock = top.lock;
     this.rec.trust = this.trustState;
     lock?.release();
+    this.restoredHistory.delete(tangent.sessionId); // the tangent is left: never sent from here
     this.lastExchange = undefined;
     if (carry) {
       // the parent's own queue, saved with its record: it reaches THIS conversation even after a
-      // quit or another tangent opened first (which gets a copy of its own, enterTangent), and
-      // survives a prompt Claude never received (composeTurn `unsent`)
+      // quit or another tangent / spec fork opened first (which gets a copy of its own, F9 / G1),
+      // and survives a prompt Claude never received (composeTurn: it leaves the record only once
+      // the line is written)
       (this.rec.pendingContext ??= []).push(carry);
       this.persist();
     }
@@ -2501,11 +2574,16 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       this.lock = oldLock;
       lock.release();
       this.dropRecord(rec.sessionId);
+      this.restoredHistory.delete(rec.sessionId);
       await this.restart().catch(() => undefined);
       throw e;
     }
-    // the old session stays on disk untouched; it is no longer active here (unless it is a tangent parent)
-    if (!this.tangentStack.some((s) => s.rec === old)) oldLock?.release();
+    // the old session stays on disk untouched; it is no longer active here (unless it is a tangent
+    // parent); its restored history (the turns rewound away included) is never sent (G2)
+    if (!this.tangentStack.some((s) => s.rec === old)) {
+      oldLock?.release();
+      this.restoredHistory.delete(old.sessionId);
+    }
     this.todoMap.clear();
   }
 
@@ -2646,11 +2724,14 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
    * What ran, from HookRunner.runManual's own pick (a Manual hook: exact name, then
    * case-insensitive), so the caller never decides from a same-named hook of another trigger or
    * file (F5). Its warnings (disabled, timed out, failed to start) are shown as notices.
+   * `o.signal` (the REPL's command signal: Ctrl+C) kills a running command hook's process group,
+   * also one with `timeout` 0 or that ignores SIGTERM: `cancelled` (G3/G4).
    */
-  async runManualHook(name: string): Promise<ManualHookRun> {
-    const r = await this.hookRunner.runManual({ ws: this.ws, sessionId: this.rec.sessionId }, name);
+  async runManualHook(name: string, o: { signal?: AbortSignal } = {}): Promise<ManualHookRun> {
+    const r = await this.hookRunner.runManual({ ws: this.ws, sessionId: this.rec.sessionId, ...(o.signal ? { signal: o.signal } : {}) }, name);
     for (const w of r.warnings) this.uiNotice('warn', w.message);
     if (!r.found) return { kind: 'not-found' };
+    if (r.aborted) return { kind: 'cancelled' };
     // an agent action's prompt is sent by the caller as its own user turn (03 §2.5); queuing it
     // here would hide it in front of whatever unrelated message comes next
     if (r.agentPrompt !== undefined) return { kind: 'agent', prompt: r.agentPrompt };
@@ -2822,7 +2903,7 @@ export async function importSessionExport(p: string, opts: Omit<KiroSessionOptio
   let mode: LaunchMode;
   let keepTurns = true;
   let writtenTranscript: string | undefined;
-  const pendingContext: string[] = [];
+  let restoredHistory: string | undefined;
   if (transcript.trim() !== '') {
     const dest = transcriptPath(claudeId, ws.cwd, env);
     mkdirp(path.dirname(dest), 0o700);
@@ -2836,7 +2917,7 @@ export async function importSessionExport(p: string, opts: Omit<KiroSessionOptio
     mode = { kind: 'new' };
     keepTurns = false;
     const history = journalHistoryText(parseJournal(journal));
-    if (history) pendingContext.push(restoredHistoryBlock(history));
+    if (history) restoredHistory = restoredHistoryBlock(history);
   }
   const cleanup = (sid?: string): void => {
     try {
@@ -2881,7 +2962,7 @@ export async function importSessionExport(p: string, opts: Omit<KiroSessionOptio
   try {
     return await KiroSessionImpl.create(
       { ...opts, ...(opts.agentName ? {} : { agentName: rec.agent }) },
-      { rec, mode, ...(pendingContext.length ? { pendingContext } : {}) },
+      { rec, mode, ...(restoredHistory ? { restoredHistory } : {}) },
     );
   } catch (e) {
     // nothing of a failed import stays behind: index file, journal, re-keyed transcript

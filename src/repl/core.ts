@@ -29,7 +29,8 @@
  * (`/tangent merge` runs a model summary turn, `/agent swap` respawns Claude Code), ⇒
  * `session.interrupt()`; the press is never kept as type-ahead for the next prompt. Every press
  * while a command runs also aborts its {@link ReplContext.commandSignal} (`/spec run` stops
- * scheduling tasks, 03 §1.7). A second Ctrl+C aborts the prompt's signal and, when the turn /
+ * scheduling tasks, 03 §1.7; `/hooks run` kills the hook's command, whose process group the
+ * terminal's SIGINT never reaches). A second Ctrl+C aborts the prompt's signal and, when the turn /
  * command still runs {@link FORCE_STOP_GRACE_MS} later (Claude Code did not end it after the
  * interrupt), stops Claude Code like headless (session close) and ACP (`replaceStuckSession`) do:
  * the session is closed (stdin EOF, SIGTERM after 2 s, then SIGKILL; 00 §2.3 / 04 §8.4), the REPL
@@ -38,7 +39,8 @@
  * conversation; a Ctrl+C while it restarts cancels that input). A command is stopped that way only
  * while the session still has work of its own in flight ({@link KiroSession.busy}): a command
  * waiting on another session (a `/spec run` task session or `/chat new` starting) or on Claude
- * Code (re)starting is neither stopped nor abandoned. At the idle prompt the first Ctrl+C /
+ * Code (re)starting is neither stopped nor abandoned; one waiting on a process of kiro-claude's
+ * own (`/hooks run`) ends through the command signal. At the idle prompt the first Ctrl+C /
  * Ctrl+D prints Q's hint, the second exits.
  *
  * Slash commands are shlex-split; unbalanced quotes fall back to a whitespace split so free-text

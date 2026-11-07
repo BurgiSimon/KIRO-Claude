@@ -291,6 +291,15 @@ export class MockSession extends EventEmitter implements KiroSession {
   started = false;
   interrupted = 0;
   currentPhase: KiroSessionOptions['specPhase'] | undefined;
+  /**
+   * The Claude conversation this session continues (MockHost.createSession copies a fork
+   * source's transcript here; a test sets it for a resumed session).
+   */
+  inherited: string[] = [];
+  /** The session already has a transcript before its first prompt (a resumed conversation). */
+  hasTranscript = false;
+  /** prompt() fails before the line reaches Claude (the child could not be (re)started). */
+  failBeforeSend: string | undefined;
 
   constructor(
     readonly opts: Partial<KiroSessionOptions>,
@@ -332,8 +341,22 @@ export class MockSession extends EventEmitter implements KiroSession {
     this.started = true;
   }
 
+  /** What the model sees in this session: the inherited conversation and every line sent. */
+  get conversation(): string[] {
+    return [...this.inherited, ...this.prompts.map((p) => p.text)];
+  }
+
+  /**
+   * The session's Claude transcript, or undefined while it has none: real claude 2.1.319 writes a
+   * session's (a fork's) transcript only with its first user line.
+   */
+  get transcript(): string[] | undefined {
+    return this.prompts.length > 0 || this.hasTranscript ? this.conversation : undefined;
+  }
+
   async *prompt(input: PromptInput): AsyncGenerator<SessionEvent, TurnResult> {
     if (this.closed) throw new Error(`${this.id} is closed`);
+    if (this.failBeforeSend) throw new Error(this.failBeforeSend);
     this.prompts.push(input);
     this.phasesSeen.push(this.currentPhase ? { name: this.currentPhase.name, allowedWritePaths: [...this.currentPhase.allowedWritePaths] } : undefined);
     const r = await this.script(input, this);
@@ -345,6 +368,9 @@ export class MockSession extends EventEmitter implements KiroSession {
       permissionDenials: [],
     };
     if (r.error) out.error = r.error;
+    // like kiroSession: a prompt turn whose result arrived is recorded (store.appendTurn)
+    this.record.turns.push({ userUuid: `${this.id}-u${this.record.turns.length + 1}`, preview: input.text.slice(0, 60), at: new Date().toISOString() });
+    this.record.messageCount += 1;
     return out;
   }
 
@@ -499,6 +525,11 @@ export class MockHost implements ReplHost {
   readonly created: Partial<KiroSessionOptions>[] = [];
   readonly sessions: MockSession[] = [];
   readonly replaced: KiroSession[] = [];
+  /**
+   * Claude session ids a fork was asked to start from that had no transcript: the real claude
+   * reports "No conversation found" and kiroSession starts a new, empty conversation.
+   */
+  readonly lostForks: string[] = [];
   askAnswers: string[] = [];
   confirmAnswers: boolean[] = [];
   chooseAnswers: ChooseAnswer[] = [];
@@ -563,6 +594,14 @@ export class MockHost implements ReplHost {
   async createSession(opts: Partial<KiroSessionOptions>): Promise<KiroSession> {
     this.created.push(opts);
     const s = new this.sessionClass(opts, this.script, this.hookList);
+    if (opts.fork) {
+      // `--resume <id> --fork-session` copies <id>'s transcript; one that has none fails and the
+      // session falls back to a new conversation (session/kiroSession.ts spawn)
+      const src = this.sessions.find((x) => x.claudeSessionId === opts.fork!.fromClaudeSessionId);
+      const t = src?.transcript;
+      if (t) s.inherited = [...t];
+      else this.lostForks.push(opts.fork.fromClaudeSessionId);
+    }
     this.sessions.push(s);
     return s;
   }

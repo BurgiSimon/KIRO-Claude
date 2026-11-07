@@ -16,7 +16,11 @@
  *    {@link SpecPhaseSettable.setSpecPhase} is switched in place (cheapest). Otherwise
  *    {@link SpecSessionDriver} creates a fresh session with `specPhase` that forks the current
  *    Claude conversation (`fork.kind:'main'`), so context carries over; when the flow ends it forks
- *    one more unrestricted session (REPL) or closes everything (CLI).
+ *    one more unrestricted session (REPL) or closes everything (CLI). Claude Code writes a fork's
+ *    transcript only with its first message (VERIFIED 2.1.319), so a session forked from one that
+ *    never got a message would start empty: the driver forks from the last session a turn reached
+ *    (main when none did), and when no spec turn reached Claude (e.g. Ctrl+C while the phase
+ *    session started) the REPL keeps its original session.
  *  - Analyze Requirements (03 §1.8): turn A with no writable paths, JSON findings, questions
  *    `Question i/N`, turn B applies all answers to the phase-1 document, then re-lint.
  *  - Task execution (03 §1.7): planned from tasks.md (model.planRun: waves, checkpoints as
@@ -166,6 +170,11 @@ export interface SpecRuntime {
 
 export interface TurnOptions {
   quiet?: boolean;
+  /**
+   * Ctrl+C for this turn: aborted by the time the turn's session is ready (spawning Claude Code
+   * takes a while), the turn is not sent and the result is `cancelled`.
+   */
+  signal?: AbortSignal | undefined;
 }
 
 /** How the driver reaches sessions (REPL: host; CLI: createSession + own renderer). */
@@ -180,6 +189,66 @@ function phaseKey(p: SpecPhaseRestriction): string {
   return JSON.stringify([p.name, [...p.allowedWritePaths].sort()]);
 }
 
+/** A spec turn that was not sent (Ctrl+C while its session started). */
+function notSent(): TurnResult {
+  return { stopReason: 'cancelled', isError: false, text: '', permissionDenials: [] };
+}
+
+/** Turns recorded in the session (kiroSession records a prompt turn once its result arrives). */
+function recordedTurns(s: KiroSession): number {
+  return s.record?.turns?.length ?? 0;
+}
+
+/** Where a fork of a session's conversation starts (KiroSessionOptions.fork). */
+interface ForkPoint {
+  claudeSessionId: string;
+  at?: string;
+  parentId: string;
+}
+
+/**
+ * Optional KiroSession extension, read duck-typed (not in types.ts — DEVIATION reported;
+ * session/kiroSession.ts has a method of this name and meaning, TS-private there): where a new
+ * fork of the session's current conversation must start — its own Claude session or, while that
+ * is itself a fork without a message yet (a /tangent or /rewind just entered), that fork's source.
+ */
+interface ForkSourceAware {
+  forkSource(): { from: string; at?: string } | undefined;
+}
+
+function hasForkSource(s: unknown): s is ForkSourceAware {
+  return !!s && typeof (s as { forkSource?: unknown }).forkSource === 'function';
+}
+
+/**
+ * Sessions a driver forked (phase sessions, continuations) that have not had a turn yet. Claude
+ * Code writes a fork's transcript only with its first message, so until then a
+ * `--resume <it> --fork-session` finds no conversation and starts empty: a fork of such a session
+ * starts where it started (`point`). Module-level: the continuation a flow hands to the REPL
+ * outlives that flow's driver (the next `/spec` command forks from it).
+ */
+const unwritten = new WeakMap<KiroSession, { point: ForkPoint | undefined; turns: number; claudeSessionId: string | undefined }>();
+
+/** Where a fork of `s`'s conversation starts: never at a Claude session without a transcript. */
+function forkPointOf(s: KiroSession | undefined): ForkPoint | undefined {
+  if (!s) return undefined;
+  const u = unwritten.get(s);
+  if (u) {
+    // until a turn reaches it or its conversation changes (/clear, a tangent)
+    if (recordedTurns(s) <= u.turns && s.claudeSessionId === u.claudeSessionId) return u.point;
+    unwritten.delete(s);
+  }
+  if (hasForkSource(s)) {
+    try {
+      const f = s.forkSource();
+      if (f?.from) return { claudeSessionId: f.from, ...(f.at ? { at: f.at } : {}), parentId: s.id };
+    } catch {
+      // fall back to the session's own Claude session
+    }
+  }
+  return s.claudeSessionId ? { claudeSessionId: s.claudeSessionId, parentId: s.id } : undefined;
+}
+
 /**
  * Runs spec-conversation turns under a phase restriction (see module doc). Sessions it created are
  * closed when replaced; {@link finish} leaves an unrestricted continuation active (`keep`) or
@@ -190,6 +259,8 @@ export class SpecSessionDriver {
   private restricted: { session: KiroSession; key: string } | undefined;
   private original: KiroSession | undefined;
   private replacedOriginal = false;
+  /** A turn of this flow reached Claude in a session this driver created. */
+  private reached = false;
 
   constructor(
     private readonly port: SessionPort,
@@ -206,6 +277,7 @@ export class SpecSessionDriver {
     if (s && canSetSpecPhase(s)) {
       await s.setSpecPhase(phase);
       try {
+        if (opts.signal?.aborted) return notSent();
         return await this.port.run(s, input, opts);
       } finally {
         await s.setSpecPhase(undefined);
@@ -216,13 +288,23 @@ export class SpecSessionDriver {
       s = await this.fork(s, { ...this.opts.phaseOptions, specPhase: { name: phase.name, allowedWritePaths: [...phase.allowedWritePaths] } });
       this.restricted = { session: s, key };
     }
-    return this.port.run(s, input, opts);
+    // Ctrl+C while the phase session started: nothing is sent (the session gets no message)
+    if (opts.signal?.aborted) return notSent();
+    const before = recordedTurns(s);
+    try {
+      return await this.port.run(s, input, opts);
+    } finally {
+      if (recordedTurns(s) > before) this.reached = true;
+    }
   }
 
   private async fork(prev: KiroSession | undefined, extra: Partial<KiroSessionOptions>): Promise<KiroSession> {
     const o: Partial<KiroSessionOptions> = { ...extra };
-    if (prev?.claudeSessionId) o.fork = { fromClaudeSessionId: prev.claudeSessionId, kind: 'main', parentId: prev.id };
+    // never from a session without a transcript yet (its fork would start empty): from its source
+    const p = forkPointOf(prev);
+    if (p) o.fork = { fromClaudeSessionId: p.claudeSessionId, ...(p.at ? { at: p.at } : {}), kind: 'main', parentId: p.parentId };
     const next = await this.port.create(o);
+    unwritten.set(next, { point: p, turns: recordedTurns(next), claudeSessionId: next.claudeSessionId });
     if (prev && !this.created.has(prev) && this.original === undefined) this.original = prev;
     this.port.activate(next);
     if (prev && this.created.has(prev)) {
@@ -237,32 +319,32 @@ export class SpecSessionDriver {
 
   /**
    * End of a flow. `keep`: when a restricted session is active, fork an unrestricted continuation
-   * (keeps the spec conversation, 03 §1.7.2) and close the restricted one and the replaced
-   * original. Otherwise close every session this driver created.
+   * (keeps the spec conversation, 03 §1.7.2) from the last session a turn reached, and close the
+   * restricted one and the replaced original; when no turn of the flow reached Claude the original
+   * stays (nothing to carry). Then, and for `close`, close every session this driver created, the
+   * host never left on one of them.
    */
   async finish(mode: 'keep' | 'close'): Promise<void> {
     const active = this.port.active();
-    if (mode === 'keep') {
-      if (active && this.restricted && this.restricted.session === active) {
-        this.restricted = undefined;
-        try {
-          const next = await this.fork(active, { ...this.opts.finalOptions });
-          this.created.delete(next); // handed over to the host
-          if (this.replacedOriginal && this.original) await this.original.close().catch(() => undefined);
-        } catch {
-          // could not fork a continuation: give the host its original session back
-          if (this.original) this.port.activate(this.original);
-        }
+    if (mode === 'keep' && active && this.restricted && this.restricted.session === active && (this.reached || !this.original)) {
+      this.restricted = undefined;
+      try {
+        const next = await this.fork(active, { ...this.opts.finalOptions });
+        this.created.delete(next); // handed over to the host
+        if (this.replacedOriginal && this.original) await this.original.close().catch(() => undefined);
+      } catch {
+        // could not fork a continuation: give the host its original session back
+        if (this.original) this.port.activate(this.original);
       }
-      for (const s of this.created) await s.close().catch(() => undefined);
-      this.created.clear();
-    } else {
-      for (const s of this.created) await s.close().catch(() => undefined);
-      this.created.clear();
+    } else if (active && this.created.has(active) && this.original) {
+      this.port.activate(this.original);
     }
+    for (const s of this.created) await s.close().catch(() => undefined);
+    this.created.clear();
     this.restricted = undefined;
     this.original = undefined;
     this.replacedOriginal = false;
+    this.reached = false;
   }
 }
 
@@ -1153,16 +1235,11 @@ function commandSignalOf(host: ReplHost): AbortSignal | undefined {
  * and cancels a spec turn whose phase session is still starting.
  */
 export function createReplRuntime(host: ReplHost, deps: ReplRuntimeDeps = {}): SpecRuntime & { readonly driver: SpecSessionDriver } {
-  // The command's Ctrl+C signal when the running spec turn was requested and not aborted yet: a
-  // press while the driver starts the turn's phase session (Claude Code spawning) cancels the turn
-  // before it is sent. A press an earlier turn handled does not cancel the later ones.
-  let turnSignal: AbortSignal | undefined;
   const port: SessionPort = {
     active: () => host.session,
     create: (o) => host.createSession(o),
     activate: (s) => host.replaceSession(s),
-    run: (_s, input) =>
-      turnSignal?.aborted ? Promise.resolve<TurnResult>({ stopReason: 'cancelled', isError: false, text: '', permissionDenials: [] }) : host.runTurn(input),
+    run: (_s, input) => host.runTurn(input),
   };
   const driver = new SpecSessionDriver(port, { phaseOptions: { origin: 'spec' }, finalOptions: {} });
   const factory = deps.hookRunnerFactory ?? ((hooks: readonly KiroHook[]) => new HookRunner([...hooks]));
@@ -1181,14 +1258,12 @@ export function createReplRuntime(host: ReplHost, deps: ReplRuntimeDeps = {}): S
     ask: (q) => host.ask(q),
     confirm: (q, d) => host.confirm(q, d),
     choose: (q, o) => host.choose(q, o),
-    async runSpecTurn(input, phase, o) {
+    runSpecTurn(input, phase, o) {
+      // The command's Ctrl+C signal when this turn was requested and not aborted yet: a press while
+      // the driver starts the turn's phase session (Claude Code spawning) cancels the turn before
+      // it is sent. A press an earlier turn handled does not cancel the later ones.
       const sig = commandSignalOf(host);
-      turnSignal = sig && !sig.aborted ? sig : undefined;
-      try {
-        return await driver.runTurn(input, phase, o);
-      } finally {
-        turnSignal = undefined;
-      }
+      return driver.runTurn(input, phase, { ...o, ...(sig && !sig.aborted ? { signal: sig } : {}) });
     },
     async openTaskSession(): Promise<TaskSessionHandle> {
       const prev = host.session;

@@ -10,7 +10,8 @@
  * mcp_status, get_settings, local slash commands (/clear, /compact, /effort, /model, /cost,
  * /context), command_lifecycle, the priority:"next" queue (folded in at the next tool boundary,
  * else run as its own turn after the result; plain interrupt keeps it, `cancel_queued` drops
- * it), and (opt-in) transcript persistence for --resume / --fork-session / --resume-session-at.
+ * it), and (opt-in) transcript persistence for --resume / --fork-session (a fork's transcript is
+ * written with its first user line, like the real claude) / --resume-session-at.
  *
  * Turns are scripted with $FAKE_CLAUDE_SCRIPT (JSON file) or $FAKE_CLAUDE_SCRIPT_JSON (inline).
  * See test/fixtures/README.md for the script format and every FAKE_CLAUDE_* variable.
@@ -604,6 +605,10 @@ function main() {
   /* --- session id + history ------------------------------------------------------------- */
   let sessionId;
   let historyLines = []; // transcript lines (objects) of the current session
+  // a --fork-session child whose copied history is not on disk yet: real claude 2.1.319 writes a
+  // fork's transcript only with its first user line, so until then `--resume <fork id>` finds no
+  // conversation (VERIFIED: a fork that exits without a message leaves no transcript)
+  let forkPending = false;
   if (resumeArg !== undefined && resumeArg !== true) {
     let loaded = [];
     if (persist) {
@@ -623,7 +628,8 @@ function main() {
     }
     sessionId = opts['--fork-session'] ? sessionIdArg || uuid() : resumeArg;
     historyLines = loaded.map((l) => ({ ...l, sessionId }));
-    if (persist && (opts['--fork-session'] || resumeAt !== undefined)) {
+    if (persist && opts['--fork-session']) forkPending = true;
+    else if (persist && resumeAt !== undefined) {
       fs.mkdirSync(projectDir, { recursive: true });
       fs.writeFileSync(transcriptFile(sessionId), historyLines.map((l) => JSON.stringify(l)).join('\n') + (historyLines.length ? '\n' : ''));
     }
@@ -754,7 +760,20 @@ function main() {
   })();
   const transcriptPathFor = () => path.join(env.CLAUDE_CONFIG_DIR || path.join(env.HOME || '/', '.claude'), 'projects', sanitize(cwd), `${sessionId}.jsonl`);
 
+  /** Write a pending fork's copied history (its first user line arrived, see forkPending). */
+  function materializeFork() {
+    if (!forkPending) return;
+    forkPending = false;
+    try {
+      fs.mkdirSync(projectDir, { recursive: true });
+      fs.writeFileSync(transcriptFile(sessionId), historyLines.map((l) => JSON.stringify(l)).join('\n') + (historyLines.length ? '\n' : ''));
+    } catch (e) {
+      process.stderr.write(`fake-claude: transcript write failed: ${e.message}\n`);
+    }
+  }
+
   function appendTranscript(entry) {
+    materializeFork();
     const line = { parentUuid: lastParentUuid, isSidechain: false, userType: 'external', cwd, sessionId, version: VERSION, timestamp: now(), ...entry };
     lastParentUuid = line.uuid;
     historyLines.push(line);
@@ -1571,6 +1590,7 @@ function main() {
       case 'control_cancel_request':
         return;
       case 'user':
+        materializeFork();
         return onUser(msg);
       default:
         return;

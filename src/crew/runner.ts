@@ -8,7 +8,8 @@
  *   `detached: true` calls `setsid()` on POSIX, and every fd of the child points at a file so
  *   callers piping our output never hang — 08b §2.2).
  * - {@link CrewSys}: clock, sleep, signals, liveness, the `/proc` scan used by `crew stop` to
- *   reap orphaned `kiro-claude acp` processes, and free-disk queries.
+ *   reap orphaned `kiro-claude acp` processes and retire the gateway's tree (a process is told
+ *   apart from a later one that reuses its pid by its start time), and free-disk queries.
  *
  * Programs are spawned without a shell (argv arrays), so paths with spaces need no quoting.
  */
@@ -75,6 +76,11 @@ export interface ProcessInfo {
   /** Parent pid and process group, when known (`/proc/<pid>/stat`). */
   ppid?: number;
   pgid?: number;
+  /**
+   * Start time in clock ticks since boot (`/proc/<pid>/stat` field 22), when known: with the pid it
+   * names one process, so a later process that reuses the pid is not taken for it.
+   */
+  startTime?: number;
 }
 
 export interface CrewSys {
@@ -87,6 +93,8 @@ export interface CrewSys {
   kill(pid: number, signal: NodeJS.Signals): boolean;
   /** Linux `/proc` scan; empty elsewhere. */
   listProcesses(): ProcessInfo[];
+  /** {@link ProcessInfo.startTime} of `pid`; undefined when it does not exist or is unknown (not Linux). */
+  startTime(pid: number): number | undefined;
   freeBytes(p: string): number | undefined;
   tmpdir(): string;
 }
@@ -265,14 +273,19 @@ function readProcFile(pid: number, name: string): Buffer | undefined {
   }
 }
 
-/** `ppid` and `pgid` from a `/proc/<pid>/stat` line (the comm field may hold spaces and parens). */
-export function parseProcStat(text: string): { ppid: number; pgid: number } | undefined {
+/**
+ * `ppid`, `pgid` and, when the line has it, `startTime` (field 22) from a `/proc/<pid>/stat` line
+ * (the comm field may hold spaces and parens).
+ */
+export function parseProcStat(text: string): { ppid: number; pgid: number; startTime?: number } | undefined {
   const close = text.lastIndexOf(')');
   if (close < 0) return undefined;
-  const f = text.slice(close + 1).trim().split(/\s+/); // state ppid pgrp …
+  const f = text.slice(close + 1).trim().split(/\s+/); // field 3 (state), 4 (ppid), 5 (pgrp) … 22 (starttime)
   const ppid = Number(f[1]);
   const pgid = Number(f[2]);
-  return Number.isInteger(ppid) && Number.isInteger(pgid) ? { ppid, pgid } : undefined;
+  if (!Number.isInteger(ppid) || !Number.isInteger(pgid)) return undefined;
+  const startTime = f[19] !== undefined ? Number(f[19]) : NaN;
+  return Number.isInteger(startTime) ? { ppid, pgid, startTime } : { ppid, pgid };
 }
 
 /** Parse a NUL-separated `/proc/<pid>/environ` buffer. */
@@ -339,6 +352,11 @@ export const defaultSys: CrewSys = {
       out.push({ pid, argv, env: envBuf ? parseEnviron(envBuf) : undefined, ...(ids ?? {}) });
     }
     return out;
+  },
+  startTime(pid) {
+    if (process.platform !== 'linux' || !Number.isInteger(pid) || pid <= 0) return undefined;
+    const stat = readProcFile(pid, 'stat');
+    return stat ? parseProcStat(stat.toString('utf8'))?.startTime : undefined;
   },
   freeBytes: (p) => freeBytesAt(p),
   tmpdir: () => os.tmpdir(),

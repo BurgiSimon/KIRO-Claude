@@ -644,3 +644,91 @@ withWs('custom shell option', async (ws) => {
   const r = await runner.runSessionStart(ctxFor(ws));
   assert.deepEqual(r.outputs, ['/bin/sh']);
 });
+
+// ───────────────────────────── Manual: cancellation (G3/G4) ─────────────────────────────
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readPid(file: string, ms = 5000): Promise<number> {
+  const t0 = Date.now();
+  for (;;) {
+    const s = fs.existsSync(file) ? fs.readFileSync(file, 'utf8').trim() : '';
+    if (/^\d+$/.test(s)) return Number(s);
+    if (Date.now() - t0 > ms) throw new Error(`the hook never wrote ${file}`);
+    await sleep(20);
+  }
+}
+
+for (const [label, timeoutMs] of [['timeout 0 (no limit)', 0], ['the default timeout', 60_000]] as const) {
+  withWs(`runManual: the abort signal kills a running command (${label}, SIGTERM ignored); the result says aborted, no output, no warning (G3/G4)`, async (ws) => {
+    const pidFile = path.join(ws.dir, 'manual.pid');
+    const done = path.join(ws.dir, 'manual.done');
+    // the shell and its child ignore SIGTERM/SIGINT/SIGHUP: only SIGKILL of the group ends them
+    const command = `trap '' TERM INT HUP; echo $$ > ${q(pidFile)}; sleep 30; touch ${q(done)}; echo SLOW-DONE`;
+    const runner = new HookRunner([v3Hook('Manual', command, { name: 'slow', timeoutMs })]);
+    const ac = new AbortController();
+    const running = runner.runManual(ctxFor(ws, { signal: ac.signal }), 'slow');
+    const pid = await readPid(pidFile);
+    const t0 = Date.now();
+    ac.abort();
+    const r = await running;
+    assert.ok(Date.now() - t0 < 2000, `the aborted hook ended after ${Date.now() - t0} ms`);
+    assert.deepEqual(r, { found: true, aborted: true, warnings: [] });
+    const t1 = Date.now();
+    while (pidAlive(pid) && Date.now() - t1 < 2000) await sleep(20);
+    assert.ok(!pidAlive(pid), `hook process ${pid} still runs`);
+    assert.ok(!fs.existsSync(done));
+  });
+}
+
+withWs('runManual: a signal aborted before the run starts runs nothing and says aborted (G3/G4)', async (ws) => {
+  const marker = path.join(ws.dir, 'ran');
+  const runner = new HookRunner([v3Hook('Manual', `touch ${q(marker)}`, { name: 'late' })]);
+  const ac = new AbortController();
+  ac.abort();
+  assert.deepEqual(await runner.runManual(ctxFor(ws, { signal: ac.signal }), 'late'), { found: true, aborted: true, warnings: [] });
+  assert.ok(!fs.existsSync(marker));
+  // a finished run is not reported as aborted, even with a signal that is aborted afterwards
+  const ac2 = new AbortController();
+  const ok = await runner.runManual(ctxFor(ws, { signal: ac2.signal }), 'late');
+  ac2.abort();
+  assert.deepEqual(ok, { found: true, output: '', exitCode: 0, warnings: [] });
+});
+
+const SETSID = ['/usr/bin/setsid', '/bin/setsid'].find((p) => fs.existsSync(p));
+
+withWs('runManual: an abort ends the run even when a process outside the hook group keeps its pipes open (pipe grace; G3/G4)', async (ws) => {
+  if (!SETSID) return; // no setsid(1) here (macOS): nothing can leave the group this way
+  const escPid = path.join(ws.dir, 'esc.pid');
+  const shPid = path.join(ws.dir, 'sh.pid');
+  // the escaped child holds the hook's stdout/stderr; the group kill cannot reach it
+  const command = `${SETSID} sleep 30 & echo $! > ${q(escPid)}; echo $$ > ${q(shPid)}; sleep 30; echo SLOW-DONE`;
+  const runner = new HookRunner([v3Hook('Manual', command, { name: 'esc', timeoutMs: 0 })]);
+  const ac = new AbortController();
+  const running = runner.runManual(ctxFor(ws, { signal: ac.signal }), 'esc');
+  const esc = await readPid(escPid);
+  const sh = await readPid(shPid);
+  try {
+    const t0 = Date.now();
+    ac.abort();
+    const r = await running;
+    assert.ok(Date.now() - t0 < 2000, `the aborted hook ended after ${Date.now() - t0} ms`);
+    assert.deepEqual(r, { found: true, aborted: true, warnings: [] });
+    const t1 = Date.now();
+    while (pidAlive(sh) && Date.now() - t1 < 2000) await sleep(20);
+    assert.ok(!pidAlive(sh), `the hook shell ${sh} still runs`);
+  } finally {
+    try {
+      process.kill(esc, 'SIGKILL');
+    } catch {
+      /* gone */
+    }
+  }
+});
