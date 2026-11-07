@@ -207,45 +207,55 @@ interface ForkPoint {
 }
 
 /**
- * Optional KiroSession extension, read duck-typed (not in types.ts — DEVIATION reported;
- * session/kiroSession.ts has a method of this name and meaning, TS-private there): where a new
- * fork of the session's current conversation must start — its own Claude session or, while that
- * is itself a fork without a message yet (a /tangent or /rewind just entered), that fork's source.
- */
-interface ForkSourceAware {
-  forkSource(): { from: string; at?: string } | undefined;
-}
-
-function hasForkSource(s: unknown): s is ForkSourceAware {
-  return !!s && typeof (s as { forkSource?: unknown }).forkSource === 'function';
-}
-
-/**
  * Sessions a driver forked (phase sessions, continuations) that have not had a turn yet. Claude
  * Code writes a fork's transcript only with its first message, so until then a
  * `--resume <it> --fork-session` finds no conversation and starts empty: a fork of such a session
  * starts where it started (`point`). Module-level: the continuation a flow hands to the REPL
  * outlives that flow's driver (the next `/spec` command forks from it).
  */
-const unwritten = new WeakMap<KiroSession, { point: ForkPoint | undefined; turns: number; claudeSessionId: string | undefined }>();
+const unwritten = new WeakMap<
+  KiroSession,
+  {
+    point: ForkPoint | undefined;
+    turns: number;
+    claudeSessionId: string | undefined;
+    /** The conversation it was forked from had history (its own record starts with none). */
+    history: boolean;
+  }
+>();
+
+/** `s`'s entry in {@link unwritten}, until a turn reaches it or its conversation changes (/clear, a tangent). */
+function unwrittenEntry(s: KiroSession): ReturnType<typeof unwritten.get> {
+  const u = unwritten.get(s);
+  if (!u) return undefined;
+  if (recordedTurns(s) <= u.turns && s.claudeSessionId === u.claudeSessionId) return u;
+  unwritten.delete(s);
+  return undefined;
+}
+
+/**
+ * The conversation `s` continues has history (`/spec new`: "Use the conversation so far as
+ * input"): turns of its own (its record's turns; a tangent, rewind, resumed or imported record
+ * carries those of the conversation it continues), or it is a fork a driver made that has no
+ * message yet (the continuation a flow just handed over) of a conversation that had history: such
+ * a record starts with no turns, although the conversation is carried. Not the record's message
+ * count: `/clear` empties the turns but keeps that count, and the cleared conversation has none.
+ */
+export function conversationHasHistory(s: KiroSession | undefined): boolean {
+  if (!s) return false;
+  if (recordedTurns(s) > 0) return true;
+  return unwrittenEntry(s)?.history === true;
+}
 
 /** Where a fork of `s`'s conversation starts: never at a Claude session without a transcript. */
 function forkPointOf(s: KiroSession | undefined): ForkPoint | undefined {
   if (!s) return undefined;
-  const u = unwritten.get(s);
-  if (u) {
-    // until a turn reaches it or its conversation changes (/clear, a tangent)
-    if (recordedTurns(s) <= u.turns && s.claudeSessionId === u.claudeSessionId) return u.point;
-    unwritten.delete(s);
-  }
-  if (hasForkSource(s)) {
-    try {
-      const f = s.forkSource();
-      if (f?.from) return { claudeSessionId: f.from, ...(f.at ? { at: f.at } : {}), parentId: s.id };
-    } catch {
-      // fall back to the session's own Claude session
-    }
-  }
+  const u = unwrittenEntry(s);
+  if (u) return u.point;
+  // KiroSession.forkSource: its own Claude session, or, while that is itself a fork without a
+  // message yet (a /tangent or /rewind just entered), that fork's source
+  const f = s.forkSource();
+  if (f?.from) return { claudeSessionId: f.from, ...(f.at ? { at: f.at } : {}), parentId: s.id };
   return s.claudeSessionId ? { claudeSessionId: s.claudeSessionId, parentId: s.id } : undefined;
 }
 
@@ -303,8 +313,9 @@ export class SpecSessionDriver {
     // never from a session without a transcript yet (its fork would start empty): from its source
     const p = forkPointOf(prev);
     if (p) o.fork = { fromClaudeSessionId: p.claudeSessionId, ...(p.at ? { at: p.at } : {}), kind: 'main', parentId: p.parentId };
+    const history = !!p && conversationHasHistory(prev);
     const next = await this.port.create(o);
-    unwritten.set(next, { point: p, turns: recordedTurns(next), claudeSessionId: next.claudeSessionId });
+    unwritten.set(next, { point: p, turns: recordedTurns(next), claudeSessionId: next.claudeSessionId, history });
     if (prev && !this.created.has(prev) && this.original === undefined) this.original = prev;
     this.port.activate(next);
     if (prev && this.created.has(prev)) {

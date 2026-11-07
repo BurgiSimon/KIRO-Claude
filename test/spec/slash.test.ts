@@ -249,3 +249,65 @@ test('/spec <name>, /spec picker, approve/revise use the remembered spec', async
     w.cleanup();
   }
 });
+
+// ───── P3: /spec new uses the conversation when the one the user continues has history ─────
+
+const USE_CONVERSATION = 'Use the conversation so far as input.';
+
+/** The drafting line of the spec whose description is `desc` (whichever session it went to). */
+function draftingLine(host: MockHost, desc: string): string {
+  const all = host.sessions.flatMap((s) => s.prompts.map((p) => p.text));
+  const hit = all.find((t) => /Phase: REQUIREMENTS/.test(t) && t.includes(`User description (ground truth): ${desc}`));
+  assert.ok(hit, `no drafting line for ${JSON.stringify(desc)}:\n${all.join('\n---\n')}`);
+  return hit;
+}
+
+test('/spec new straight after a flow (its continuation has no message yet) still uses the conversation (P3)', async () => {
+  const { w, host } = setup();
+  try {
+    await host.runTurn({ text: 'remember CODEWORD-PELICAN' });
+    host.chooseAnswers = ['Stop here'];
+    await run(host, 'new first-spec --type feature --workflow requirements-first a csv export');
+    assert.ok(draftingLine(host, 'a csv export').includes(USE_CONVERSATION), 'control: main had a turn');
+    const cont = host.session as unknown as { record: { messageCount: number; turns: unknown[] }; conversation: string[] };
+    assert.equal(cont.record.turns.length, 0, 'precondition: the continuation the flow handed over has no turn of its own');
+    assert.ok(cont.conversation.includes('remember CODEWORD-PELICAN'), 'precondition: it carries the conversation');
+    host.chooseAnswers = ['Stop here'];
+    await run(host, 'new second-spec --type feature --workflow requirements-first a tsv export');
+    assert.ok(draftingLine(host, 'a tsv export').includes(USE_CONVERSATION), 'the carried conversation is not used as input');
+  } finally {
+    w.cleanup();
+  }
+});
+
+test('/spec new in a chat without history does not ask to use the conversation, also straight after a flow on it (P3 control)', async () => {
+  const { w, host } = setup();
+  try {
+    host.chooseAnswers = ['Stop here'];
+    await run(host, 'new first-spec --type feature --workflow requirements-first a csv export');
+    assert.ok(!draftingLine(host, 'a csv export').includes(USE_CONVERSATION), 'an empty chat');
+    // the continuation carries the drafting turn: that is history now
+    host.chooseAnswers = ['Stop here'];
+    await run(host, 'new second-spec --type feature --workflow requirements-first a tsv export');
+    assert.ok(draftingLine(host, 'a tsv export').includes(USE_CONVERSATION), 'the first flow\'s drafting turn is in the conversation');
+  } finally {
+    w.cleanup();
+  }
+});
+
+test('/spec new after /clear (the turns are gone, the message count stays) does not ask to use the cleared conversation (P3, verifier)', async () => {
+  const { w, host } = setup();
+  try {
+    await host.runTurn({ text: 'remember CODEWORD-PELICAN' });
+    // what KiroSessionImpl.clear() leaves: no turns, the message count kept, a new Claude session
+    const s = host.session as unknown as { record: { messageCount: number; turns: unknown[]; claudeSessionId: string }; claudeSessionId: string };
+    s.record.turns = [];
+    s.claudeSessionId = s.record.claudeSessionId = `${s.claudeSessionId}-cleared`;
+    assert.ok(s.record.messageCount > 0, 'precondition: the message count is kept');
+    host.chooseAnswers = ['Stop here'];
+    await run(host, 'new first-spec --type feature --workflow requirements-first a csv export');
+    assert.ok(!draftingLine(host, 'a csv export').includes(USE_CONVERSATION), 'asked to use the cleared conversation');
+  } finally {
+    w.cleanup();
+  }
+});

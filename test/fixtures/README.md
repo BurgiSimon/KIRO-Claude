@@ -187,8 +187,12 @@ result, exit 1; `--resume` keeps id + history; `--fork-session` copies history t
 untouched) and, like the real claude 2.1.319, writes the fork's transcript only when the fork gets its
 first user line: a fork that exits without one leaves no transcript, so `--resume <fork id>` (or a
 fork of it) reports `No conversation found`; `--resume-session-at <uuid>` keeps history up to and
-including that line; `--continue` picks the newest transcript of the cwd; `/clear` starts a new
-transcript. Without persistence any `--resume` id is accepted with empty history. Never point
+including that line, and, like the real claude 2.1.319, a uuid the resumed transcript does not hold
+(with or without `--fork-session`) fails: stderr `No message found with message.uuid of: <uuid>`, an
+`error_during_execution` result on stdout (`errors: [that text]`), exit 1, nothing written (a
+missing transcript still reports `No conversation found` first); `--continue` picks the newest
+transcript of the cwd; `/clear` starts a new transcript. Without persistence any `--resume` id is
+accepted with empty history (and `--resume-session-at` cuts nothing). Never point
 `CLAUDE_CONFIG_DIR` at a real config dir.
 
 ### Environment variables

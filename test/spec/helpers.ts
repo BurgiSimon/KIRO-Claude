@@ -402,6 +402,10 @@ export class MockSession extends EventEmitter implements KiroSession {
   async enterTangent(): Promise<void> {}
   async exitTangent(): Promise<void> {}
   async rewind(): Promise<void> {}
+  /** Its own Claude session (a fork without a message yet: see workflow.test.ts ForkingSession). */
+  forkSource(): { from: string; at?: string } | undefined {
+    return this.claudeSessionId ? { from: this.claudeSessionId } : undefined;
+  }
   toolListing() {
     return [];
   }

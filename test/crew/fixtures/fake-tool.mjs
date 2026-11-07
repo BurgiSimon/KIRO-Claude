@@ -23,6 +23,10 @@
 //                            linger exits on SIGTERM, stubborn ignores it. late → the gateway starts a
 //                            SIGTERM-ignoring child only when it is told to stop, just before it exits
 //                            (not in crew stop's snapshot of the tree). Pid in fake-gateway-child.json
+//   $KIROCREW_HOME/fake-held  exists → `gateway-pid` answers {"holder":"held"} while the gateway runs
+//                            (a held lock whose holder KiroCrew cannot name); `stop` is unchanged (KiroCrew
+//                            tries its authenticated API shutdown first). A file, so a test can flip it
+//                            while one `crew stop` polls.
 import { spawn, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as http from 'node:http';
@@ -408,6 +412,8 @@ function kirocrew() {
   }
   if (verb === 'gateway-pid') {
     const r = gwRecord();
+    // KiroCrew's `held`: the lock is positively held but nothing names its holder (cli_server_stop.py).
+    if (r && fs.existsSync(path.join(KC_HOME, 'fake-held'))) return out(JSON.stringify({ holder: 'held', reason: `${path.join(KC_HOME, 'gateway.lock')}: the lock is held but no live holder pid can be established` }));
     return out(JSON.stringify(r ? { holder: 'process', pid: r.pid, alive: true, source: 'lock' } : { holder: 'nobody' }));
   }
   if (verb === 'gateway') return gateway();

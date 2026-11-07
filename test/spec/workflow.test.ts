@@ -1199,7 +1199,7 @@ test('G0: SpecSessionDriver forks from the last session a turn reached, never fr
 class ForkingSession extends MockSession {
   /** Set while the session is a fork without a message yet (a /tangent or /rewind just entered). */
   source: { from: string; at?: string } | undefined;
-  forkSource(): { from: string; at?: string } {
+  override forkSource(): { from: string; at?: string } {
     return this.prompts.length === 0 && this.source ? this.source : { from: this.claudeSessionId! };
   }
 }

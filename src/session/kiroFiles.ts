@@ -346,6 +346,22 @@ export function copyJournal(dir: string, fromSid: string, toSid: string, opts: {
   return records.length;
 }
 
+/**
+ * Copy the journal of a conversation forked at turn `index` (0-based) of `turns` (`/rewind`, or
+ * a fork at a rewind point, `KiroSessionOptions.fork.at`): the records before the next turn's
+ * `Prompt` (by message id, so steers and `/clear` markers do not shift the cut); at the last turn
+ * every record but trailing compactions (the fork's history is uncompacted). Nothing is written
+ * when there is nothing to copy. Returns the number of records copied.
+ */
+export function copyJournalThroughTurn(dir: string, fromSid: string, toSid: string, turns: readonly { userUuid: string }[], index: number): number {
+  const next = turns[index + 1];
+  let records = readJournal(dir, fromSid);
+  if (next) records = journalBeforeMessage(records, next.userUuid);
+  else while (records.length && records[records.length - 1]!.kind === 'Compaction') records.pop();
+  if (records.length) writeJournalRecords(dir, toSid, records);
+  return records.length;
+}
+
 /** Replace `<sid>.jsonl` with exactly `records` (atomic temp + rename, 0600). */
 export function writeJournalRecords(dir: string, sid: string, records: readonly JournalRecord[]): void {
   writeJournalText(dir, sid, records.length ? records.map((r) => JSON.stringify(r)).join('\n') + '\n' : '');

@@ -9,6 +9,8 @@
  *    anything else gets `-c`).
  *  - The child runs in its own process group on Unix (`detached`), so a timeout or abort
  *    SIGKILLs the whole group (grandchildren included). On Windows `taskkill /T /F` is used.
+ *    A timeout or abort during the pipe grace (after the shell exited) still kills members
+ *    left in the group, but never a group id that may have been reused (review L1).
  *  - A running child cannot outlive kiro-claude (review C12): being in its own group and
  *    session, it gets neither the terminal's signals nor our death, and the timeout timer dies
  *    with us. So it is registered with claude/lifecycle.ts as a non-graceful group child until
@@ -34,8 +36,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { utf8SafePrefixLength } from './text.js';
 import { log } from './log.js';
-// claude/lifecycle.ts has no runtime imports, so this adds no import cycle.
-import { trackChild } from '../claude/lifecycle.js';
+// claude/lifecycle.ts imports only node: built-ins, so this adds no import cycle.
+import { childReaped, signalChild, trackChild } from '../claude/lifecycle.js';
 
 export interface ShellResult {
   exitCode: number | null;
@@ -166,11 +168,17 @@ class Capture {
   }
 }
 
-/** Kill a child and (Unix) its whole process group / (Windows) its process tree. */
+/**
+ * Kill a child and (Unix) its whole process group / (Windows) its process tree. After the child
+ * was reaped its pid may name another process: on Unix the group is signalled only while it is
+ * provably still ours (claude/lifecycle.ts signalChild, review L1); on Windows nothing is done
+ * (`taskkill /T` needs the parent alive to find the tree anyway).
+ */
 export function killProcessTree(child: ChildProcess, signal: NodeJS.Signals = 'SIGKILL'): void {
   const pid = child.pid;
   if (pid === undefined) return;
   if (isWin) {
+    if (childReaped(child)) return;
     try {
       const k = spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
       k.on('error', () => undefined);
@@ -184,15 +192,7 @@ export function killProcessTree(child: ChildProcess, signal: NodeJS.Signals = 'S
     }
     return;
   }
-  try {
-    process.kill(-pid, signal);
-  } catch {
-    try {
-      child.kill(signal);
-    } catch {
-      // already gone
-    }
-  }
+  signalChild(child, signal, true);
 }
 
 /** Longest delay `setTimeout` honours; larger values fire after 1 ms (with a stderr warning). */

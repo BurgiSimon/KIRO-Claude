@@ -29,10 +29,11 @@
  * (`/tangent merge` runs a model summary turn, `/agent swap` respawns Claude Code), ⇒
  * `session.interrupt()`; the press is never kept as type-ahead for the next prompt. Every press
  * while a command runs also aborts its {@link ReplContext.commandSignal} (`/spec run` stops
- * scheduling tasks, 03 §1.7; `/hooks run` kills the hook's command, whose process group the
- * terminal's SIGINT never reaches). A second Ctrl+C aborts the prompt's signal and, when the turn /
- * command still runs {@link FORCE_STOP_GRACE_MS} later (Claude Code did not end it after the
- * interrupt), stops Claude Code like headless (session close) and ACP (`replaceStuckSession`) do:
+ * scheduling tasks, 03 §1.7; `/hooks run` and `/chat save|load-via-script` kill the hook's
+ * command / the script, whose process group the terminal's SIGINT never reaches). A second
+ * Ctrl+C aborts the prompt's signal and, when the turn / command still runs
+ * {@link FORCE_STOP_GRACE_MS} later (Claude Code did not end it after the interrupt), stops
+ * Claude Code like headless (session close) and ACP (`replaceStuckSession`) do:
  * the session is closed (stdin EOF, SIGTERM after 2 s, then SIGKILL; 00 §2.3 / 04 §8.4), the REPL
  * returns to its prompt and the next input re-creates the session with `--resume` (a conversation
  * without a finished turn, which closing drops, starts afresh; a tangent continues as its own
@@ -40,8 +41,9 @@
  * while the session still has work of its own in flight ({@link KiroSession.busy}): a command
  * waiting on another session (a `/spec run` task session or `/chat new` starting) or on Claude
  * Code (re)starting is neither stopped nor abandoned; one waiting on a process of kiro-claude's
- * own (`/hooks run`) ends through the command signal. At the idle prompt the first Ctrl+C /
- * Ctrl+D prints Q's hint, the second exits.
+ * own (`/hooks run`, `/chat *-via-script`) ends through the command signal; `$EDITOR` and
+ * `!cmd` get the terminal and its SIGINT themselves. At the idle prompt the first Ctrl+C / Ctrl+D
+ * prints Q's hint, the second exits.
  *
  * Slash commands are shlex-split; unbalanced quotes fall back to a whitespace split so free-text
  * commands (`/plan I don't …`) work. `/<steering>` sends `#steering:<name> …` with
@@ -443,6 +445,9 @@ export class Repl implements ReplContext {
     this.approving = true;
     try {
       for (;;) {
+        // a command typed here (`/chat save-via-script …`, `!cmd`) may have outlived the request:
+        // a Ctrl+C during it interrupted the turn, so the question is not asked again
+        if (signal.aborted || this.quitting) return { kind: 'cancelled' };
         this.write(`\n${approvalQuestion()}\n\n`);
         let again = false;
         while (!again) {
@@ -851,6 +856,8 @@ export class Repl implements ReplContext {
   ): Promise<{ result: TurnResult; seen: Set<SessionEvent['type']> }> {
     const busy = this.refuseNestedTurn();
     if (busy) return { result: busy, seen: new Set() };
+    // a turn run by a command typed at an approval prompt (whose own turn ended under it)
+    const inApproval = this.approving;
     const ac = new AbortController();
     const scope = this.interruptScope(() => ac.abort());
     this.reader.on('interrupt', scope.listener);
@@ -873,7 +880,9 @@ export class Repl implements ReplContext {
           break;
         }
         seen.add(n.value.type);
-        if (this.approving) {
+        // held back while an approval prompt is shown; a turn run by a command typed at that
+        // prompt renders as it comes (the prompt is not on screen while the command runs)
+        if (this.approving && !inApproval) {
           this.deferred.push(n.value);
           continue;
         }
@@ -891,6 +900,11 @@ export class Repl implements ReplContext {
       // an approval still open when the stream ended (withdrawn request): keep the order
       if (!this.approving) this.flushDeferred();
     }
+    // ... and let it end first (it renders the held-back events): a command typed at it may
+    // still run (a Ctrl+C during `/chat save-via-script …` interrupts the turn as well) and must
+    // print before the turn's end and the next prompt. Not from a turn that command runs itself
+    // (the approval waits for it).
+    if (this.approving && !inApproval) await this.approvalChain;
     this.renderer.endTurn(result, { progName: this.progName });
     const text = this.renderer.assistantText || result.text || '';
     if (text.trim() !== '' && result.stopReason !== 'local_command') {

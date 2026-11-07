@@ -11,7 +11,8 @@
  * /context), command_lifecycle, the priority:"next" queue (folded in at the next tool boundary,
  * else run as its own turn after the result; plain interrupt keeps it, `cancel_queued` drops
  * it), and (opt-in) transcript persistence for --resume / --fork-session (a fork's transcript is
- * written with its first user line, like the real claude) / --resume-session-at.
+ * written with its first user line, like the real claude) / --resume-session-at (a uuid the
+ * transcript does not hold fails with `No message found with message.uuid of: <uuid>`, exit 1).
  *
  * Turns are scripted with $FAKE_CLAUDE_SCRIPT (JSON file) or $FAKE_CLAUDE_SCRIPT_JSON (inline).
  * See test/fixtures/README.md for the script format and every FAKE_CLAUDE_* variable.
@@ -624,7 +625,16 @@ function main() {
     if (resumeAt !== undefined) {
       const idx = loaded.findIndex((l) => l.uuid === resumeAt);
       if (idx >= 0) loaded = loaded.slice(0, idx + 1);
-      else process.stderr.write(`fake-claude: --resume-session-at ${resumeAt} not found; keeping full history\n`);
+      else if (persist) {
+        // a message the transcript does not hold: real claude 2.1.319 refuses the resume, with or
+        // without --fork-session, before anything is written (VERIFIED; the same error path as
+        // `No conversation found`)
+        const msg = `No message found with message.uuid of: ${resumeAt}`;
+        process.stderr.write(msg + '\n');
+        emit({ type: 'result', subtype: 'error_during_execution', is_error: true, duration_ms: 0, duration_api_ms: 0, num_turns: 0, stop_reason: null, session_id: resumeArg, total_cost_usd: 0, usage: { input_tokens: 0, output_tokens: 0 }, modelUsage: {}, permission_denials: [], errors: [msg], uuid: uuid() });
+        log({ event: 'exit', code: 1, reason: 'resume-session-at message not found' });
+        return exitAfterFlush(1);
+      } else process.stderr.write(`fake-claude: --resume-session-at ${resumeAt} without persistence (no transcript to cut)\n`);
     }
     sessionId = opts['--fork-session'] ? sessionIdArg || uuid() : resumeArg;
     historyLines = loaded.map((l) => ({ ...l, sessionId }));

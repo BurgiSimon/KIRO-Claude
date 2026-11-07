@@ -291,6 +291,10 @@ export class MockSession extends EventEmitter implements KiroSession {
     this.rec('rewind', turn);
   }
 
+  forkSource(): { from: string; at?: string } | undefined {
+    return this.claudeSessionId ? { from: this.claudeSessionId } : undefined;
+  }
+
   toolListing(): ToolListingEntry[] {
     return this.listing;
   }

@@ -1058,3 +1058,67 @@ test('repl: /hooks run outside a Ctrl+C gets a live command signal and prints th
   assert.equal(s.manualHookSignals[0]!.aborted, false);
   run.t.cleanup();
 });
+
+// ───── repl verifier (R1): a command typed at an approval prompt outlives its turn ─────
+
+test('repl: a turn that ends while a command typed at its approval prompt still runs waits for that command (no prompt in between, no dead question); a turn the command runs itself does not wait for the approval (no deadlock)', { timeout: 20_000 }, async () => {
+  let run!: ReturnType<typeof startRepl>;
+  const approvalAc = new AbortController();
+  let approval: Promise<ApprovalResponse> | undefined;
+  let commandStarted = false;
+  const s = new MockSession().script(
+    {
+      steps: [
+        {
+          // the request stays open while its turn ends (an interrupt ended it; the session
+          // withdraws the request a moment later)
+          run: async ({ session }) => {
+            approval = session.ui!.requestApproval({ call: call('Bash', { command: 'touch x' }, 'q'), requestId: 'rq', reasons: [], agentName: 'kiro_default' }, approvalAc.signal);
+            await until(() => commandStarted, 10_000);
+          },
+        },
+      ],
+      // interrupted: it ends without a text of its own
+      result: { stopReason: 'cancelled', text: '' },
+    },
+    { steps: [text('NESTED-ANSWER')], result: { text: 'NESTED-ANSWER' } },
+  );
+  const cmd: SlashCommand = {
+    name: 'nested',
+    summary: 'test: outlives the turn whose approval prompt it was typed at, then runs a turn',
+    async run(_a, _r, host) {
+      commandStarted = true;
+      await until(() => !(host as unknown as ReplContext).busy, 10_000);
+      await sleep(100);
+      host.print('nested: the outer turn ended');
+      approvalAc.abort();
+      await host.runTurn({ text: 'nested turn' });
+      host.print('nested: done');
+    },
+  };
+  run = startRepl({ session: s, keepOpen: true, extraCommands: [cmd] });
+  await run.waitFor('> ');
+  run.send('go');
+  await run.waitFor(/\[y\/n\/t\]:[\s\S]*> $/, 5000);
+  const mark = run.out().length;
+  run.send('/nested');
+  await run.waitFor(/nested: done\n[\s\S]*> $/, 10_000);
+  assert.deepEqual(await approval, { kind: 'cancelled' });
+  const after = run.out().slice(mark);
+  const ended = after.indexOf('nested: the outer turn ended');
+  const done = after.indexOf('nested: done');
+  assert.ok(ended >= 0 && done > ended, after);
+  // the command's own turn rendered as it ran, once (its events are not held back for the
+  // approval prompt the command was typed at)
+  assert.equal(after.split('NESTED-ANSWER').length - 1, 1, after);
+  assert.ok(after.indexOf('NESTED-ANSWER') > ended && after.indexOf('NESTED-ANSWER') < done, after);
+  // no idle prompt while the command ran (`> ` + text is an answer), and the dead approval
+  // question was not asked again
+  assert.ok(!/\n> \n|\n> nested:/.test(after.slice(0, done)), `the prompt came back while the command ran:\n${after}`);
+  assert.match(after.slice(done), /^nested: done\n\n> $/, after);
+  assert.ok(!after.includes(APPROVAL_QUESTION), after);
+  assert.deepEqual(s.prompts.map((p) => p.text), ['go', 'nested turn']);
+  run.send('/quit');
+  assert.equal(await run.exit, 0);
+  run.t.cleanup();
+});

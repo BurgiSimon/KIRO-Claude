@@ -260,7 +260,9 @@ export function runCaptured(
       if (drainTimer) clearTimeout(drainTimer);
       if (child) {
         // We gave up on it: whatever of its group is still around (a SIGTERM-ignoring
-        // grandchild) is not waited for — kill it now rather than after the grace.
+        // grandchild) is not waited for — kill it now rather than after the grace. The child
+        // has exited by now, so signalChild only signals the group while it is provably still
+        // ours (its pid may have been reused, lifecycle.ts L1).
         if (killing) signalChild(child, 'SIGKILL', group);
         child.stdout?.destroy();
         child.stderr?.destroy();

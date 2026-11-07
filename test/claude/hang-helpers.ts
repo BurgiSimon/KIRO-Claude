@@ -8,6 +8,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { startTicksOf } from './pid-reuse-helpers.js';
+
 export const isWin = process.platform === 'win32';
 export const isLinux = process.platform === 'linux';
 
@@ -61,9 +63,17 @@ if (a[0] === '--version' && ${JSON.stringify(opts.mode)} === 'auth') {
   return { bin, pidFile };
 }
 
+/**
+ * Start time (Linux /proc clock ticks) of each pid when {@link readPids} first listed it, or
+ * null when it was already gone then, so {@link reap} never SIGKILLs a process that reused the
+ * number later (pid_max may be 32768).
+ */
+const seenStart = new Map<number, number | null>();
+
 export function readPids(pidFile: string): number[] {
+  let pids: number[];
   try {
-    return fs
+    pids = fs
       .readFileSync(pidFile, 'utf8')
       .split('\n')
       .map((l) => Number.parseInt(l, 10))
@@ -71,6 +81,12 @@ export function readPids(pidFile: string): number[] {
   } catch {
     return [];
   }
+  if (isLinux) {
+    for (const p of pids) {
+      if (!seenStart.has(p)) seenStart.set(p, startTicksOf(p) ?? null);
+    }
+  }
+  return pids;
 }
 
 /** True while `pid` exists and is not a zombie (zombies of orphans may linger in containers). */
@@ -114,9 +130,19 @@ export async function waitDead(pids: number[], ms: number): Promise<boolean> {
   }
 }
 
-/** Best-effort SIGKILL of leftovers so a failing test does not leak processes. */
+/**
+ * Best-effort SIGKILL of leftovers so a failing test does not leak processes. On Linux a pid
+ * listed by {@link readPids} is killed only while it is still the process first listed (one
+ * that was already gone then, or has a new start time, is a reuse); other pids (e.g. read from
+ * a driver's output while running) are killed if they run.
+ */
 export function reap(pids: number[]): void {
   for (const p of pids) {
+    if (isLinux) {
+      const start = startTicksOf(p);
+      const seen = seenStart.get(p);
+      if (start === undefined || (seen !== undefined && seen !== start)) continue; // gone, or reused
+    }
     try {
       process.kill(p, 'SIGKILL');
     } catch {

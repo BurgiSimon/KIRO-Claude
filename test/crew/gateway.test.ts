@@ -9,7 +9,7 @@ import * as path from 'node:path';
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { readState } from '../../src/crew/state.js';
+import { readState, writeState } from '../../src/crew/state.js';
 import { defaultSys, type CrewSys, type ProcessInfo } from '../../src/crew/runner.js';
 import { cloneFakeEnv, crew, freePort, makeFakeEnv, realPython, type FakeEnv } from './helpers.js';
 
@@ -67,6 +67,14 @@ function stillRuns(pid: number, start: number | undefined): boolean {
 }
 
 type Proc = ProcessInfo & { startTime?: number };
+
+function bootId(): string | undefined {
+  try {
+    return fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * The real CrewSys, except that pid `g` (the gateway) is reused `delayMs` after the real gateway
@@ -137,7 +145,9 @@ describe('crew start / status / open / stop (08 §3.8)', { skip: PY ? false : 'n
       for (const k of ['CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CCR_TEST']) assert.equal(launch.env[k], undefined, k);
       const run = path.join(fe.cs, 'run');
       const ready = JSON.parse(fs.readFileSync(path.join(run, 'ready.json'), 'utf8'));
-      assert.deepEqual(ready, { port, token: `tok-${pid}`, pid, home: kcHome(fe) });
+      // W1: the READY object plus who the gateway is (its pid outlives it): start time and boot
+      const identity = process.platform === 'linux' ? { pid, startTime: procStart(pid), bootId: bootId() } : { pid };
+      assert.deepEqual(ready, { port, token: `tok-${pid}`, pid, home: kcHome(fe), kiroClaude: identity });
       assert.equal(fs.readFileSync(path.join(run, 'token'), 'utf8'), `tok-${pid}\n`);
       for (const f of ['ready.json', 'token', 'gateway.out', 'gateway.err']) assert.equal(fs.statSync(path.join(run, f)).mode & 0o777, 0o600, f);
 
@@ -588,6 +598,213 @@ describe('crew start / status / open / stop (08 §3.8)', { skip: PY ? false : 'n
         assert.match(r.stderr, /^error: /, args.join(' '));
       }
     } finally {
+      fe.cleanup();
+    }
+  });
+});
+
+// W1: KiroCrew answers `gateway-pid` with {"holder":"held"} when a gateway holds the lock but
+// nothing names it. run/ready.json's pid is then the only lead, and that file outlives its gateway
+// (a crash, a reboot, a gateway started some other way) while its pid gets reused. Nothing may
+// be signalled, or reported as the gateway, on the word of a stale file.
+describe('crew stop / status with a held lock: run/ready.json pid identity (W1)', { skip: PY ? false : 'no python3 with sqlite3' }, () => {
+  const linux = process.platform !== 'linux' ? 'needs /proc' : false;
+  const readyFile = (fe: FakeEnv): string => path.join(fe.cs, 'run', 'ready.json');
+  const holdLock = (fe: FakeEnv): void => fs.writeFileSync(path.join(kcHome(fe), 'fake-held'), '');
+  const releaseName = (fe: FakeEnv): void => fs.rmSync(path.join(kcHome(fe), 'fake-held'), { force: true });
+  const shimOf = (fe: FakeEnv): string => path.join(fe.cs, 'bin', 'kiro-claude');
+
+  /** An unrelated live process that took a stale record's pid; it notes every SIGTERM it gets. */
+  async function bystander(fe: FakeEnv, env: NodeJS.ProcessEnv): Promise<{ pid: number; start?: number; terms(): number; stop(): void }> {
+    const marker = path.join(fe.root, `bystander-${Date.now()}-${Math.random().toString(36).slice(2)}.sig`);
+    const code = `const fs=require('fs');process.on('SIGTERM',()=>fs.appendFileSync(${JSON.stringify(marker)},'TERM\\n'));setInterval(()=>{},1000);`;
+    const ch = spawn(process.execPath, ['-e', code], { env: { PATH: '/usr/bin:/bin', ...env }, stdio: 'ignore' });
+    await new Promise((res) => setTimeout(res, 300)); // its SIGTERM handler is installed
+    const pid = ch.pid!;
+    return {
+      pid,
+      start: procStart(pid),
+      terms: () => (fs.existsSync(marker) ? fs.readFileSync(marker, 'utf8').split('\n').filter(Boolean).length : 0),
+      stop: () => ch.kill('SIGKILL'),
+    };
+  }
+
+  async function startGateway(fe: FakeEnv, port?: number): Promise<{ pid: number; start?: number; port: number }> {
+    const p = port ?? (await freePort());
+    const r = await crew(fe, ['start', '--port', String(p)]);
+    assert.equal(r.code, 0, r.stderr);
+    const pid = gatewayPid(fe)!;
+    return { pid, start: procStart(pid), port: p };
+  }
+
+  /** The record a crashed earlier gateway left, whose pid `u` took since (`kind` of identity). */
+  function staleRecord(fe: FakeEnv, u: { pid: number; start?: number }, port: number, kind: 'none' | 'start' | 'boot'): void {
+    const id =
+      kind === 'none' ? {} : kind === 'start' ? { kiroClaude: { pid: u.pid, startTime: (u.start ?? 0) + 7, bootId: bootId() } } : { kiroClaude: { pid: u.pid, startTime: u.start, bootId: '00000000-0000-4000-8000-000000000000' } };
+    fs.writeFileSync(readyFile(fe), JSON.stringify({ port, token: 'stale-token', pid: u.pid, home: kcHome(fe), ...id }), { mode: 0o600 });
+  }
+
+  const staleCases = [
+    { name: 'an older record (no identity) whose pid is now a process of another HOME', kind: 'none', sameEnv: false },
+    { name: 'an older record (no identity) whose pid is now a non-gateway process of this crew env', kind: 'none', sameEnv: true },
+    { name: 'a record whose pid now has another start time', kind: 'start', sameEnv: true },
+    { name: 'a record of an earlier boot (same pid and start time)', kind: 'boot', sameEnv: true },
+  ] as const;
+  for (const sc of staleCases) {
+    it(`stop, held: ${sc.name} → nothing is signalled; the gateway that ignores the stop is reported as not stopped`, { skip: linux }, async () => {
+      const fe = await setUp({ FAKE_STOP_IGNORE: '1' });
+      let u: Awaited<ReturnType<typeof bystander>> | undefined;
+      try {
+        const g = await startGateway(fe);
+        holdLock(fe);
+        u = await bystander(fe, sc.sameEnv ? { HOME: fe.home, KIROCREW_KIRO_BIN: shimOf(fe) } : { HOME: path.join(fe.root, 'other-home') });
+        staleRecord(fe, u, g.port, sc.kind);
+        const r = await crew(fe, ['stop', '--timeout', '1']);
+        assert.equal(u.terms(), 0, `crew stop sent SIGTERM to pid ${u.pid}, which only a stale run/ready.json named`);
+        assert.equal(stillRuns(u.pid, u.start), true, `crew stop killed pid ${u.pid}, which only a stale run/ready.json named`);
+        assert.equal(stillRuns(g.pid, g.start), true, 'the held gateway (no pid known) was not signalled either');
+        assert.equal(r.code, 1, `a held gateway that did not exit is not reported as stopped: ${r.stdout}`);
+        assert.equal(r.stdout, '');
+        assert.match(r.stderr, new RegExp(`the Kiro Crew gateway did not exit\\. Nothing names its pid \\(kirocrew gateway-pid: held; run/ready\\.json named pid ${u.pid}, which is no longer that gateway\\), so nothing was signalled\\.`));
+      } finally {
+        u?.stop();
+        fe.cleanup();
+      }
+    });
+  }
+
+  it('stop, held: a stale record, and kirocrew stop does stop the gateway → "Stopped (pid unknown)", the stale pid untouched', { skip: linux }, async () => {
+    const fe = await setUp();
+    let u: Awaited<ReturnType<typeof bystander>> | undefined;
+    try {
+      const g = await startGateway(fe);
+      holdLock(fe);
+      u = await bystander(fe, { HOME: path.join(fe.root, 'other-home') });
+      staleRecord(fe, u, g.port, 'none');
+      const r = await crew(fe, ['stop', '--timeout', '5']);
+      assert.equal(u.terms(), 0, `crew stop sent SIGTERM to pid ${u.pid}`);
+      assert.equal(stillRuns(u.pid, u.start), true);
+      assert.deepEqual({ code: r.code, stderr: r.stderr, stdout: r.stdout }, { code: 0, stderr: '', stdout: 'Stopped (pid unknown); 0 orphan agent process(es) reaped\n' });
+      assert.equal(stillRuns(g.pid, g.start), false);
+      assert.equal(fs.existsSync(readyFile(fe)), false);
+    } finally {
+      u?.stop();
+      fe.cleanup();
+    }
+  });
+
+  it('stop, held: when gateway-pid names the holder while stop waits, that pid gets the SIGTERM fallback (not the stale one)', { skip: linux }, async () => {
+    const fe = await setUp({ FAKE_STOP_IGNORE: '1' });
+    let u: Awaited<ReturnType<typeof bystander>> | undefined;
+    try {
+      const g = await startGateway(fe);
+      holdLock(fe);
+      u = await bystander(fe, { HOME: path.join(fe.root, 'other-home') });
+      staleRecord(fe, u, g.port, 'none');
+      const p = crew(fe, ['stop', '--timeout', '3']);
+      await new Promise((res) => setTimeout(res, 500));
+      releaseName(fe); // KiroCrew can name the holder now
+      const r = await p;
+      assert.equal(u.terms(), 0, `crew stop sent SIGTERM to pid ${u.pid}`);
+      assert.equal(stillRuns(g.pid, g.start), false, 'the named gateway was stopped');
+      assert.deepEqual({ code: r.code, stderr: r.stderr, stdout: r.stdout }, { code: 0, stderr: '', stdout: `Stopped (pid ${g.pid}); 0 orphan agent process(es) reaped\n` });
+    } finally {
+      u?.stop();
+      fe.cleanup();
+    }
+  });
+
+  for (const rec of ['as crew start wrote it', 'of an older kiro-claude (no identity)'] as const) {
+    it(`stop, held: a record ${rec} that still names the gateway → its pid gets the SIGTERM/SIGKILL fallback`, { skip: linux }, async () => {
+      const fe = await setUp({ FAKE_STOP_IGNORE: '1', FAKE_GATEWAY_MODE: 'ignore-term' });
+      try {
+        const g = await startGateway(fe);
+        holdLock(fe);
+        if (rec !== 'as crew start wrote it') {
+          const j = JSON.parse(fs.readFileSync(readyFile(fe), 'utf8')) as Record<string, unknown>;
+          delete j.kiroClaude;
+          fs.writeFileSync(readyFile(fe), JSON.stringify(j), { mode: 0o600 });
+        }
+        const r = await crew(fe, ['stop', '--timeout', '1']);
+        assert.deepEqual({ code: r.code, stderr: r.stderr, stdout: r.stdout }, { code: 0, stderr: '', stdout: `Stopped (pid ${g.pid}); 0 orphan agent process(es) reaped\n` });
+        assert.equal(defaultSys.isAlive(g.pid), false);
+      } finally {
+        fe.cleanup();
+      }
+    });
+  }
+
+  it('status, held: a stale record → the pid is not reported and its port is not used (crew.json\'s is)', { skip: linux }, async () => {
+    const fe = await setUp();
+    let u: Awaited<ReturnType<typeof bystander>> | undefined;
+    try {
+      const g = await startGateway(fe);
+      const stateFile = path.join(fe.cs, 'crew.json');
+      writeState(stateFile, { ...readState(stateFile)!, port: g.port });
+      holdLock(fe);
+      u = await bystander(fe, { HOME: path.join(fe.root, 'other-home') });
+      staleRecord(fe, u, 1, 'none');
+      let r = await crew(fe, ['status', '--json']);
+      const j = JSON.parse(r.stdout) as { running: boolean; ready: boolean; holder: string; pid?: number; port: number; reason?: string };
+      assert.deepEqual({ running: j.running, holder: j.holder, pid: j.pid, port: j.port }, { running: true, holder: 'held', pid: undefined, port: g.port }, `pid ${u.pid} of a stale run/ready.json reported as the gateway`);
+      assert.equal(j.ready, true, j.reason);
+      assert.equal(r.code, 0);
+      r = await crew(fe, ['status']);
+      assert.match(r.stdout, new RegExp(`^Kiro Crew gateway: running \\(pid unknown, port ${g.port}\\)\\n`));
+      // the record crew start writes is believed again: its pid is reported
+      releaseName(fe);
+      fs.rmSync(readyFile(fe));
+      assert.equal((await crew(fe, ['stop'])).code, 0);
+      const g2 = await startGateway(fe, g.port);
+      holdLock(fe);
+      r = await crew(fe, ['status', '--json']);
+      assert.deepEqual((({ holder, pid, port }) => ({ holder, pid, port }))(JSON.parse(r.stdout) as { holder: string; pid?: number; port: number }), { holder: 'held', pid: g2.pid, port: g.port });
+      releaseName(fe);
+    } finally {
+      u?.stop();
+      fe.cleanup();
+    }
+  });
+
+  it('status, held: a record this process cannot check (no /proc) → pid unknown, its port still used', async () => {
+    const fe = await setUp();
+    try {
+      const g = await startGateway(fe);
+      holdLock(fe);
+      const blind = { ...defaultSys, startTime: () => undefined, listProcesses: () => [], bootId: () => undefined } as CrewSys;
+      const r = await crew(fe, ['status', '--json'], { deps: { sys: blind } });
+      const j = JSON.parse(r.stdout) as { holder: string; pid?: number; port: number; ready: boolean };
+      assert.deepEqual({ holder: j.holder, pid: j.pid, port: j.port, ready: j.ready }, { holder: 'held', pid: undefined, port: g.port, ready: true });
+      releaseName(fe);
+    } finally {
+      fe.cleanup();
+    }
+  });
+
+  it('status / open / doctor: a record naming another pid than the holder gateway-pid names → its port is not used (crew.json\'s is)', { skip: linux }, async () => {
+    const fe = await setUp();
+    let u: Awaited<ReturnType<typeof bystander>> | undefined;
+    try {
+      const g = await startGateway(fe);
+      const stateFile = path.join(fe.cs, 'crew.json');
+      writeState(stateFile, { ...readState(stateFile)!, port: g.port });
+      u = await bystander(fe, { HOME: path.join(fe.root, 'other-home') });
+      staleRecord(fe, u, 1, 'none');
+      let r = await crew(fe, ['status', '--json']);
+      const j = JSON.parse(r.stdout) as { holder: string; pid?: number; port: number; ready: boolean; reason?: string };
+      assert.deepEqual({ holder: j.holder, pid: j.pid, port: j.port }, { holder: 'process', pid: g.pid, port: g.port });
+      assert.equal(j.ready, true, j.reason);
+      r = await crew(fe, ['open', '--print']);
+      assert.equal(r.code, 0, r.stderr);
+      assert.match(r.stdout, new RegExp(`^http://localhost:${g.port}\\?token=`));
+      const d = JSON.parse((await crew(fe, ['doctor', '--json'])).stdout) as { rows: Array<{ id: string; status: string; detail: string }> };
+      const d11 = d.rows.find((x) => x.id === 'D11')!;
+      assert.equal(d11.status, 'ok', d11.detail);
+      assert.equal(u.terms(), 0);
+      assert.equal((await crew(fe, ['stop'])).code, 0);
+      assert.equal(stillRuns(u.pid, u.start), true);
+    } finally {
+      u?.stop();
       fe.cleanup();
     }
   });

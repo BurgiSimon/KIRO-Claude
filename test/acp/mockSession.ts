@@ -425,6 +425,9 @@ export class MockSession extends EventEmitter implements KiroSession {
   async enterTangent(): Promise<void> {}
   async exitTangent(): Promise<void> {}
   async rewind(): Promise<void> {}
+  forkSource(): { from: string; at?: string } | undefined {
+    return this.claudeSessionId ? { from: this.claudeSessionId } : undefined;
+  }
 
   toolListing(): ToolListingEntry[] {
     if (this.world.toolListing) return this.world.toolListing;

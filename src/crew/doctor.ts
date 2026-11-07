@@ -25,8 +25,8 @@ import * as path from 'node:path';
 import { kiroHome } from '../util/paths.js';
 import { backendInstalled, backendRow, prerequisiteProblems, summarizePrerequisite } from './api.js';
 import { atLeast, buildKiroCrew, builtState, detectBuildNode, detectGit, detectPython, fallbackNodeOf, findNpm, installMembersAdapter, membersAdapterInstalled, membersAdapterVersion } from './build.js';
-import { kirocrewFor, readReady, type CrewCtx } from './context.js';
-import { gatewayApiClient } from './gateway.js';
+import { kirocrewFor, type CrewCtx } from './context.js';
+import { gatewayApiClient, gatewayRecord } from './gateway.js';
 import { isRelocatedXdgDataHome, probeEnv } from './env.js';
 import { gitHead } from './fetch.js';
 import { createIdentityStub, inspectIdentityStore } from './identity.js';
@@ -607,7 +607,7 @@ export async function runDoctor(c: CrewCtx, o: DoctorOptions = {}): Promise<Doct
     else if (!running) row.detail = 'not running';
     else if (kc && state) {
       try {
-        const port = readReady(c.paths)?.port ?? state.port;
+        const { port } = gatewayRecord(c, state, holder);
         const client = await gatewayApiClient(c, kc, port);
         const pre = summarizePrerequisite((await client.get('/api/kiro-prerequisite')).json);
         const be = (await client.get('/api/acp-backends')).json;

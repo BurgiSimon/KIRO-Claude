@@ -1004,7 +1004,7 @@ for (const viaSpec of [false, true]) {
     // to a new conversation and restores ITS OWN record's journal, which is empty: the session
     // group's kiroSession create(opts.fork) copies no journal from the fork's parent (enterTangent
     // does). Then finish('keep') closes main, whose saved history was never sent.
-    { timeout: 60_000, ...(viaSpec ? { todo: 'session group: a create({fork}) whose source has no transcript restores no history (copy the parent journal, like enterTangent)' } : {}) },
+    { timeout: 60_000 },
     async () => {
       const script = {
         turns: [
@@ -1086,3 +1086,432 @@ test('e2e: a double Ctrl+C while the /spec new requirements session starts cance
     r.t.cleanup();
   }
 });
+
+// ───── P3 (spec): /spec new straight after a flow uses the conversation it carries ─────
+
+test('e2e: /spec new straight after another flow (its continuation has no message yet) asks to use the conversation so far, which it carries (P3)', { timeout: 60_000 }, async () => {
+  const r = live(HISTORY_SCRIPT({ text: 'DRAFTED history=[{{historyUserTexts}}] END' }), { isolate: true });
+  try {
+    await r.waitFor(/> $/);
+    r.line('remember CODEWORD-PELICAN');
+    await r.waitFor(/ANSWER history=\[remember CODEWORD-PELICAN\] END[\s\S]*> $/);
+    let mark = r.o().length;
+    r.line('/spec new first-spec --type feature --workflow requirements-first a csv export');
+    await r.waitFor(/Stop here \(resume later with \/spec first-spec\)[\s\S]*$/, 20_000, mark);
+    r.line('2');
+    await r.waitFor(/Stopped at the requirements\.md checkpoint[\s\S]*> $/, 20_000, mark);
+    // at once: the continuation the first flow handed over has not got a message yet
+    mark = r.o().length;
+    r.line('/spec new second-spec --type feature --workflow requirements-first a tsv export');
+    await r.waitFor(/Stop here \(resume later with \/spec second-spec\)[\s\S]*$/, 20_000, mark);
+    const drafts = sentLines(r).filter((u) => u.includes('Phase: REQUIREMENTS'));
+    assert.equal(drafts.length, 2, JSON.stringify(drafts));
+    assert.ok(drafts[0]!.includes('Use the conversation so far as input.'), `control: main had a turn:\n${drafts[0]}`);
+    assert.ok(drafts[1]!.includes('Use the conversation so far as input.'), `the second flow does not use the carried conversation:\n${drafts[1]}`);
+    // and the conversation is carried indeed: the second drafting turn ran in main's conversation
+    assert.match(r.o().slice(mark), /DRAFTED history=\[remember CODEWORD-PELICAN \| [\s\S]*a tsv export[\s\S]*?\] END/);
+    r.line('2');
+    await r.waitFor(/Stopped at the requirements\.md checkpoint[\s\S]*> $/, 20_000, mark);
+    r.line('/quit');
+    assert.equal(await r.exit, 0);
+  } finally {
+    r.end();
+    await r.exit.catch(() => undefined);
+    r.t.cleanup();
+  }
+});
+
+test('e2e: /spec new as the first line of a chat does not ask to use the conversation (P3 control)', { timeout: 60_000 }, async () => {
+  const r = live(HISTORY_SCRIPT(), { isolate: true });
+  try {
+    await r.waitFor(/> $/);
+    const mark = r.o().length;
+    r.line('/spec new first-spec --type feature --workflow requirements-first a csv export');
+    await r.waitFor(/Stop here \(resume later with \/spec first-spec\)[\s\S]*$/, 20_000, mark);
+    const drafts = sentLines(r).filter((u) => u.includes('Phase: REQUIREMENTS'));
+    assert.equal(drafts.length, 1, JSON.stringify(drafts));
+    assert.ok(!drafts[0]!.includes('Use the conversation so far'), drafts[0]);
+    r.line('2');
+    await r.waitFor(/Stopped at the requirements\.md checkpoint[\s\S]*> $/, 20_000, mark);
+    r.line('/quit');
+    assert.equal(await r.exit, 0);
+  } finally {
+    r.end();
+    await r.exit.catch(() => undefined);
+    r.t.cleanup();
+  }
+});
+
+// ───── Ctrl+C during /chat save-via-script and load-via-script (R1) ─────
+
+const VIA_SCRIPT_CASES: { cmd: 'save' | 'load'; tty: boolean; presses: number }[] = [
+  { cmd: 'save', tty: false, presses: 1 },
+  { cmd: 'save', tty: true, presses: 2 },
+  { cmd: 'load', tty: false, presses: 2 },
+  { cmd: 'load', tty: true, presses: 1 },
+];
+
+for (const vc of VIA_SCRIPT_CASES) {
+  const label = `${vc.tty ? 'terminal' : 'line'} mode, ${vc.presses} press${vc.presses > 1 ? 'es' : ''}`;
+  test(`e2e: Ctrl+C during /chat ${vc.cmd}-via-script kills the script (SIGTERM ignored) and gives the prompt back; it reports neither success nor failure, ${vc.cmd === 'load' ? 'loads nothing of what the script printed, ' : ''}and Claude Code is neither stopped nor restarted (R1, ${label})`, { timeout: 60_000 }, async () => {
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-viascript-')));
+    const pidFile = path.join(dir, 'script.pid');
+    const marker = path.join(dir, 'script.done');
+    const exportFile = path.join(dir, 'export.json');
+    const r = live(MAIN_AND_TASKS, { isolate: true, tty: vc.tty });
+    let pid: number | undefined;
+    try {
+      await r.waitFor(/> $/);
+      r.line('first main');
+      await r.waitFor(/MAIN-ANSWER to first main[\s\S]*> $/);
+      let mark = r.o().length;
+      if (vc.cmd === 'load') {
+        // a complete export the script prints before it hangs: a cancelled run must not load it
+        r.line(`/chat save ${exportFile}`);
+        await r.waitFor(/Exported conversation state to[\s\S]*> $/, 10_000, mark);
+        mark = r.o().length;
+      }
+      // the script ignores SIGTERM/SIGINT/SIGHUP: only SIGKILL of its process group ends it
+      const body = vc.cmd === 'save' ? 'cat > /dev/null; sleep 30' : `cat '${exportFile}'; sleep 30`;
+      r.line(`/chat ${vc.cmd}-via-script trap '' TERM INT HUP; echo $$ > '${pidFile}'; ${body}; touch '${marker}'`);
+      const t0 = Date.now();
+      while (!(fs.existsSync(pidFile) && /^\d+$/.test(fs.readFileSync(pidFile, 'utf8').trim()))) {
+        if (Date.now() - t0 > 10_000) throw new Error(`the script never started\n${r.o()}`);
+        await sleepMs(25);
+      }
+      pid = Number(fs.readFileSync(pidFile, 'utf8').trim());
+      await sleepMs(200); // the load script has printed its export
+      const pressedAt = Date.now();
+      r.ctrlC();
+      if (vc.presses === 2) {
+        await sleepMs(150);
+        r.ctrlC();
+      }
+      const what = vc.cmd === 'save' ? 'Export' : 'Import';
+      await r.waitFor(new RegExp(`${what} via [\\s\\S]*? was cancelled\\.\\n\\n[\\s\\S]*> $`), 5000, mark);
+      assert.ok(Date.now() - pressedAt < 4000, `the prompt came back ${Date.now() - pressedAt} ms after the press`);
+      const t1 = Date.now();
+      while (pidAlive(pid) && Date.now() - t1 < 2000) await sleepMs(25);
+      assert.ok(!pidAlive(pid), `script process ${pid} still runs after the prompt came back`);
+      assert.ok(!fs.existsSync(marker), 'the script ran to completion');
+      await sleepMs(1500); // past the forced-stop grace
+      const after = r.o().slice(mark);
+      assert.ok(!/✔ (Exported|Imported) conversation state via|Failed to (export|import) via/.test(after), after);
+      assert.ok(!/did not stop|Failed to execute command/.test(after), `the idle session was stopped or the command abandoned:\n${after}`);
+      assert.equal(r.ended(), undefined, `the REPL quit:\n${after}`);
+      const m2 = r.o().length;
+      r.line('main again');
+      await r.waitFor(/MAIN-ANSWER to main again[\s\S]*> $/, 15_000, m2);
+      // one Claude Code child all along: not restarted, and no imported session was started
+      assert.equal(r.log().filter((e) => e.event === 'start' && (e.argv as string[]).includes('--input-format')).length, 1, 'Claude Code was restarted or the export was imported');
+      assert.equal(interruptRequests(r.log()), 0, 'the idle Claude Code got an interrupt');
+      r.line('/quit');
+      assert.equal(await r.exit, 0);
+    } finally {
+      if (pid !== undefined && pidAlive(pid)) {
+        try {
+          process.kill(-pid, 'SIGKILL');
+        } catch {
+          /* gone */
+        }
+      }
+      r.end();
+      await r.exit.catch(() => undefined);
+      r.t.cleanup();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+// ───── spec verifier (P1/P3): the stock fake refuses a fork at a lost message; /clear after a flow ─────
+
+test('e2e: /spec new right after /rewind 1 in a chat that fell back to a fresh Claude session (turn 1\'s uuid named the lost transcript) drafts over turn 1 only; the rewound turns never come back (P1, stock fake)', { timeout: 90_000 }, async () => {
+  const script = {
+    turns: [
+      { repeat: true, match: 'Phase: REQUIREMENTS', steps: [{ text: 'DRAFTED history=[{{historyUserTexts}}] END' }] },
+      { repeat: true, steps: [{ text: 'ANSWER history=[{{historyUserTexts}}] END' }] },
+    ],
+  };
+  const t = tempEnv();
+  try {
+    let r = liveIn(t, script);
+    await r.waitFor(/> $/);
+    r.line('first ALPHA_1');
+    await r.waitFor(/ANSWER history=\[first ALPHA_1\] END[\s\S]*> $/);
+    let mark = r.o().length;
+    r.line('second BETA_2');
+    await r.waitFor(/ANSWER history=\[[^\]]*BETA_2\] END[\s\S]*> $/, 20_000, mark);
+    r.line('/quit');
+    assert.equal(await r.exit, 0);
+    const sdir = t.env.KIRO_CLAUDE_SESSIONS_DIR!;
+    const rec = fs
+      .readdirSync(sdir)
+      .filter((f) => f.endsWith('.json'))
+      .map((f) => JSON.parse(fs.readFileSync(path.join(sdir, f), 'utf8')) as { sessionId: string; turns?: unknown[] })
+      .find((x) => (x.turns?.length ?? 0) === 2)!;
+    // the Claude transcript is gone: the resume falls back to a fresh Claude session (G2)
+    const pdir = path.join(t.env.CLAUDE_CONFIG_DIR!, 'projects');
+    for (const d of fs.readdirSync(pdir)) fs.rmSync(path.join(pdir, d), { recursive: true, force: true });
+    r = liveIn(t, script, { resume: { sessionId: rec.sessionId } });
+    try {
+      await r.waitFor(/> $/);
+      mark = r.o().length;
+      r.line('third GAMMA_3');
+      await r.waitFor(/ANSWER history=\[[\s\S]*?GAMMA_3[\s\S]*?\] END[\s\S]*> $/, 20_000, mark);
+      mark = r.o().length;
+      r.line('/rewind 1');
+      await r.waitFor(/> $/, 20_000, mark);
+      mark = r.o().length;
+      r.line('/spec new my-feature --type feature --workflow requirements-first a csv export');
+      await r.waitFor(/Stop here \(resume later with \/spec my-feature\)/, 20_000, mark);
+      // (greedy: the restored history quotes earlier answers, `… END` included)
+      const drafted = /DRAFTED history=\[([\s\S]*)\] END/.exec(r.o().slice(mark))?.[1] ?? '';
+      assert.match(drafted, /ALPHA_1/, `the drafting turn lost turn 1:\n${r.o().slice(mark)}`);
+      assert.doesNotMatch(drafted, /BETA_2|GAMMA_3/, `the rewound turns came back in the drafting turn:\n${drafted}`);
+      // (its last user text is the drafting line itself)
+      assert.match(drafted, /Use the conversation so far as input\.\s*User description \(ground truth\): a csv export/, `the rewound chat has history:\n${drafted}`);
+      r.line('Stop');
+      await r.waitFor(/Stopped at the requirements\.md checkpoint[\s\S]*> $/, 20_000, mark);
+      mark = r.o().length;
+      r.line('which code word?');
+      await r.waitFor(/ANSWER history=\[[\s\S]*?\] END[\s\S]*> $/, 20_000, mark);
+      const h = /ANSWER history=\[([\s\S]*)\] END/.exec(r.o().slice(mark))![1]!;
+      assert.match(h, /ALPHA_1/, `the chat lost turn 1:\n${h.slice(0, 600)}`);
+      assert.match(h, /Phase: REQUIREMENTS/, `the chat lost the drafting turn:\n${h.slice(0, 600)}`);
+      assert.doesNotMatch(h, /BETA_2|GAMMA_3/, `the rewound turns came back:\n${h.slice(0, 600)}`);
+      r.line('/quit');
+      assert.equal(await r.exit, 0);
+    } finally {
+      r.end();
+      await r.exit.catch(() => undefined);
+    }
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('e2e: /spec new after /clear in the continuation a flow handed over does not ask to use the (cleared) conversation (P3)', { timeout: 60_000 }, async () => {
+  const r = live(HISTORY_SCRIPT({ text: 'DRAFTED history=[{{historyUserTexts}}] END' }), { isolate: true });
+  try {
+    await r.waitFor(/> $/);
+    r.line('remember CODEWORD-PELICAN');
+    await r.waitFor(/ANSWER history=\[remember CODEWORD-PELICAN\] END[\s\S]*> $/);
+    let mark = r.o().length;
+    r.line('/spec new first-spec --type feature --workflow requirements-first a csv export');
+    await r.waitFor(/Stop here \(resume later with \/spec first-spec\)[\s\S]*$/, 20_000, mark);
+    r.line('2');
+    await r.waitFor(/Stopped at the requirements\.md checkpoint[\s\S]*> $/, 20_000, mark);
+    mark = r.o().length;
+    r.line('/clear');
+    await r.waitFor(/\[y\/n\]:/, 20_000, mark);
+    r.line('y');
+    await r.waitFor(/> $/, 20_000, mark);
+    mark = r.o().length;
+    r.line('/spec new second-spec --type feature --workflow requirements-first a tsv export');
+    await r.waitFor(/Stop here \(resume later with \/spec second-spec\)[\s\S]*$/, 20_000, mark);
+    const drafted = /DRAFTED history=\[([\s\S]*)\] END/.exec(r.o().slice(mark))?.[1] ?? '';
+    assert.match(drafted, /a tsv export/, r.o().slice(mark));
+    assert.doesNotMatch(drafted, /CODEWORD-PELICAN|a csv export/, `the cleared conversation came back:\n${drafted}`);
+    const drafts = sentLines(r).filter((u) => u.includes('Phase: REQUIREMENTS'));
+    assert.equal(drafts.length, 2, JSON.stringify(drafts));
+    assert.ok(!drafts[1]!.includes('Use the conversation so far'), `asked to use the cleared conversation:\n${drafts[1]}`);
+    r.line('2');
+    await r.waitFor(/Stopped at the requirements\.md checkpoint[\s\S]*> $/, 20_000, mark);
+    r.line('/quit');
+    assert.equal(await r.exit, 0);
+  } finally {
+    r.end();
+    await r.exit.catch(() => undefined);
+    r.t.cleanup();
+  }
+});
+
+test('e2e: /spec new after /clear in a chat that had turns does not ask to use the (cleared) conversation (P3)', { timeout: 60_000 }, async () => {
+  const r = live(HISTORY_SCRIPT({ text: 'DRAFTED history=[{{historyUserTexts}}] END' }), { isolate: true });
+  try {
+    await r.waitFor(/> $/);
+    r.line('remember CODEWORD-PELICAN');
+    await r.waitFor(/ANSWER history=\[remember CODEWORD-PELICAN\] END[\s\S]*> $/);
+    let mark = r.o().length;
+    r.line('/clear');
+    await r.waitFor(/\[y\/n\]:/, 20_000, mark);
+    r.line('y');
+    await r.waitFor(/> $/, 20_000, mark);
+    mark = r.o().length;
+    r.line('/spec new my-feature --type feature --workflow requirements-first a csv export');
+    await r.waitFor(/Stop here \(resume later with \/spec my-feature\)[\s\S]*$/, 20_000, mark);
+    const drafted = /DRAFTED history=\[([\s\S]*)\] END/.exec(r.o().slice(mark))?.[1] ?? '';
+    assert.match(drafted, /a csv export/, r.o().slice(mark));
+    assert.doesNotMatch(drafted, /CODEWORD-PELICAN/, `precondition: the conversation was cleared:\n${drafted}`);
+    const drafts = sentLines(r).filter((u) => u.includes('Phase: REQUIREMENTS'));
+    assert.equal(drafts.length, 1, JSON.stringify(drafts));
+    assert.ok(!drafts[0]!.includes('Use the conversation so far'), `asked to use the cleared conversation:\n${drafts[0]}`);
+    r.line('2');
+    await r.waitFor(/Stopped at the requirements\.md checkpoint[\s\S]*> $/, 20_000, mark);
+    r.line('/quit');
+    assert.equal(await r.exit, 0);
+  } finally {
+    r.end();
+    await r.exit.catch(() => undefined);
+    r.t.cleanup();
+  }
+});
+
+// ───── repl verifier (R1/R2): a script command at an approval prompt; agentSpawn hooks of idle commands ─────
+
+for (const tty of [false, true]) {
+  test(`e2e: Ctrl+C during /chat save-via-script typed at an approval prompt kills the script and cancels the turn without asking the dead question again (R1, ${tty ? 'terminal' : 'line'} mode)`, { timeout: 60_000 }, async () => {
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-viaappr-')));
+    const pidFile = path.join(dir, 'script.pid');
+    const marker = path.join(dir, 'script.done');
+    // a child in a session of its own keeps the script's stdout open after its group is killed, so
+    // the command ends only after runShell's pipe grace: well after the interrupted turn ended
+    const holderJs = path.join(dir, 'holder.cjs');
+    const holderPidFile = path.join(dir, 'holder.pid');
+    fs.writeFileSync(holderJs, "const h = require('child_process').spawn('sleep', ['30'], { detached: true, stdio: ['ignore', 'inherit', 'inherit'] }); require('fs').writeFileSync(process.argv[2], String(h.pid)); h.unref();\n");
+    const script = {
+      turns: [
+        { match: '^make', steps: [{ tool: { name: 'Bash', input: { command: 'touch made.txt' } } }, { text: 'TOOL-SAID {{lastToolResult}}' }] },
+        { repeat: true, match: 'main', steps: [{ text: 'MAIN-ANSWER to {{userText}}' }] },
+      ],
+    };
+    const r = live(script, { isolate: true, tty });
+    let pid: number | undefined;
+    let holder: number | undefined;
+    try {
+      await r.waitFor(/> $/);
+      r.line('make a file');
+      await r.waitFor(/\[y\/n\/t\]:[\s\S]*> $/);
+      const mark = r.o().length;
+      r.line(`/chat save-via-script trap '' TERM INT HUP; echo $$ > '${pidFile}'; '${process.execPath}' '${holderJs}' '${holderPidFile}'; cat > /dev/null; sleep 30; touch '${marker}'`);
+      const t0 = Date.now();
+      const started = (f: string): boolean => fs.existsSync(f) && /^\d+$/.test(fs.readFileSync(f, 'utf8').trim());
+      while (!(started(pidFile) && started(holderPidFile))) {
+        if (Date.now() - t0 > 10_000) throw new Error(`the script never started\n${r.o()}`);
+        await sleepMs(25);
+      }
+      pid = Number(fs.readFileSync(pidFile, 'utf8').trim());
+      holder = Number(fs.readFileSync(holderPidFile, 'utf8').trim());
+      const pressedAt = Date.now();
+      r.ctrlC();
+      await r.waitFor(/Export via [\s\S]*? was cancelled\.\n\n[\s\S]*> $/, 5000, mark);
+      assert.ok(Date.now() - pressedAt < 4000, `the prompt came back ${Date.now() - pressedAt} ms after the press`);
+      const t1 = Date.now();
+      while (pidAlive(pid) && Date.now() - t1 < 2000) await sleepMs(25);
+      assert.ok(!pidAlive(pid), `script process ${pid} still runs`);
+      assert.ok(!fs.existsSync(marker), 'the script ran to completion');
+      await sleepMs(300);
+      const after = r.o().slice(mark);
+      const cancelledAt = after.indexOf('was cancelled.');
+      // the press interrupted the turn too: its approval is gone, so the question is not asked again
+      assert.ok(!after.slice(cancelledAt).includes('Allow this action?'), `the dead approval question was asked again:\n${after}`);
+      // and the turn ended under the command: the prompt waits for it (nothing printed after it)
+      assert.ok(!/\n> /.test(after.slice(0, cancelledAt)), `the prompt came back while the command still ran:\n${after}`);
+      assert.ok(!/✔ Exported conversation state via|Failed to export via/.test(after), after);
+      assert.equal(r.ended(), undefined, `the REPL quit:\n${after}`);
+      const m2 = r.o().length;
+      r.line('main again');
+      await r.waitFor(/MAIN-ANSWER to main again[\s\S]*> $/, 15_000, m2);
+      assert.ok(!fs.existsSync(path.join(r.t.wsDir, 'made.txt')), 'the tool ran');
+      r.line('/quit');
+      assert.equal(await r.exit, 0);
+    } finally {
+      if (pid !== undefined && pidAlive(pid)) {
+        try {
+          process.kill(-pid, 'SIGKILL');
+        } catch {
+          /* gone */
+        }
+      }
+      if (holder !== undefined && pidAlive(holder)) {
+        try {
+          process.kill(holder, 'SIGKILL');
+        } catch {
+          /* gone */
+        }
+      }
+      r.end();
+      await r.exit.catch(() => undefined);
+      r.t.cleanup();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+// /clear, /agent swap and a new session's start run the agentSpawn hooks again: commands of
+// kiro-claude's own, while the session is idle (so Ctrl+C neither interrupts nor stops anything).
+const SPAWN_HOOK_CASES: { cmd: string; answer?: string }[] = [{ cmd: '/clear', answer: 'y' }, { cmd: '/agent swap other' }, { cmd: '/chat new' }];
+
+for (const sc of SPAWN_HOOK_CASES) {
+  test(
+    `e2e: Ctrl+C while ${sc.cmd} re-runs a slow agentSpawn hook kills the hook and gives the prompt back, without stopping Claude Code (R2)`,
+    {
+      timeout: 60_000,
+      todo: 'session group: KiroSessionImpl.runSessionStartHooks (start / restart({sessionStart}) / clear) passes no signal to HookRunner.runSessionStart and interrupt() does not reach it, so Ctrl+C is swallowed until the hook ends (its timeout: V2 30 s, V3 60 s, 0 = never); for /chat new|resume|load the REPL must also interrupt the session being started (chat.ts activate)',
+    },
+    async () => {
+      const kiroHome = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-spawnhook-')));
+      const once = path.join(kiroHome, 'hook.once');
+      const pidFile = path.join(kiroHome, 'hook.pid');
+      const marker = path.join(kiroHome, 'hook.done');
+      // fast at the REPL's own start; the second run (the command's) hangs, ignoring TERM/INT/HUP
+      const command = `trap '' TERM INT HUP; if [ -f '${once}' ]; then echo $$ > '${pidFile}'; sleep 30; touch '${marker}'; fi; touch '${once}'; echo SPAWN-CTX`;
+      fs.mkdirSync(path.join(kiroHome, 'hooks'), { recursive: true });
+      fs.writeFileSync(path.join(kiroHome, 'hooks', 'spawn.json'), JSON.stringify({ version: 'v1', hooks: [{ name: 'spawn', trigger: 'SessionStart', timeout: 60, action: { type: 'command', command } }] }));
+      fs.mkdirSync(path.join(kiroHome, 'agents'), { recursive: true });
+      fs.writeFileSync(path.join(kiroHome, 'agents', 'other.json'), JSON.stringify({ name: 'other', description: 'another agent' }));
+      const r = live(MAIN_AND_TASKS, { isolate: true, extraEnv: { KIRO_HOME: kiroHome } });
+      let pid: number | undefined;
+      try {
+        await r.waitFor(/> $/);
+        r.line('first main');
+        await r.waitFor(/MAIN-ANSWER to first main[\s\S]*> $/);
+        let mark = r.o().length;
+        r.line(sc.cmd);
+        if (sc.answer) {
+          await r.waitFor(/\[y\/n\]:[\s\S]*> $/, 10_000, mark);
+          r.line(sc.answer);
+        }
+        const t0 = Date.now();
+        while (!(fs.existsSync(pidFile) && /^\d+$/.test(fs.readFileSync(pidFile, 'utf8').trim()))) {
+          if (Date.now() - t0 > 10_000) throw new Error(`the hook never ran again\n${r.o()}`);
+          await sleepMs(25);
+        }
+        pid = Number(fs.readFileSync(pidFile, 'utf8').trim());
+        await sleepMs(200);
+        mark = r.o().length;
+        const pressedAt = Date.now();
+        r.ctrlC();
+        await r.waitFor(/> $/, 5000, mark).catch((e: Error) => {
+          throw new Error(`Ctrl+C did not end ${sc.cmd} while its agentSpawn hook ran: ${e.message}`);
+        });
+        assert.ok(Date.now() - pressedAt < 4000, `the prompt came back ${Date.now() - pressedAt} ms after the press`);
+        const t1 = Date.now();
+        while (pidAlive(pid) && Date.now() - t1 < 2000) await sleepMs(25);
+        assert.ok(!pidAlive(pid), `hook process ${pid} still runs after the prompt came back`);
+        assert.ok(!fs.existsSync(marker), 'the hook ran to completion');
+        await sleepMs(1500); // past the forced-stop grace
+        const after = r.o().slice(mark);
+        assert.ok(!/did not stop/.test(after), `Claude Code was force-stopped:\n${after}`);
+        assert.equal(r.ended(), undefined, `the REPL quit:\n${after}`);
+        const m2 = r.o().length;
+        r.line('main again');
+        await r.waitFor(/MAIN-ANSWER to main again[\s\S]*> $/, 15_000, m2);
+        r.line('/quit');
+        assert.equal(await r.exit, 0);
+      } finally {
+        if (pid !== undefined && pidAlive(pid)) {
+          try {
+            process.kill(-pid, 'SIGKILL');
+          } catch {
+            /* gone */
+          }
+        }
+        r.end();
+        await r.exit.catch(() => undefined);
+        r.t.cleanup();
+        fs.rmSync(kiroHome, { recursive: true, force: true });
+      }
+    },
+  );
+}

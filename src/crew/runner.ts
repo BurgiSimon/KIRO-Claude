@@ -95,6 +95,12 @@ export interface CrewSys {
   listProcesses(): ProcessInfo[];
   /** {@link ProcessInfo.startTime} of `pid`; undefined when it does not exist or is unknown (not Linux). */
   startTime(pid: number): number | undefined;
+  /**
+   * This boot's id (`/proc/sys/kernel/random/boot_id`), undefined when unknown (not Linux): a start
+   * time counts clock ticks since boot, so a pid and start time recorded before a reboot can name
+   * a process of a later boot.
+   */
+  bootId(): string | undefined;
   freeBytes(p: string): number | undefined;
   tmpdir(): string;
 }
@@ -357,6 +363,14 @@ export const defaultSys: CrewSys = {
     if (process.platform !== 'linux' || !Number.isInteger(pid) || pid <= 0) return undefined;
     const stat = readProcFile(pid, 'stat');
     return stat ? parseProcStat(stat.toString('utf8'))?.startTime : undefined;
+  },
+  bootId() {
+    if (process.platform !== 'linux') return undefined;
+    try {
+      return fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() || undefined;
+    } catch {
+      return undefined;
+    }
   },
   freeBytes: (p) => freeBytesAt(p),
   tmpdir: () => os.tmpdir(),

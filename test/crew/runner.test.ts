@@ -110,6 +110,16 @@ describe('gateway process tree (crew stop)', () => {
     assert.equal(defaultSys.startTime(2 ** 22 + 12345), undefined);
   });
 
+  it('sys.bootId is this boot\'s id (W1: a start time recorded before a reboot can name a later process)', () => {
+    if (process.platform !== 'linux') {
+      assert.equal(defaultSys.bootId(), undefined);
+      return;
+    }
+    const id = defaultSys.bootId();
+    assert.match(id ?? '', /^[0-9a-f-]{36}$/);
+    assert.equal(id, defaultSys.bootId());
+  });
+
   it('gatewayTree: descendants, the gateway group when it leads one, never this process or its ancestors', () => {
     const P = (pid: number, ppid: number, pgid: number) => ({ pid, ppid, pgid, argv: [`p${pid}`] });
     const procs = [

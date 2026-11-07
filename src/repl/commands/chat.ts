@@ -9,7 +9,11 @@
  *  - `load`: tries `<path>` then `<path>.json` (Classic); the imported session replaces the
  *    current one; `✔ Imported conversation state from <path>` / `Failed to import from …`.
  *  - `*-via-script`: the script gets the export JSON on stdin / prints it on stdout and must
- *    exit 0 (util/process.runShell).
+ *    exit 0 (util/process.runShell). It runs in a process group of its own (C12), which the
+ *    terminal's SIGINT never reaches, while the session is idle (so the forced stop never ends
+ *    the command, F0): Ctrl+C reaches it only through the command signal, which kills it. A
+ *    cancelled run prints `Export via <script> was cancelled.` / `Import via <script> was
+ *    cancelled.`, neither success nor failure, and loads nothing of what it printed (R1).
  *  - `new` / `resume` create a fresh / resumed KiroSession with the current agent, model and
  *    effort and close the old one.
  */
@@ -108,6 +112,11 @@ export async function loadFrom(r: ReplContext, args: string[]): Promise<void> {
   }
 }
 
+/** The command's Ctrl+C signal for runShell: it kills the script's process group (R1). */
+function signalOf(r: ReplContext): { signal?: AbortSignal } {
+  return r.commandSignal ? { signal: r.commandSignal } : {};
+}
+
 async function saveViaScript(r: ReplContext, script: string | undefined): Promise<void> {
   if (!script) {
     r.write(`\n${c.red('Usage: /chat save-via-script <script>')}\n\n`);
@@ -118,7 +127,11 @@ async function saveViaScript(r: ReplContext, script: string | undefined): Promis
     const file = path.join(dir, 'session.json');
     await r.session.exportTo(file, true);
     const json = fs.readFileSync(file, 'utf8');
-    const res = await runShell(script, { cwd: r.ws.cwd, env: r.ws.env, stdin: json });
+    const res = await runShell(script, { cwd: r.ws.cwd, env: r.ws.env, stdin: json, ...signalOf(r) });
+    if (res.aborted) {
+      r.write(`\n${c.gray(`Export via ${script} was cancelled.`)}\n\n`);
+      return;
+    }
     if (res.exitCode !== 0) {
       const why = res.error ?? (res.stderr.trim() || `exit status ${res.exitCode ?? res.signal}`);
       r.write(`\n${c.red(`Failed to export via ${script}: ${why}`)}\n\n`);
@@ -137,7 +150,12 @@ async function loadViaScript(r: ReplContext, script: string | undefined): Promis
     r.write(`\n${c.red('Usage: /chat load-via-script <script>')}\n\n`);
     return;
   }
-  const res = await runShell(script, { cwd: r.ws.cwd, env: r.ws.env, maxOutputBytes: 256 * 1024 * 1024 });
+  const res = await runShell(script, { cwd: r.ws.cwd, env: r.ws.env, maxOutputBytes: 256 * 1024 * 1024, ...signalOf(r) });
+  if (res.aborted) {
+    // whatever it printed before the Ctrl+C is not an export to load
+    r.write(`\n${c.gray(`Import via ${script} was cancelled.`)}\n\n`);
+    return;
+  }
   if (res.exitCode !== 0) {
     const why = res.error ?? (res.stderr.trim() || `exit status ${res.exitCode ?? res.signal}`);
     r.write(`\n${c.red(`Failed to import via ${script}: ${why}`)}\n\n`);

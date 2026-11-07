@@ -25,6 +25,7 @@ import { formatSpecList, formatSpecStatus, isValidSpecName, listSpecs, loadSpec,
 import {
   analyzeRequirements,
   approveSpec,
+  conversationHasHistory,
   createNewSpec,
   createReplRuntime,
   resumeSpec,
@@ -192,7 +193,9 @@ async function cmdNew(host: ReplHost, rt: SpecRuntime, args: string[]): Promise<
   const req: NewSpecRequest = { name, kind, description };
   if (workflow) req.workflowType = workflow;
   if (detail) req.detail = detail;
-  if (host.session.record.messageCount > 0) req.useConversation = true;
+  // the conversation the user continues: also a continuation a flow just handed over (no turn of
+  // its own yet, its conversation carried)
+  if (conversationHasHistory(host.session)) req.useConversation = true;
   remember(host, name);
   await createNewSpec(rt, req);
 }

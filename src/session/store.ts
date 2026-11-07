@@ -49,6 +49,13 @@ export function sessionsDir(ws: WorkspaceContext): string {
 }
 
 const SAFE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
+/** A Claude Code session / message id. */
+const CLAUDE_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** True for a Claude Code session / message id (a UUID): safe as a `--resume*` argv value. */
+export function isClaudeUuid(s: unknown): s is string {
+  return typeof s === 'string' && CLAUDE_UUID_RE.test(s);
+}
 
 /** True when `id` can be used as a file stem in the store (no separators, no `..`). */
 export function isSafeSessionId(id: string): boolean {
@@ -179,6 +186,12 @@ export function fromDiskJson(raw: unknown, id: string): SessionRecord | undefine
   if (byAgent) rec.trust.byAgent = byAgent;
   const pending = strArr(raw.pendingContext).filter((s) => s.trim() !== '');
   if (pending.length) rec.pendingContext = pending;
+  // ids that become `--resume` / `--resume-session-at` argv values: UUIDs only (a copied record
+  // file is not trusted to name a flag)
+  const pf = raw.pendingFork;
+  if (isObj(pf) && typeof pf.from === 'string' && CLAUDE_UUID_RE.test(pf.from) && (pf.at === undefined || (typeof pf.at === 'string' && CLAUDE_UUID_RE.test(pf.at)))) {
+    rec.pendingFork = { from: pf.from, ...(typeof pf.at === 'string' ? { at: pf.at } : {}) };
+  }
   const effort = typeof raw.effort === 'string' ? raw.effort : typeof kc.effort === 'string' ? kc.effort : undefined;
   if (effort !== undefined) rec.effort = effort;
   return rec;

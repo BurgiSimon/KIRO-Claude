@@ -17,11 +17,16 @@
  *   agent process(es) reaped`. The gateway and its tree are known by pid and start time from a
  *   snapshot taken while it still ran, so a process that reuses one of their pids (or the
  *   gateway's process group id) once they are gone is never signalled nor taken for the gateway.
+ *   The gateway's pid is the one `gateway-pid` names; for a `held` lock (KiroCrew cannot name its
+ *   holder) it is `ready.json`'s only while that file provably still names the gateway `crew start`
+ *   recorded there (same boot and start time; {@link gatewayRecord}). Otherwise nothing is
+ *   signalled: stop waits for the lock to be released, or for `gateway-pid` to name the holder.
  * - `--approval auto` is passed as KiroCrew's `yolo` (its choices are reads|yolo|interactive).
  * - Every command uses one gateway env (context.gatewayEnvFor): a `--kiro-bin` given to the
  *   start that launched the running gateway is used by exec/stop/status/doctor too.
  * - status: `gateway-pid` plus cookie-authenticated `/api/status`, `/api/kiro-prerequisite`,
- *   `/api/acp-backends`. Exit 0 running and ready, 3 stopped, 4 running but not ready.
+ *   `/api/acp-backends`. Exit 0 running and ready, 3 stopped, 4 running but not ready. The pid and
+ *   port shown come from `ready.json` only while it is the running gateway's (as for stop).
  * - open: `kirocrew token --port <p> --ttl <ttl>` → open with `xdg-open`/`open` unless `--print`;
  *   warns `This link signs you in; do not share it.`; not running: exit 3.
  * - logs: tail `$CS/run/gateway.err` and `$KIROCREW_HOME/gateway.log` (`--acp`: the newest
@@ -33,7 +38,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { backendInstalled, backendRow, GatewayAuthError, GatewayClient, prerequisiteProblems, summarizePrerequisite, type PrerequisiteSummary } from './api.js';
-import { kirocrewFor, loadState, readReady, readToken, type CrewCtx } from './context.js';
+import { gatewayEnvFor, kirocrewFor, loadState, READY_IDENTITY_KEY, readReady, readToken, type CrewCtx, type ReadyRecord } from './context.js';
 import { gatewayRunning, tokenFromUrl, type GatewayHolder, type KiroCrewCli } from './kirocrew.js';
 import { kirocrewHome, kirocrewLauncher } from './paths.js';
 import { lastLines, type ProcessInfo } from './runner.js';
@@ -158,6 +163,8 @@ export async function crewStart(c: CrewCtx, o: StartOptions): Promise<number> {
     c.err(`kiro-claude: cannot start the Kiro Crew gateway: ${(e as Error).message}`);
     return 1;
   }
+  // Read now, while the pid is surely our child's (the launcher execs the gateway in place).
+  const spawnStart = c.deps.sys.startTime(pid);
 
   const deadline = c.deps.sys.now() + c.deps.startTimeoutMs;
   let ready: Record<string, unknown> | undefined;
@@ -185,11 +192,16 @@ export async function crewStart(c: CrewCtx, o: StartOptions): Promise<number> {
     if (!exited) c.err(`It may still be starting (pid ${pid}); check with: kiro-claude crew status, or stop it with: kiro-claude crew stop`);
     return 1;
   }
-  writeFileAtomic(c.paths.readyFile, `${JSON.stringify(ready)}\n`, { mode: 0o600 });
+  const realPid = typeof ready.pid === 'number' ? ready.pid : pid;
+  // A pid outlives its process (this file can outlive the gateway: a crash, a reboot), so the
+  // record also says which process it was: crew stop/status act on its pid only while it is that one.
+  const startTime = realPid === pid ? spawnStart : c.deps.sys.startTime(realPid);
+  const bootId = startTime !== undefined ? c.deps.sys.bootId() : undefined;
+  const identity = { pid: realPid, ...(startTime !== undefined ? { startTime } : {}), ...(bootId ? { bootId } : {}) };
+  writeFileAtomic(c.paths.readyFile, `${JSON.stringify({ ...ready, pid: realPid, [READY_IDENTITY_KEY]: identity })}\n`, { mode: 0o600 });
   const token = typeof ready.token === 'string' ? ready.token : '';
   if (token) writeFileAtomic(c.paths.tokenFile, `${token}\n`, { mode: 0o600 });
   const realPort = typeof ready.port === 'number' ? ready.port : port;
-  const realPid = typeof ready.pid === 'number' ? ready.pid : pid;
   c.out(`Kiro Crew gateway running at http://localhost:${realPort} (pid ${realPid}). Open it with: kiro-claude crew open`);
   return 0;
 }
@@ -314,6 +326,105 @@ async function retireGatewayTree(c: CrewCtx, g: GatewaySnapshot): Promise<number
   return n;
 }
 
+/**
+ * The gateway as it is now: pid `pid`, its start time, group leadership, env and tree. With
+ * `expectStart` (the start time a record proved for `pid` a moment ago), a pid that names another
+ * process by now is not the gateway: the snapshot then has no tree and never reads as alive.
+ */
+function snapshotGateway(c: CrewCtx, pid: number, gwEnv: NodeJS.ProcessEnv, expectStart?: number): GatewaySnapshot {
+  const procs = c.deps.sys.listProcesses();
+  const gwProc = procs.find((p) => p.pid === pid);
+  const startTime = gwProc?.startTime ?? c.deps.sys.startTime(pid);
+  if (expectStart !== undefined && startTime !== expectStart) {
+    return { pid, startTime: expectStart, leader: false, home: c.home, kiroBin: gwEnv.KIROCREW_KIRO_BIN, tree: [] };
+  }
+  const leader = gwProc?.pgid === pid;
+  return {
+    pid,
+    startTime,
+    leader,
+    home: gwProc?.env?.HOME ?? c.home,
+    kiroBin: gwProc?.env ? gwProc.env.KIROCREW_KIRO_BIN : gwEnv.KIROCREW_KIRO_BIN,
+    tree: gatewayTree(procs, pid, c.deps.sys.pid, leader),
+  };
+}
+
+/** What `run/ready.json` tells about the running gateway ({@link gatewayRecord}). */
+export interface GatewayRecordView {
+  /**
+   * The gateway's pid: the holder `gateway-pid` names, else (a `held` lock) the record's pid when
+   * it provably still is that gateway. Undefined when nothing names it: never guessed.
+   */
+  pid?: number;
+  /** The recorded start time of that pid, when the record proved it. */
+  startTime?: number;
+  /** The record's port, unless the record is provably another (earlier) gateway's; else crew.json's. */
+  port: number;
+  /**
+   * `same`: the record is the running gateway's; `other`: provably not (its pid is gone, names
+   * another process now, or is not the holder `gateway-pid` names); `unknown`: this process cannot
+   * tell (no /proc, another user's process); `none`: there is no record.
+   */
+  verdict: 'same' | 'other' | 'unknown' | 'none';
+  record?: ReadyRecord;
+}
+
+/** argv of KiroCrew's gateway as `crew start` runs it (`… kirocrew gateway … --json-ready …`). */
+function isGatewayArgv(argv: readonly string[]): boolean {
+  return argv.includes('gateway') && argv.includes('--json-ready');
+}
+
+/**
+ * Whether `rec` (run/ready.json) still describes the running gateway. `named` is the holder pid
+ * `gateway-pid` gave, if any. A record with an identity (crew start writes one: pid, start time,
+ * boot) is that process only while the pid's boot and start time read back equal. A record without
+ * one (an older kiro-claude's, or no /proc at READY) is checked against the process itself: a live
+ * KiroCrew `gateway --json-ready` with the gateway env's HOME and KIROCREW_KIRO_BIN.
+ */
+function recordVerdict(c: CrewCtx, state: CrewState, rec: ReadyRecord, named: number | undefined): 'same' | 'other' | 'unknown' {
+  const pid = rec.pid;
+  if (pid === undefined) return 'unknown';
+  if (named !== undefined && pid !== named) return 'other';
+  if (!c.deps.sys.isAlive(pid)) return 'other';
+  if (rec.startTime !== undefined) {
+    if (rec.bootId !== undefined) {
+      const boot = c.deps.sys.bootId();
+      if (boot === undefined) return 'unknown';
+      if (boot !== rec.bootId) return 'other';
+    }
+    const st = c.deps.sys.startTime(pid);
+    if (st === undefined) return 'unknown';
+    return st === rec.startTime ? 'same' : 'other';
+  }
+  if (named !== undefined) return 'same'; // the holder KiroCrew names is the pid the record names
+  const p = c.deps.sys.listProcesses().find((x) => x.pid === pid);
+  if (!p) return 'unknown';
+  if (!isGatewayArgv(p.argv)) return 'other';
+  if (!p.env) return 'unknown';
+  const gw = gatewayEnvFor(c, state).env;
+  return p.env.HOME === (gw.HOME ?? c.home) && p.env.KIROCREW_KIRO_BIN === gw.KIROCREW_KIRO_BIN ? 'same' : 'other';
+}
+
+/**
+ * The running gateway's pid and port as `run/ready.json` and `gateway-pid` (`holder`) tell them.
+ * The file survives its gateway (a crash, a reboot, a gateway started some other way), and a pid
+ * is reused, so its pid is never taken on its own word: for a `held` lock it is used only when
+ * {@link recordVerdict} proves it, and the file's port is ignored once it is provably stale.
+ */
+export function gatewayRecord(c: CrewCtx, state: CrewState, holder: GatewayHolder): GatewayRecordView {
+  const record = readReady(c.paths);
+  const named = holder.holder === 'process' ? holder.pid : undefined;
+  const verdict = record ? recordVerdict(c, state, record, named) : 'none';
+  const proven = holder.holder === 'held' && verdict === 'same' ? record?.pid : undefined;
+  return {
+    pid: named ?? proven,
+    startTime: proven !== undefined ? record?.startTime : undefined,
+    port: verdict !== 'other' && record?.port !== undefined ? record.port : state.port,
+    verdict,
+    record,
+  };
+}
+
 async function waitGone(c: CrewCtx, alive: () => boolean, ms: number): Promise<boolean> {
   const deadline = c.deps.sys.now() + ms;
   while (alive()) {
@@ -383,55 +494,54 @@ export async function crewStop(c: CrewCtx, o: StopOptions = {}): Promise<number>
     c.out(reaped > 0 ? `Kiro Crew gateway is not running; ${reaped} orphan agent process(es) reaped` : 'Kiro Crew gateway is not running.');
     return 0;
   }
-  const pid = holder.holder === 'process' ? holder.pid : readReady(c.paths)?.pid;
+  // The pid `gateway-pid` names, else (a `held` lock) ready.json's only while it provably is still
+  // that gateway: a stale file's pid may be anyone's by now, and is never signalled.
+  const rec = gatewayRecord(c, state, holder);
+  let pid = rec.pid;
   // the gateway and its own children, seen while it still runs (they are re-parented once it exits)
-  let snap: GatewaySnapshot | undefined;
-  if (pid !== undefined) {
-    const procs = c.deps.sys.listProcesses();
-    const gwProc = procs.find((p) => p.pid === pid);
-    const leader = gwProc?.pgid === pid;
-    snap = {
-      pid,
-      startTime: gwProc?.startTime ?? c.deps.sys.startTime(pid),
-      leader,
-      home: gwProc?.env?.HOME ?? c.home,
-      kiroBin: gwProc?.env ? gwProc.env.KIROCREW_KIRO_BIN : gwEnv.env.KIROCREW_KIRO_BIN,
-      tree: gatewayTree(procs, pid, c.deps.sys.pid, leader),
-    };
-  }
+  let snap = pid !== undefined ? snapshotGateway(c, pid, gwEnv.env, rec.startTime) : undefined;
   const alive = (): boolean => snap !== undefined && gatewayAlive(c, snap);
   const stopRun = await kc.stop();
   if (stopRun.code !== 0 && c.cli.verbosity > 0) c.err(`kirocrew stop: ${(stopRun.stderr || stopRun.stdout).trim()}`);
-  const timeoutMs = (o.timeoutSec ?? 30) * 1000;
+  const deadline = c.deps.sys.now() + (o.timeoutSec ?? 30) * 1000;
   let gone = false;
-  if (pid !== undefined) {
-    gone = await waitGone(c, alive, timeoutMs);
-  } else {
-    const deadline = c.deps.sys.now() + timeoutMs;
+  if (!snap) {
+    // Nothing names the gateway's pid: signal nothing, and wait for the lock to be released, or for
+    // `gateway-pid` to name its holder (then that pid is watched, and signalled after the timeout).
     for (;;) {
       const h = await kc.gatewayPid();
       if (!gatewayRunning(h)) {
         gone = true;
         break;
       }
+      if (h.holder === 'process') {
+        pid = h.pid;
+        snap = snapshotGateway(c, pid, gwEnv.env);
+        break;
+      }
       if (c.deps.sys.now() >= deadline) break;
-      await c.deps.sys.sleep(1000);
+      await c.deps.sys.sleep(c.deps.pollMs);
     }
   }
-  if (!gone && pid !== undefined) {
-    c.deps.sys.kill(pid, 'SIGTERM');
+  if (snap && !gone) gone = await waitGone(c, alive, Math.max(0, deadline - c.deps.sys.now()));
+  if (!gone && snap) {
+    c.deps.sys.kill(snap.pid, 'SIGTERM');
     if (!(await waitGone(c, alive, c.deps.killGraceMs))) {
-      c.deps.sys.kill(pid, 'SIGKILL');
+      c.deps.sys.kill(snap.pid, 'SIGKILL');
       await waitGone(c, alive, 2000);
     }
   }
   // decided once: a process that takes the pid later (during the retire wait) is not the gateway
-  const exited = !alive();
+  const exited = snap ? !alive() : gone;
   const reaped = reapOrphans(c, state);
   if (snap && exited) await retireGatewayTree(c, snap);
   removeRunSecrets(c);
   if (!exited) {
-    c.err(`kiro-claude: the Kiro Crew gateway (pid ${pid}) did not exit.`);
+    if (snap) c.err(`kiro-claude: the Kiro Crew gateway (pid ${pid}) did not exit.`);
+    else {
+      const stale = rec.verdict === 'other' && rec.record?.pid !== undefined ? `; run/ready.json named pid ${rec.record.pid}, which is no longer that gateway` : '';
+      c.err(`kiro-claude: the Kiro Crew gateway did not exit. Nothing names its pid (kirocrew gateway-pid: ${holder.holder}${stale}), so nothing was signalled.`);
+    }
     return 1;
   }
   c.out(`Stopped (pid ${pid ?? 'unknown'}); ${reaped} orphan agent process(es) reaped`);
@@ -494,9 +604,9 @@ export async function gatherStatus(c: CrewCtx, state: CrewState, kc: KiroCrewCli
     report.reason = holder.holder === 'indeterminate' ? holder.reason : 'stopped';
     return report;
   }
-  const ready = readReady(c.paths);
-  report.pid = holder.holder === 'process' ? holder.pid : ready?.pid;
-  report.port = ready?.port ?? state.port;
+  const rec = gatewayRecord(c, state, holder);
+  report.pid = rec.pid;
+  report.port = rec.port;
   report.url = `http://localhost:${report.port}`;
   try {
     const client = await gatewayApiClient(c, kc, report.port);
@@ -572,7 +682,7 @@ export async function crewOpen(c: CrewCtx, o: { print?: boolean; ttl?: string } 
     c.err('Kiro Crew gateway is not running. Start it with: kiro-claude crew start');
     return 3;
   }
-  const port = readReady(c.paths)?.port ?? state.port;
+  const { port } = gatewayRecord(c, state, holder);
   const { url, result } = await kc.token(port, o.ttl ?? '1h');
   if (!url) {
     c.err(`kiro-claude: kirocrew token failed: ${(result.stderr || result.stdout).trim() || `exit ${result.code}`}`);

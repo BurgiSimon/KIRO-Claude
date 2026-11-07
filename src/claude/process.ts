@@ -799,7 +799,11 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
     return this.closePromise;
   }
 
-  /** Signals the child's process group (POSIX) — tool commands and MCP servers it started too. */
+  /**
+   * Signals the child's process group (POSIX) — tool commands and MCP servers it started too.
+   * May run after the child exited while its pipes drain; signalChild then signals the group
+   * only while it is provably still ours (lifecycle.ts L1).
+   */
   private kill(signal: NodeJS.Signals): void {
     signalChild(this.child, signal, PROCESS_GROUPS);
   }

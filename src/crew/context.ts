@@ -153,16 +153,42 @@ export function kirocrewFor(c: CrewCtx, state: CrewState, opts: { extra?: Record
   return { kc: new KiroCrewCli({ dir: state.kirocrew.dir, env: gw.env, runner: c.deps.runner, cwd: opts.cwd }), gw };
 }
 
-/** Reads `run/ready.json` (the parsed `KIROCREW_READY:{…}` object). */
-export function readReady(paths: CrewPaths): { port?: number; token?: string; pid?: number; home?: string } | undefined {
+/** `run/ready.json`: the gateway's READY object plus who that gateway was ({@link READY_IDENTITY_KEY}). */
+export interface ReadyRecord {
+  port?: number;
+  token?: string;
+  pid?: number;
+  home?: string;
+  /** Start time and boot of `pid` when `crew start` recorded it (absent in an older kiro-claude's file, or without /proc). */
+  startTime?: number;
+  bootId?: string;
+}
+
+/**
+ * The key under which `crew start` adds, to the `KIROCREW_READY:{…}` object it stores as
+ * `ready.json`, the identity of the gateway process: `{pid, startTime?, bootId?}`. A pid alone
+ * outlives its process (a stale file, a reboot); with its start time and boot it names one process.
+ */
+export const READY_IDENTITY_KEY = 'kiroClaude';
+
+/** Reads `run/ready.json` (the parsed `KIROCREW_READY:{…}` object and the recorded identity). */
+export function readReady(paths: CrewPaths): ReadyRecord | undefined {
   try {
     const j = JSON.parse(fs.readFileSync(paths.readyFile, 'utf8')) as Record<string, unknown>;
-    return {
+    const pid = typeof j.pid === 'number' ? j.pid : undefined;
+    const rec: ReadyRecord = {
       port: typeof j.port === 'number' ? j.port : undefined,
       token: typeof j.token === 'string' ? j.token : undefined,
-      pid: typeof j.pid === 'number' ? j.pid : undefined,
+      pid,
       home: typeof j.home === 'string' ? j.home : undefined,
     };
+    const id = j[READY_IDENTITY_KEY] as Record<string, unknown> | undefined;
+    // the identity counts only for the pid the record names
+    if (id && typeof id === 'object' && pid !== undefined && id.pid === pid) {
+      if (typeof id.startTime === 'number' && Number.isInteger(id.startTime)) rec.startTime = id.startTime;
+      if (typeof id.bootId === 'string' && id.bootId) rec.bootId = id.bootId;
+    }
+    return rec;
   } catch {
     return undefined;
   }

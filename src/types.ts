@@ -479,6 +479,17 @@ export interface SessionRecord {
    * history); removed once the line of its next prompt is written to Claude.
    */
   pendingContext?: string[];
+  /**
+   * This record's conversation is a fork (a tangent, rewind, transferred copy, spec-phase session
+   * or continuation) that has not completed a turn of its own yet, and this is where it forks
+   * from (`--resume <from> --fork-session [--resume-session-at <at>]`). Claude Code writes a
+   * fork's transcript only with its first message, so until then `claudeSessionId` may name no
+   * transcript: a resume of this record (also after a quit) forks this source again instead,
+   * without `at` at the record's own last turn (the source may have moved on since).
+   * Removed once a turn completes in the record (or `/clear` starts a new conversation). Absent
+   * in records written before this field existed (they resume `claudeSessionId`).
+   */
+  pendingFork?: { from: string; at?: string };
 }
 
 // ───────────────────────────── Models ─────────────────────────────
@@ -681,6 +692,14 @@ export interface KiroSession extends EventEmitter {
   exitTangent(mode: 'discard' | 'tail' | 'merge'): Promise<void>;
   /** /rewind N: fork at turn N (1-based). */
   rewind(turn: number): Promise<void>;
+  /**
+   * Where a new fork of this session's current conversation must start
+   * (`KiroSessionOptions.fork.fromClaudeSessionId` / `at`): its own Claude session or, while that
+   * is itself a fork without a message yet (a /tangent or /rewind just entered; Claude Code writes
+   * a fork's transcript only with its first message), that fork's own source. Undefined (or an
+   * empty `from`) when the session has no Claude session to fork. Used by the spec driver.
+   */
+  forkSource(): { from: string; at?: string } | undefined;
 
   /** Tool listing for /tools. */
   toolListing(): ToolListingEntry[];
