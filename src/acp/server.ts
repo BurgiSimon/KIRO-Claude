@@ -120,6 +120,7 @@ import {
   promptUsage,
   resolveModelId,
   stripToolUseError,
+  sumTurnUsage,
   toolCallUpdate,
   toolMeta,
   toolResultUpdates,
@@ -1913,6 +1914,9 @@ export class AcpServer {
     let failure: unknown;
     const work = (async (): Promise<TurnResult> => {
       let r = await this.drain(st, turn, st.session.prompt(input, { signal: turn.abort.signal }));
+      // the response's usage covers every Claude turn of this request (F6): KiroSession.prompt
+      // sums its own redirect / Stop-hook continuations, the held-steer ones are added here
+      let usage = r.usage;
       while (!turn.cancelled && !st.closed && !r.isError && st.steers.length > 0) {
         // steers still held at the end of the turn: continue inside this prompt request
         const batch = st.steers;
@@ -1922,8 +1926,9 @@ export class AcpServer {
         // its reply is a new paragraph, not glued onto the answer before it
         turn.breakPending = turn.textTail !== '';
         r = await this.drain(st, turn, st.session.prompt({ text, skipPromptHooks: true }, { signal: turn.abort.signal }));
+        usage = sumTurnUsage(usage, r.usage);
       }
-      return r;
+      return usage ? { ...r, usage } : r;
     })();
     try {
       const raced = await Promise.race([work, turn.cancelGrace.promise.then(() => undefined)]);
@@ -1980,11 +1985,12 @@ export class AcpServer {
    * 05 §4.6 step 5: the child produced no result within the grace period after a cancel. Close
    * the session (stdin EOF, then SIGTERM / SIGKILL: the child dies and the stuck turn ends) and
    * re-create it under the SAME ACP / Kiro session id with `resume` of its persisted record and
-   * the options it was created with (cwd, client MCP servers, additional directories, trust
-   * flags, the permission bridge), carrying the agent / model / effort it has now (`set_mode` /
-   * `set_model` / effort changes included). The new child starts eagerly; the session queue then
-   * continues with it. A failed re-creation is reported by every later operation on the session
-   * (`Failed to start the session: …`), like a failed start.
+   * the options it was created with (cwd, client MCP servers, additional directories,
+   * `--trust-all-tools`, the permission bridge), carrying the agent / model / effort it has now
+   * (`set_mode` / `set_model` / effort changes included) and the record's own per-tool trust
+   * (never the launch `--trust-tools` again, F2). The new child starts eagerly; the session
+   * queue then continues with it. A failed re-creation is reported by every later operation on
+   * the session (`Failed to start the session: …`), like a failed start.
    */
   private async replaceStuckSession(st: AcpSessionState, stuck: Promise<unknown>): Promise<void> {
     const old = st.session;
@@ -2000,6 +2006,10 @@ export class AcpServer {
     if (st.closed || this.stopping) return;
     const opts: KiroSessionOptions = { ...st.createOpts, resume: { sessionId: st.id }, agentName: old.agent.name, model: old.model };
     delete opts.fork;
+    // the resumed record carries every agent's per-tool trust (what `--trust-tools` gave the
+    // launch agent, allow_always grants, `byAgent`); the launch flag applied again would trust
+    // the tool for the agent active NOW (e.g. one `set_mode` switched to) — as REPL restartStopped
+    delete opts.trustTools;
     if (old.effort) opts.effort = old.effort;
     else delete opts.effort;
     if (old.trust.trustAll) opts.trustAllTools = true;
@@ -2064,15 +2074,19 @@ export class AcpServer {
     return { ...(pct !== undefined ? { pct } : {}), ...(used !== undefined ? { used } : {}), ...(size !== undefined ? { size } : {}) };
   }
 
-  /** `_kiro.dev/metadata` + `usage_update` after a turn (05 §5.3, §7.7; 08 KC-ACP-13/18). */
+  /**
+   * `_kiro.dev/metadata` + `usage_update` after a turn (05 §5.3, §7.7; 08 KC-ACP-13/18).
+   * `turnDurationMs` is the prompt request's own duration (`wallMs`): a raw result's
+   * `duration_ms` covers only the last of its Claude turns (held-steer / Stop-hook continuation,
+   * a steer answered in a turn of its own) (F6).
+   */
   private async emitTurnMetadata(st: AcpSessionState, turn: TurnCtx, wallMs: number): Promise<void> {
     const n = await this.contextNumbers(st, turn.rawResult);
-    const dur = typeof turn.rawResult?.duration_ms === 'number' ? turn.rawResult.duration_ms : wallMs;
     const effort = st.session.effort;
     this.conn.notify('_kiro.dev/metadata', {
       sessionId: st.id,
       contextUsagePercentage: n.pct ?? 0,
-      turnDurationMs: Math.round(dur),
+      turnDurationMs: Math.round(wallMs),
       // shape as captured from kiro-cli 2.35 (`support` spellings other than "unavailable" UNVERIFIED, 05 §11 item 7)
       reasoning: { support: 'unavailable', ...(effort ? { effort } : {}), effortLevels: [...EFFORT_LEVELS] },
     });

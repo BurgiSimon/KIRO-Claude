@@ -681,6 +681,18 @@ export function mapStopReason(r: TurnResult, rawResult?: Record<string, unknown>
   }
 }
 
+/** Token counts of two Claude turns of one prompt request added up (either may be missing). */
+export function sumTurnUsage(a: TurnUsage | undefined, b: TurnUsage | undefined): TurnUsage | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    cacheReadTokens: a.cacheReadTokens + b.cacheReadTokens,
+    cacheCreationTokens: a.cacheCreationTokens + b.cacheCreationTokens,
+  };
+}
+
 /** `PromptResponse.usage` (05 §7.7; unstable ACP schema). */
 export function promptUsage(u: TurnUsage | undefined): Record<string, number> | undefined {
   if (!u) return undefined;

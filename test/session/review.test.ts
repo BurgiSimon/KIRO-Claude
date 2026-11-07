@@ -480,19 +480,20 @@ describe('C21: Kiro settings with a Claude Code equivalent reach the child env',
     const stub = (vals: Record<string, unknown>) => ({ get: (k: string) => vals[k] });
     assert.deepEqual(claudeSettingsEnv(stub({})), {});
     assert.deepEqual(claudeSettingsEnv(stub({ 'chat.disableAutoCompaction': false, 'mcp.initTimeout': 0, 'api.timeout': 'x' })), {});
-    assert.deepEqual(claudeSettingsEnv(stub({ 'chat.disableAutoCompaction': 'true', 'mcp.initTimeout': '12000', 'api.timeout': 90 })), {
+    // (interactive: mcp.initTimeout only raises Claude Code's own 30 s MCP start-up limit, F4)
+    assert.deepEqual(claudeSettingsEnv(stub({ 'chat.disableAutoCompaction': 'true', 'mcp.initTimeout': '42000', 'api.timeout': 90 })), {
       DISABLE_AUTO_COMPACT: '1',
-      MCP_TIMEOUT: '12000',
+      MCP_TIMEOUT: '42000',
       API_TIMEOUT_MS: '90000',
     });
     const sb = mkSandbox();
-    sb.write('.kiro/settings/cli.json', JSON.stringify({ 'chat.disableAutoCompaction': true, 'mcp.initTimeout': 20000, 'api.timeout': 600 }));
+    sb.write('.kiro/settings/cli.json', JSON.stringify({ 'chat.disableAutoCompaction': true, 'mcp.initTimeout': 40000, 'api.timeout': 600 }));
     const { s } = await open(sb);
     const childEnv = (): NodeJS.ProcessEnv => (s as unknown as { childEnv(): NodeJS.ProcessEnv }).childEnv();
     try {
       const env = childEnv();
       assert.equal(env.DISABLE_AUTO_COMPACT, '1');
-      assert.equal(env.MCP_TIMEOUT, '20000');
+      assert.equal(env.MCP_TIMEOUT, '40000');
       assert.equal(env.API_TIMEOUT_MS, '600000');
       sb.env.MCP_TIMEOUT = '1234';
       assert.equal(childEnv().MCP_TIMEOUT, '1234');

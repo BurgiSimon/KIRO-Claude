@@ -168,6 +168,39 @@ test('/spec run: scope picker, explicit ids, flags, errors', async () => {
   }
 });
 
+test('/spec run and /spec <name>: the REPL command signal (first Ctrl+C) stops the run; no further task is scheduled (F0)', async () => {
+  const { w, host } = setup();
+  try {
+    const dir = writeSpec(w, 'todo-export', { requirements: REQ_MD, design: DESIGN_MD, tasks: TASKS_MD });
+    const box = (id: string): string => parseTasks(read(path.join(dir, 'tasks.md'))).byId.get(id)!.box;
+    let ac = new AbortController();
+    // the REPL's per-command signal (repl/core.ts ReplContext.commandSignal), read duck-typed
+    Object.defineProperty(host, 'commandSignal', { get: () => ac.signal, configurable: true });
+    const create = host.createSession.bind(host);
+    // Ctrl+C while a task session starts (spawning Claude Code takes a while)
+    host.createSession = async (o) => {
+      const s = await create(o);
+      if (o.origin === 'spec') ac.abort();
+      return s;
+    };
+    await run(host, 'run todo-export 1.1 2.1');
+    assert.ok(host.text.includes('✗ Task 1.1 interrupted'), host.text);
+    assert.ok(!host.text.includes('▶ Task 2.1'), `the run went on after the Ctrl+C:\n${host.text}`);
+    assert.deepEqual([box('1.1'), box('2.1')], [' ', ' ']);
+    assert.ok(host.sessions.slice(1).every((s) => s.closed), 'the task session is closed');
+    assert.deepEqual(host.sessions[1]!.prompts, [], 'no task turn was started');
+    // the step-through picker runs tasks through the same runtime
+    host.printed.length = 0;
+    ac = new AbortController();
+    host.chooseAnswers = ['Run all remaining required tasks'];
+    await run(host, 'todo-export');
+    assert.ok(host.text.includes('✗ Task 1.1 interrupted'), host.text);
+    assert.ok(!host.text.includes('▶ Task 2.1'), host.text);
+  } finally {
+    w.cleanup();
+  }
+});
+
 test('/spec analyze: picker over specs with requirements; message when none', async () => {
   const { w, host } = setup();
   try {

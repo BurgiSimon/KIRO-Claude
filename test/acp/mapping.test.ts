@@ -35,6 +35,7 @@ import {
   stripReadDecorations,
   stripSubagentTrailer,
   stripToolUseError,
+  sumTurnUsage,
   todoSnapshot,
   toolCallUpdate,
   toolResultUpdates,
@@ -321,6 +322,15 @@ test('promptUsage sums all four counters (05 §10)', () => {
     cachedWriteTokens: 2208,
   });
   assert.equal(promptUsage(undefined), undefined);
+});
+
+test('sumTurnUsage adds the Claude turns of one prompt request (F6)', () => {
+  const a = { inputTokens: 100, outputTokens: 15, cacheReadTokens: 10, cacheCreationTokens: 1 };
+  const b = { inputTokens: 200, outputTokens: 3, cacheReadTokens: 50, cacheCreationTokens: 5 };
+  assert.deepEqual(sumTurnUsage(a, b), { inputTokens: 300, outputTokens: 18, cacheReadTokens: 60, cacheCreationTokens: 6 });
+  assert.equal(sumTurnUsage(a, undefined), a);
+  assert.equal(sumTurnUsage(undefined, b), b);
+  assert.equal(sumTurnUsage(undefined, undefined), undefined);
 });
 
 test('promptToInput (05 §4.5.1)', () => {

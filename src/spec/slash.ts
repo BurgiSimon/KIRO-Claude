@@ -10,7 +10,7 @@
  * | `/spec <name>` | resume: pending checkpoint, or step through tasks |
  * | `/spec list` · `/spec status [name]` | progress table / detailed status |
  * | `/spec view\|open <name> [requirements\|bugfix\|design\|tasks]` | print a document |
- * | `/spec run <name> [ids…\|--next\|--all\|--include-optional]` | scope picker (All remaining required tasks / include optional / Select tasks… / Cancel) then execution |
+ * | `/spec run <name> [ids…\|--next\|--all\|--include-optional]` | scope picker (All remaining required tasks / include optional / Select tasks… / Cancel) then execution; Ctrl+C stops scheduling tasks and interrupts the running one (the REPL command signal, via createReplRuntime) |
  * | `/spec analyze_requirements\|analyze [name]` | Analyze Requirements (picker over specs with requirements) |
  * | `/spec approve [name]` · `/spec revise [name] <feedback>` | approve / revise the pending checkpoint (scripted use) |
  * | `/spec sync <name>` | adapter extension (03 §1.7.4) |

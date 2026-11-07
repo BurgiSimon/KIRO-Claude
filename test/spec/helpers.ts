@@ -395,8 +395,8 @@ export class MockSession extends EventEmitter implements KiroSession {
   hooks(): readonly KiroHook[] {
     return this.hookList;
   }
-  async runManualHook(): Promise<string> {
-    return '';
+  async runManualHook(): Promise<import('../../src/types.js').ManualHookRun> {
+    return { kind: 'not-found' };
   }
   async exportTo(p: string): Promise<string> {
     return p;

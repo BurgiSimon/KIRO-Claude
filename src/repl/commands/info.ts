@@ -59,19 +59,25 @@ export const hooksCommand: BuiltinCommand = {
         r.write(`\n${c.red('Usage: /hooks run <name>')}\n\n`);
         return;
       }
-      const hook = r.session.hooks().find((h) => h.name === name);
-      if (!hook) {
-        r.write(`\n${c.red(`No hook named '${name}'.`)}\n\n`);
-        return;
+      // branch on what the session ran (the Manual hook HookRunner.runManual picks), never on a
+      // same-named hook of another trigger or file (F5)
+      const ran = await r.session.runManualHook(name);
+      switch (ran.kind) {
+        case 'not-found':
+          r.write(`\n${c.red(`No manual hook named '${name}'.`)}\n\n`);
+          return;
+        case 'disabled':
+          // the session has shown `Hook "<name>" is disabled.`; nothing ran (F11)
+          return;
+        case 'agent':
+          // an agent action's prompt goes to the model as its own user turn (03 §2.5)
+          if (ran.prompt.trim()) return r.sendPrompt({ text: ran.prompt });
+          r.write(`\n${c.gray(`Hook '${name}' has an empty prompt.`)}\n\n`);
+          return;
+        case 'command':
+          r.write(ran.output.trim() ? `\n${ran.output.replace(/\s+$/, '')}\n\n` : `\n${c.gray(`Hook '${name}' produced no output.`)}\n\n`);
+          return;
       }
-      const out = await r.session.runManualHook(name);
-      if (hook.action.type === 'agent') {
-        // an agent action's prompt goes to the model as its own user turn (03 §2.5)
-        if (out.trim()) return r.sendPrompt({ text: out });
-        r.write(`\n${c.gray(`Hook '${name}' has an empty prompt.`)}\n\n`);
-        return;
-      }
-      r.write(out.trim() ? `\n${out.replace(/\s+$/, '')}\n\n` : `\n${c.gray(`Hook '${name}' produced no output.`)}\n\n`);
       return;
     }
     r.write(`${c.yellow(notSupported(`hooks ${sub}`))}\nEdit the agent file or .kiro/hooks/*.json to change hooks.\n`);

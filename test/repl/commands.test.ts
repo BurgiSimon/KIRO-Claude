@@ -2,9 +2,13 @@ import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { PassThrough } from 'node:stream';
 import { buildModelList } from '../../src/models/models.js';
+import { openSettings } from '../../src/config/settings.js';
+import { createWorkspaceContext } from '../../src/config/workspace.js';
+import { runRepl } from '../../src/repl/repl.js';
 import { SessionStore } from '../../src/session/store.js';
-import type { KiroSession } from '../../src/types.js';
+import type { CliContext, KiroHook, KiroSession } from '../../src/types.js';
 import { compactInstructions } from '../../src/repl/commands/conversation.js';
 import { looksLikePlan } from '../../src/repl/commands/plan.js';
 import { promptArguments } from '../../src/repl/commands/prompts.js';
@@ -12,6 +16,7 @@ import { formatToolListing, toolNameMatches } from '../../src/repl/commands/tool
 import { formatHooks, formatUsage } from '../../src/repl/commands/info.js';
 import { formatContextReport } from '../../src/repl/commands/context.js';
 import { setColorEnabled, stripAnsi } from '../../src/util/ansi.js';
+import { fakeClaudePath, fakeEnv } from '../claude/helpers.js';
 import { runToEnd, startRepl, tempEnv } from './harness.js';
 import { MockSession, agentOf } from './mockSession.js';
 
@@ -388,9 +393,9 @@ test('/hooks list and run', async () => {
   r = await cmd(['/hooks', '/hooks run lint', '/hooks run ghost', '/hooks add x'], { session: s2 });
   assert.ok(r.out.includes('agentSpawn:\n  - agentSpawn-0: git status\nManual:\n  - lint: npm run lint [matcher: x]\n'), r.out);
   assert.ok(r.out.includes('\noutput of lint\n'));
-  assert.ok(r.out.includes("No hook named 'ghost'."));
+  assert.ok(r.out.includes("No manual hook named 'ghost'."));
   assert.ok(r.out.includes('/hooks add is not supported in kiro-claude'));
-  assert.deepEqual(s2.called('runManualHook'), [['lint']]);
+  assert.deepEqual(s2.called('runManualHook'), [['lint'], ['ghost']]);
   assert.equal(formatHooks([]).includes('No hooks are configured.'), true);
 });
 
@@ -399,10 +404,173 @@ test('/hooks run with an agent action sends its prompt as a user turn (C17)', as
   s.hookList = [
     { dialect: 'v3', source: 'workspace-file', name: 'review', trigger: 'Manual', rawTrigger: 'Manual', action: { type: 'agent', prompt: 'Review the diff' }, timeoutMs: 60000, maxOutputBytes: 10240, cacheTtlSec: 0, enabled: true },
   ];
-  s.runManualHook = async (): Promise<string> => 'Review the diff';
   const r = await cmd(['/hooks run review'], { session: s });
   assert.deepEqual(s.prompts.map((p) => p.text), ['Review the diff'], 'the prompt reached the model');
   assert.ok(!r.out.includes('\nReview the diff\n\n'), 'the prompt is not just printed');
+});
+
+const hook = (name: string, trigger: KiroHook['trigger'], action: KiroHook['action'], enabled = true): KiroHook => ({
+  dialect: 'v3',
+  source: 'workspace-file',
+  name,
+  trigger,
+  rawTrigger: trigger,
+  action,
+  timeoutMs: 60000,
+  maxOutputBytes: 10240,
+  cacheTtlSec: 0,
+  enabled,
+});
+
+test('/hooks run branches on the Manual hook that ran, never on a same-named hook of another trigger (F5)', async () => {
+  const s = new MockSession();
+  s.hookList = [
+    hook('lint', 'Stop', { type: 'agent', prompt: 'Check the lint results' }, false),
+    hook('lint', 'Manual', { type: 'command', command: 'echo LINT' }),
+    hook('review', 'PostToolUse', { type: 'command', command: 'true' }, false),
+    hook('review', 'Manual', { type: 'agent', prompt: 'Please review the diff now' }),
+    hook('stop-only', 'Stop', { type: 'agent', prompt: 'never run by /hooks run' }),
+  ];
+  const r = await cmd(['/hooks run lint', '/hooks run review', '/hooks run stop-only'], { session: s });
+  assert.deepEqual(s.prompts.map((p) => p.text), ['Please review the diff now'], 'only the Manual agent hook reached the model');
+  assert.ok(r.out.includes('\noutput of lint\n'), r.out);
+  assert.ok(!r.out.includes('\nPlease review the diff now\n\n'), 'the agent prompt is not just printed');
+  assert.ok(r.out.includes("No manual hook named 'stop-only'."), r.out);
+  assert.deepEqual(s.called('runManualHook'), [['lint'], ['review'], ['stop-only']]);
+});
+
+test('/hooks run on a disabled Manual hook shows only the disabled warning (F11)', async () => {
+  const s = new MockSession();
+  s.hookList = [hook('off', 'Manual', { type: 'agent', prompt: 'Review the code' }, false), hook('cmdoff', 'Manual', { type: 'command', command: 'echo hi' }, false)];
+  const r = await cmd(['/hooks run off', '/hooks run cmdoff'], { session: s });
+  assert.deepEqual(s.prompts, [], 'a disabled hook sends nothing');
+  assert.ok(!r.out.includes('empty prompt'), r.out);
+  assert.ok(!r.out.includes('produced no output'), r.out);
+  // nothing at all after either line (the session shows the disabled warning; this mock has none)
+  assert.ok(r.out.includes('> /hooks run off\n> /hooks run cmdoff\n> '), r.out);
+  assert.deepEqual(s.called('runManualHook'), [['off'], ['cmdoff']]);
+});
+
+test('/hooks run through the real session and fake claude: name collisions across triggers, case-insensitive and disabled hooks (F5, F11)', { timeout: 60_000 }, async () => {
+  const t = tempEnvT();
+  t.write(
+    'proj/.kiro/hooks/a.json',
+    JSON.stringify({
+      version: 'v1',
+      hooks: [
+        { name: 'lint', trigger: 'Stop', enabled: false, action: { type: 'agent', prompt: 'Check the lint results' } },
+        { name: 'lint', trigger: 'Manual', action: { type: 'command', command: 'echo LINT-OUTPUT-42' } },
+        { name: 'review', trigger: 'PostToolUse', enabled: false, action: { type: 'command', command: 'true' } },
+        { name: 'review', trigger: 'Manual', action: { type: 'agent', prompt: 'Please review the diff now' } },
+        { name: 'off', trigger: 'Manual', enabled: false, action: { type: 'agent', prompt: 'Do the thing' } },
+      ],
+    }),
+  );
+  const logFile = path.join(t.root, 'fake.log');
+  const env = fakeEnv({
+    ...t.env,
+    KIRO_HOME: t.kiroHome,
+    XDG_RUNTIME_DIR: path.join(t.root, 'run'),
+    XDG_CACHE_HOME: path.join(t.root, 'cache'),
+    KIRO_CLAUDE_BIN: fakeClaudePath(),
+    FAKE_CLAUDE_LOG: logFile,
+    FAKE_CLAUDE_SCRIPT_JSON: JSON.stringify({ turns: [], default: { steps: [{ text: 'MODEL GOT: {{userText}}' }] } }),
+  });
+  fs.mkdirSync(env.XDG_RUNTIME_DIR!, { recursive: true, mode: 0o700 });
+  const ws = createWorkspaceContext(t.wsDir, env);
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  let out = '';
+  stdout.on('data', (d: Buffer) => (out += d.toString()));
+  stderr.on('data', (d: Buffer) => (out += d.toString()));
+  const ctx: CliContext = { ws, settings: openSettings(ws), stdin: stdin as unknown as NodeJS.ReadStream, stdout: stdout as unknown as NodeJS.WriteStream, stderr: stderr as unknown as NodeJS.WriteStream, progName: 'kiro-claude', verbosity: 0 };
+  const exit = runRepl({ ctx, sessionOptions: { env, claudePath: fakeClaudePath() } });
+  stdin.end(['/hooks run lint', '/hooks run REVIEW', '/hooks run off', '/quit'].map((l) => `${l}\n`).join(''));
+  assert.equal(await exit, 0);
+  out = stripAnsi(out);
+  const users = (fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8').split('\n').filter(Boolean) : [])
+    .map((l) => JSON.parse(l) as { event?: string; line?: { type?: string; message?: { content?: unknown } } })
+    .filter((e) => e.event === 'stdin' && e.line?.type === 'user')
+    .map((e) => {
+      const c = e.line!.message!.content;
+      return typeof c === 'string' ? c : (c as { text?: string }[]).map((b) => b.text ?? '').join('');
+    });
+  // 'lint': the Manual command hook ran and its output was printed (a Stop agent 'lint' is not it)
+  assert.match(out, /LINT-OUTPUT-42/);
+  assert.ok(!users.some((u) => u.includes('LINT-OUTPUT-42')), `command output was sent to the model: ${JSON.stringify(users)}`);
+  // 'REVIEW': the Manual agent hook 'review' (case-insensitive, as HookRunner.runManual) sent its prompt
+  assert.equal(users.filter((u) => u.includes('Please review the diff now')).length, 1, JSON.stringify(users));
+  assert.match(out, /MODEL GOT: .*Please review the diff now/);
+  // 'off': disabled — the warning, no "empty prompt", nothing sent
+  assert.match(out, /Hook "off" is disabled\./);
+  assert.doesNotMatch(out, /empty prompt|produced no output/);
+  assert.ok(!users.some((u) => u.includes('Do the thing')));
+});
+
+/** `/hooks run` lines through the real runRepl + session + fake claude; what was printed and sent. */
+async function realHooksRun(hooks: unknown[], lines: string[]): Promise<{ out: string; users: string[] }> {
+  const t = tempEnvT();
+  t.write('proj/.kiro/hooks/a.json', JSON.stringify({ version: 'v1', hooks }));
+  const logFile = path.join(t.root, 'fake.log');
+  const env = fakeEnv({
+    ...t.env,
+    KIRO_HOME: t.kiroHome,
+    XDG_RUNTIME_DIR: path.join(t.root, 'run'),
+    XDG_CACHE_HOME: path.join(t.root, 'cache'),
+    KIRO_CLAUDE_BIN: fakeClaudePath(),
+    FAKE_CLAUDE_LOG: logFile,
+    FAKE_CLAUDE_SCRIPT_JSON: JSON.stringify({ turns: [], default: { steps: [{ text: 'MODEL GOT: {{userText}}' }] } }),
+  });
+  fs.mkdirSync(env.XDG_RUNTIME_DIR!, { recursive: true, mode: 0o700 });
+  const ws = createWorkspaceContext(t.wsDir, env);
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  let out = '';
+  stdout.on('data', (d: Buffer) => (out += d.toString()));
+  stderr.on('data', (d: Buffer) => (out += d.toString()));
+  const ctx: CliContext = { ws, settings: openSettings(ws), stdin: stdin as unknown as NodeJS.ReadStream, stdout: stdout as unknown as NodeJS.WriteStream, stderr: stderr as unknown as NodeJS.WriteStream, progName: 'kiro-claude', verbosity: 0 };
+  const exit = runRepl({ ctx, sessionOptions: { env, claudePath: fakeClaudePath() } });
+  stdin.end([...lines, '/quit'].map((l) => `${l}\n`).join(''));
+  assert.equal(await exit, 0);
+  const users = (fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8').split('\n').filter(Boolean) : [])
+    .map((l) => JSON.parse(l) as { event?: string; line?: { type?: string; message?: { content?: unknown } } })
+    .filter((e) => e.event === 'stdin' && e.line?.type === 'user')
+    .map((e) => {
+      const c = e.line!.message!.content;
+      return typeof c === 'string' ? c : (c as { text?: string }[]).map((b) => b.text ?? '').join('');
+    });
+  return { out: stripAnsi(out), users };
+}
+
+test('/hooks run through the real session: a disabled command hook, a timed-out command and an exact vs case-insensitive pick (F5, F11)', { timeout: 60_000 }, async () => {
+  const { out, users } = await realHooksRun(
+    [
+      { name: 'Lint', trigger: 'Manual', enabled: false, action: { type: 'command', command: 'echo UPPER-LINT' } },
+      { name: 'lint', trigger: 'Manual', action: { type: 'command', command: 'echo LOWER-LINT' } },
+      { name: 'cmdoff', trigger: 'Manual', enabled: false, action: { type: 'command', command: 'echo never' } },
+      { name: 'slow', trigger: 'Manual', timeout: 0.3, action: { type: 'command', command: 'sleep 5; echo late' } },
+    ],
+    ['/hooks run lint', '/hooks run LINT', '/hooks run cmdoff', '/hooks run slow'],
+  );
+  const printedAfter = (line: string): string => {
+    const i = out.indexOf(`> ${line}\n`);
+    assert.ok(i >= 0, out);
+    const rest = out.slice(i + line.length + 3);
+    const j = rest.indexOf('\n> ');
+    return j >= 0 ? rest.slice(0, j) : rest;
+  };
+  // the exact name wins over a case-insensitive match (HookRunner.runManual)
+  assert.match(printedAfter('/hooks run lint'), /LOWER-LINT/);
+  // no exact 'LINT': the first case-insensitive Manual hook is the disabled 'Lint' — only its warning
+  assert.equal(printedAfter('/hooks run LINT').trim(), 'Hook "Lint" is disabled.');
+  // a disabled command hook: only the warning, never "produced no output" (F11)
+  assert.equal(printedAfter('/hooks run cmdoff').trim(), 'Hook "cmdoff" is disabled.');
+  // a command that ran and timed out is a command with no output, not a disabled hook
+  assert.match(printedAfter('/hooks run slow'), /timed out[\s\S]*Hook 'slow' produced no output\./);
+  assert.doesNotMatch(out, /UPPER-LINT/);
+  assert.deepEqual(users, [], 'nothing was sent to the model');
 });
 
 test('/mcp status', async () => {

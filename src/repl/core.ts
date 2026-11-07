@@ -27,15 +27,19 @@
  *
  * Ctrl+C during a turn, or during a slash command that runs without a turn of the REPL's own
  * (`/tangent merge` runs a model summary turn, `/agent swap` respawns Claude Code), ⇒
- * `session.interrupt()`; the press is never kept as type-ahead for the next prompt. A second
- * Ctrl+C aborts the prompt's signal and, when the turn / command still runs
- * {@link FORCE_STOP_GRACE_MS} later (Claude Code did not end it after the interrupt), stops
- * Claude Code like headless (session close) and ACP (`replaceStuckSession`) do: the session is
- * closed (stdin EOF, SIGTERM after 2 s, then SIGKILL; 00 §2.3 / 04 §8.4), the REPL returns to
- * its prompt and the next input re-creates the session with `--resume` (a conversation without
- * a finished turn, which closing drops, starts afresh; a tangent continues as its own
- * conversation; a Ctrl+C while it restarts cancels that input). At the idle prompt the first
- * Ctrl+C / Ctrl+D prints Q's hint, the second exits.
+ * `session.interrupt()`; the press is never kept as type-ahead for the next prompt. Every press
+ * while a command runs also aborts its {@link ReplContext.commandSignal} (`/spec run` stops
+ * scheduling tasks, 03 §1.7). A second Ctrl+C aborts the prompt's signal and, when the turn /
+ * command still runs {@link FORCE_STOP_GRACE_MS} later (Claude Code did not end it after the
+ * interrupt), stops Claude Code like headless (session close) and ACP (`replaceStuckSession`) do:
+ * the session is closed (stdin EOF, SIGTERM after 2 s, then SIGKILL; 00 §2.3 / 04 §8.4), the REPL
+ * returns to its prompt and the next input re-creates the session with `--resume` (a conversation
+ * without a finished turn, which closing drops, starts afresh; a tangent continues as its own
+ * conversation; a Ctrl+C while it restarts cancels that input). A command is stopped that way only
+ * while the session still has work of its own in flight ({@link KiroSession.busy}): a command
+ * waiting on another session (a `/spec run` task session or `/chat new` starting) or on Claude
+ * Code (re)starting is neither stopped nor abandoned. At the idle prompt the first Ctrl+C /
+ * Ctrl+D prints Q's hint, the second exits.
  *
  * Slash commands are shlex-split; unbalanced quotes fall back to a whitespace split so free-text
  * commands (`/plan I don't …`) work. `/<steering>` sends `#steering:<name> …` with
@@ -178,8 +182,13 @@ export class Repl implements ReplContext {
   private approving = false;
   private deferred: SessionEvent[] = [];
   private sigHandler: (() => void) | undefined;
-  /** A session closed by a forced stop (second Ctrl+C); re-created at the next input. */
-  private stoppedSession: { session: KiroSession; closing: Promise<void>; tangentParent?: string } | undefined;
+  /**
+   * A session closed by a forced stop (second Ctrl+C); re-created at the next input.
+   * `tangentParent` / `tangentId`: the stop hit tangent `tangentId` of main `tangentParent`.
+   */
+  private stoppedSession: { session: KiroSession; closing: Promise<void>; tangentParent?: string; tangentId?: string } | undefined;
+  /** The running slash command's {@link ReplContext.commandSignal}. */
+  private cmdSignal: AbortSignal | undefined;
 
   constructor(
     private readonly opts: RunReplOptions,
@@ -233,6 +242,10 @@ export class Repl implements ReplContext {
 
   get busy(): boolean {
     return this.turnActive;
+  }
+
+  get commandSignal(): AbortSignal | undefined {
+    return this.cmdSignal;
   }
 
   private wrapWidth(): number | undefined {
@@ -610,8 +623,13 @@ export class Repl implements ReplContext {
       // Ctrl+C while the command runs outside a turn of its own (`/tangent merge`'s summary
       // turn, a Claude Code respawn) interrupts the session instead of waiting as type-ahead
       // for the next prompt (where it would count as an exit press); a turn the command starts
-      // handles its own presses (runEvents)
-      const scope = this.interruptScope(undefined, () => !this.turnActive);
+      // handles its own presses (runEvents). Any press aborts the command's signal.
+      const cmdAbort = new AbortController();
+      const outerSignal = this.cmdSignal;
+      this.cmdSignal = cmdAbort.signal;
+      const onPress = (): void => cmdAbort.abort();
+      const scope = this.interruptScope(undefined, () => !this.turnActive, { onlyWhenBusy: true });
+      this.reader.on('interrupt', onPress);
       this.reader.on('interrupt', scope.listener);
       try {
         const r = await this.unlessAbandoned((entry.cmd as SlashCommand).run(args, raw, this), scope);
@@ -627,6 +645,8 @@ export class Repl implements ReplContext {
       } finally {
         scope.end();
         this.reader.off('interrupt', scope.listener);
+        this.reader.off('interrupt', onPress);
+        this.cmdSignal = outerSignal;
       }
     }
     // /<prompt> args (V3), prompts first (00 §2.2)
@@ -686,8 +706,11 @@ export class Repl implements ReplContext {
    * Ctrl+C while a turn or slash command runs (see the module doc): the first press interrupts
    * the session; a second one runs `onSecond` and arms the forced stop. `active` limits the
    * scope (a command's scope ignores presses while a turn it started handles them).
+   * `onlyWhenBusy` (a command's scope): the forced stop only closes a session that still has work
+   * of its own in flight when the grace ends; an idle one (the command waits on another session)
+   * is left open and the command is not abandoned (a later press may try again).
    */
-  private interruptScope(onSecond?: () => void, active: () => boolean = () => true): InterruptScope {
+  private interruptScope(onSecond?: () => void, active: () => boolean = () => true, o: { onlyWhenBusy?: boolean } = {}): InterruptScope {
     let presses = 0;
     let ended = false;
     let timer: NodeJS.Timeout | undefined;
@@ -712,6 +735,11 @@ export class Repl implements ReplContext {
       if (timer || this.stoppedSession) return;
       timer = setTimeout(() => {
         if (ended) return;
+        // `busy` undefined (a session that does not report it): stop it, as before
+        if (o.onlyWhenBusy && (!active() || this.current.busy === false)) {
+          timer = undefined;
+          return;
+        }
         void this.forceStop().then(resolveStopped);
       }, FORCE_STOP_GRACE_MS);
       timer.unref?.();
@@ -740,7 +768,7 @@ export class Repl implements ReplContext {
     this.notice('warn', 'Claude Code did not stop after the interrupt; stopping it.');
     const tangentParent = session.tangent?.parentId;
     const closing = withTimeout(session.close(), FORCE_CLOSE_TIMEOUT_MS).then(() => undefined);
-    this.stoppedSession = { session, closing, ...(tangentParent ? { tangentParent } : {}) };
+    this.stoppedSession = { session, closing, ...(tangentParent ? { tangentParent, tangentId: session.id } : {}) };
     return closing;
   }
 
@@ -799,7 +827,9 @@ export class Repl implements ReplContext {
           return 'failed';
         }
         this.replaceSession(fresh);
-        if (st.tangentParent && resumable) {
+        // only when the record resumed is still the tangent the stop hit: a /tangent whose fork
+        // was still starting fell back to its main record meanwhile (no tangent to announce)
+        if (st.tangentParent && resumable && old.id === st.tangentId) {
           this.write(`${c.gray(`The tangent continues as its own conversation; the main one is saved as ${st.tangentParent} (/chat resume).`)}\n`);
         }
       }

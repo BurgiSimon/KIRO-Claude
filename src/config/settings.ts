@@ -165,8 +165,16 @@ export const SETTINGS_SCHEMA: Record<string, SettingSchemaEntry> = {
   },
   'chat.preserveScrollback': { type: 'boolean', default: true, description: 'Preserve terminal scrollback (accepted and ignored)' },
   // ── MCP / API / app ──
-  'mcp.initTimeout': { type: 'number', default: 5000, description: 'MCP server initialization timeout (ms); passed to Claude Code as MCP_TIMEOUT when set' },
-  'mcp.noInteractiveTimeout': { type: 'number', default: 30000, description: 'MCP initialization timeout in non-interactive mode (ms)' },
+  'mcp.initTimeout': {
+    type: 'number',
+    default: 5000,
+    description: "MCP server initialization timeout (ms) in interactive and ACP sessions; when set above Claude Code's own 30 s limit it is passed as MCP_TIMEOUT (it never shortens it)",
+  },
+  'mcp.noInteractiveTimeout': {
+    type: 'number',
+    default: 30000,
+    description: 'MCP initialization timeout in non-interactive mode (ms); --require-mcp-startup waits this long, and when set it is passed to Claude Code as MCP_TIMEOUT',
+  },
   'mcp.loadedBefore': { type: 'boolean', description: 'Internal: the MCP safety note was shown (not supported in kiro-claude)' },
   'api.timeout': { type: 'number', default: 3600, description: 'Request timeout (seconds); passed to Claude Code as API_TIMEOUT_MS when set' },
   'api.streamIdleSoftTimeout': {

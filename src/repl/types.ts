@@ -92,6 +92,12 @@ export interface ReplContext extends ReplHost {
   readonly columns: number;
   /** A turn is running (commands typed at its `[y/n/t]` prompt must not replace the session). */
   readonly busy: boolean;
+  /**
+   * Aborted by Ctrl+C while the running slash command runs (undefined outside a command).
+   * Contributed commands, which only see {@link ReplHost}, read it duck-typed (spec/slash.ts:
+   * `/spec run` stops scheduling tasks and interrupts the running one, 03 §1.7).
+   */
+  readonly commandSignal: AbortSignal | undefined;
 }
 
 /** A built-in command: same shape as SlashCommand, but its run gets the full context. */

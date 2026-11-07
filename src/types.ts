@@ -355,6 +355,15 @@ export interface HookRunnerLike {
   runManual(ctx: HookRunContext, name: string): Promise<{ found: boolean; output?: string; agentPrompt?: string; warnings: HookWarning[] }>;
 }
 
+/**
+ * What `/hooks run <name>` actually ran ({@link KiroSession.runManualHook}): the Manual hook
+ * {@link HookRunnerLike.runManual} picked (exact name, then case-insensitive). `agent`: its prompt,
+ * which the caller sends as a user turn (03 §2.5); `command`: its output; `disabled`: nothing ran
+ * (the session already showed the warning); `not-found`: no Manual hook has that name (hooks of
+ * other triggers never run here).
+ */
+export type ManualHookRun = { kind: 'agent'; prompt: string } | { kind: 'command'; output: string } | { kind: 'disabled' } | { kind: 'not-found' };
+
 // ───────────────────────────── Gate / approvals ─────────────────────────────
 
 /** Adapter-held session trust (00 §5.4). Mutated by `t`, /tools trust, --trust-tools, ACP allow_always. */
@@ -459,8 +468,9 @@ export interface SessionRecord {
   /**
    * Context for this conversation's next user turn: the summary (`/tangent merge`) or last
    * exchange (`/tangent tail`) of a tangent that returned into it (01 §5.11, 06 §6.4). Kept on
-   * the record so it reaches THIS conversation even after a quit or another tangent; consumed by
-   * its next prompt.
+   * the record so it reaches THIS conversation even after a quit, a `/chat save` + `/chat load` or
+   * another tangent (which gets a copy, as a fork of this history); consumed by its next prompt
+   * that Claude receives.
    */
   pendingContext?: string[];
 }
@@ -623,6 +633,12 @@ export interface KiroSession extends EventEmitter {
   readonly record: SessionRecord;
   planMode: boolean;
   readonly tangent: { name: string | null; parentId: string } | undefined;
+  /**
+   * Work of this session is in flight: a turn (prompt, compact, a local command, a summary turn)
+   * or a user line Claude Code has not answered yet. False while idle or while Claude Code is
+   * only (re)starting. Optional for test doubles; the REPL treats `undefined` as busy.
+   */
+  readonly busy?: boolean;
 
   /** Spawn claude, run SessionStart hooks, compose the system prompt. Idempotent. */
   start(): Promise<void>;
@@ -672,10 +688,11 @@ export interface KiroSession extends EventEmitter {
   todos(): TodoItem[];
   hooks(): readonly KiroHook[];
   /**
-   * /hooks run: a command hook's output, or an agent-action hook's prompt, which the caller sends
-   * as a user turn (the session does not queue it).
+   * /hooks run: what ran, tagged ({@link ManualHookRun}): a command hook's output, or an
+   * agent-action hook's prompt, which the caller sends as a user turn (the session does not
+   * queue it); hook warnings (e.g. disabled) are shown as notices.
    */
-  runManualHook(name: string): Promise<string>;
+  runManualHook(name: string): Promise<ManualHookRun>;
 
   /** /chat save; returns the written path. */
   exportTo(path: string, force: boolean): Promise<string>;

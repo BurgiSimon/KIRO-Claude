@@ -206,3 +206,20 @@ test('stdout closed mid-turn ⇒ interrupt, exit 1, session closed (control, C10
   assert.deepEqual(r.runtime, []);
   assert.equal(r.sessionEnd, true);
 });
+
+test('--no-interactive hands Claude Code mcp.noInteractiveTimeout as MCP_TIMEOUT, never mcp.initTimeout (F4)', { skip: skipReason }, async () => {
+  const childMcpTimeout = async (settings: object): Promise<string> => {
+    t.write(path.join(t.kiroHome, 'settings', 'cli.json'), settings);
+    Object.assign(t.env, script({ default: { steps: [{ text: 'MCP_TIMEOUT=[{{env:MCP_TIMEOUT}}]' }] } }));
+    const r = await run(t, ['chat', '--no-interactive', 'hi']);
+    assert.equal(r.code, 0, r.stderr);
+    const m = /MCP_TIMEOUT=\[([^\]]*)\]/.exec(r.stdout);
+    assert.ok(m, r.stdout);
+    return m[1]!;
+  };
+  assert.equal(await childMcpTimeout({ 'mcp.initTimeout': 1500, 'mcp.noInteractiveTimeout': 60000 }), '60000');
+  assert.equal(await childMcpTimeout({ 'mcp.initTimeout': 1500 }), '', 'no 1.5 s hard limit: Claude Code keeps its own default');
+  assert.equal(await childMcpTimeout({}), '');
+  t.env.MCP_TIMEOUT = '7777';
+  assert.equal(await childMcpTimeout({ 'mcp.noInteractiveTimeout': 60000 }), '7777', 'the user env wins');
+});

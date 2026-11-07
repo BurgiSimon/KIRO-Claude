@@ -272,7 +272,7 @@ describe('C7: a /tangent merge or tail carry belongs to the parent conversation'
     assert.equal(new SessionStore(sb.sessionsDir).read(mainId)!.pendingContext, undefined);
   });
 
-  it('merge, then a new tangent: the summary does not go into that tangent, main gets it after the return', async () => {
+  it('merge, then a new tangent: that tangent sees the summary too (F9), main still gets it after the return', async () => {
     const sb = mkSandbox({ script: TANGENT_SCRIPT, env: { FAKE_CLAUDE_PERSIST: '1' } });
     const { s } = await open(sb);
     try {
@@ -283,7 +283,8 @@ describe('C7: a /tangent merge or tail carry belongs to the parent conversation'
       await s.exitTangent('merge');
       await s.enterTangent('other');
       await drain(s.prompt({ text: 'unrelated question' }));
-      assert.doesNotMatch(lastUserText(sb), /tangent-summary/, 'the summary of "research" went into "other"');
+      // merged into main = part of main's history (01 §5.11), which "other" was forked from
+      assert.match(lastUserText(sb), /<tangent-summary name="research">[\s\S]*FOUND_X[\s\S]*unrelated question/);
       await s.exitTangent('discard');
       assert.equal(s.id, mainId);
       await drain(s.prompt({ text: 'back-in-main' }));
@@ -293,7 +294,7 @@ describe('C7: a /tangent merge or tail carry belongs to the parent conversation'
     }
   });
 
-  it('tail, then a new tangent: the last exchange does not go into that tangent; main gets it', async () => {
+  it('tail, then a new tangent: that tangent sees the last exchange too (F9); main gets it', async () => {
     const sb = mkSandbox({ script: TANGENT_SCRIPT, env: { FAKE_CLAUDE_PERSIST: '1' } });
     const { s } = await open(sb);
     try {
@@ -303,7 +304,7 @@ describe('C7: a /tangent merge or tail carry belongs to the parent conversation'
       await s.exitTangent('tail');
       await s.enterTangent('other');
       await drain(s.prompt({ text: 'unrelated question' }));
-      assert.doesNotMatch(lastUserText(sb), /tangent-tail/);
+      assert.match(lastUserText(sb), /<tangent-tail name="research">[\s\S]*User: finding FOUND_X[\s\S]*unrelated question/);
       await s.exitTangent('discard');
       await drain(s.prompt({ text: 'back-in-main' }));
       assert.match(lastUserText(sb), /<tangent-tail name="research">[\s\S]*User: finding FOUND_X[\s\S]*back-in-main/);
@@ -465,7 +466,7 @@ describe('C17: /hooks run on an agent-action Manual hook', () => {
     sb.write('.kiro/hooks/m.json', JSON.stringify({ version: 'v1', hooks: [{ name: 'ask', trigger: 'Manual', action: { type: 'agent', prompt: 'Review the code' } }] }));
     const { s } = await open(sb);
     try {
-      assert.equal(await s.runManualHook('ask'), 'Review the code');
+      assert.deepEqual(await s.runManualHook('ask'), { kind: 'agent', prompt: 'Review the code' });
       assert.equal(sb.userLines().length, 0, 'running the hook sends nothing by itself');
       await drain(s.prompt({ text: 'what is 2+2' }));
       assert.doesNotMatch(lastUserText(sb), /Review the code/);

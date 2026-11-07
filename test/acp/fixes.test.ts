@@ -7,7 +7,11 @@
  *  3. `usage_update` is refreshed from Claude's `get_context_usage` after every turn;
  *  4. subagent inner MCP calls use the session's Claude ⇄ Kiro MCP server name map;
  *  5. `_kiro.dev/subagent/list_update` is the current list: finished subagents are reported once
- *     as `completed`, then pruned.
+ *     as `completed`, then pruned;
+ *  6. the stuck-cancel restart resumes the record's per-agent trust and never re-applies the
+ *     launch `--trust-tools` to the agent active now (F2);
+ *  7. `PromptResponse.usage` and `turnDurationMs` cover every Claude turn of the prompt request
+ *     (held-steer and Stop-hook continuations) (F6).
  * Integration tests run the REAL session module with test/fixtures/fake-claude.mjs; the others
  * use the mock session (test/acp/mockSession.ts).
  */
@@ -415,4 +419,250 @@ test('_kiro.dev/subagent/list_update lists current subagents: a finished one is 
   await promptReq(c, sid, 'second');
   assert.deepEqual(lists().slice(6), [['t4:working'], []]);
   assert.equal(await c.close(), 0);
+});
+
+// ───────────────────────────── 6. stuck-cancel restart keeps per-agent trust (F2) ─────────────────────────────
+
+/** `--trust-tools shell` on kc-a; kc-a and kc-b both ask for everything else (`allowedTools: []`). */
+function trustE2E(answer: () => string = () => 'allow_once'): E2E & { asks: () => number } {
+  const t = tmpEnv({
+    FAKE_CLAUDE_SCRIPT_JSON: JSON.stringify({
+      turns: [
+        { repeat: true, match: 'RUN', steps: [{ tool: { name: 'Bash', input: { command: 'echo hi' } } }, { text: 'ran' }] },
+        { repeat: true, match: 'HANG', steps: [{ text: 'starting' }, { sleepMs: 120_000 }, { text: 'late' }] },
+      ],
+    }),
+    FAKE_CLAUDE_PERSIST: '1',
+    // the child never acts on the interrupt (05 §4.6 step 5 path)
+    FAKE_CLAUDE_CONTROL_DELAYS: JSON.stringify({ interrupt: 120_000 }),
+  });
+  const log = path.join(t.root, 'fake-claude.jsonl');
+  t.env.FAKE_CLAUDE_LOG = log;
+  writeAgent(path.join(t.work, '.kiro'), 'kc-a', { description: 'a', tools: ['*'], allowedTools: [], includeMcpJson: false });
+  writeAgent(path.join(t.work, '.kiro'), 'kc-b', { description: 'b', tools: ['*'], allowedTools: [], includeMcpJson: false });
+  let asks = 0;
+  const c = new TestClient({
+    args: ['--agent-engine', 'v2', '--agent', 'kc-a', '--trust-tools', 'shell'],
+    env: t.env,
+    cwd: t.work,
+    timings: { cancelGraceMs: 300 },
+    onPermission: () => {
+      asks++;
+      return { outcome: { outcome: 'selected', optionId: answer() } };
+    },
+  });
+  clients.push(c);
+  return { t, c, log, asks: () => asks };
+}
+
+async function runShell(c: TestClient, sid: string): Promise<void> {
+  const r = await promptReq(c, sid, 'RUN');
+  assert.equal(r.result?.stopReason, 'end_turn', JSON.stringify(r));
+}
+
+async function hangAndCancel(c: TestClient, sid: string): Promise<void> {
+  const from = c.frames.length;
+  const hung = promptReq(c, sid, 'HANG');
+  await c.waitFor((f) => isUpdate('agent_message_chunk')(f) && f.params.update.content.text.includes('starting'), 20_000, 'HANG started', from);
+  c.notify('session/cancel', { sessionId: sid });
+  assert.deepEqual((await hung).result, { stopReason: 'cancelled' });
+}
+
+test('stuck-cancel restart does not re-apply the launch --trust-tools to the agent set_mode switched to (F2)', { skip, timeout: 90_000 }, async () => {
+  const e = trustE2E();
+  await e.c.initialize();
+  const sid = (await e.c.call('session/new', { cwd: e.t.work, mcpServers: [] }, 30_000)).sessionId as string;
+  await runShell(e.c, sid);
+  assert.equal(e.asks(), 0, 'kc-a: shell trusted by --trust-tools');
+  await e.c.call('session/set_mode', { sessionId: sid, modeId: 'kc-b' }, 30_000);
+  await runShell(e.c, sid);
+  assert.equal(e.asks(), 1, 'kc-b: shell asks (per-agent trust)');
+
+  await hangAndCancel(e.c, sid);
+  await runShell(e.c, sid); // the first prompt on the re-created session
+  assert.ok(streamStarts(e.log).some((s) => (s.argv as string[]).includes('--resume')), 'Claude Code was restarted with --resume');
+  assert.equal(e.asks(), 2, 'kc-b after the restart: shell still asks');
+  const rec = JSON.parse(fs.readFileSync(path.join(e.t.kiroHome, 'sessions', 'cli', `${sid}.json`), 'utf8')) as Frame;
+  assert.equal(rec.agent, 'kc-b');
+  assert.ok(!(rec.trust.allowedTools as string[]).includes('execute_bash'), `kc-b's own trust is untouched: ${JSON.stringify(rec.trust)}`);
+  assert.ok((rec.trust.byAgent['kc-a'].allowedTools as string[]).includes('execute_bash'), 'kc-a keeps its --trust-tools trust');
+  await e.c.call('session/set_mode', { sessionId: sid, modeId: 'kc-a' }, 30_000);
+  await runShell(e.c, sid);
+  assert.equal(e.asks(), 2, 'back on kc-a: shell is still trusted');
+  await finish(e);
+});
+
+test('stuck-cancel restart of the first prompt keeps the launch --trust-tools trust (it comes back with the record) (F2)', { skip, timeout: 90_000 }, async () => {
+  const e = trustE2E();
+  await e.c.initialize();
+  const sid = (await e.c.call('session/new', { cwd: e.t.work, mcpServers: [] }, 30_000)).sessionId as string;
+  await hangAndCancel(e.c, sid);
+  await runShell(e.c, sid);
+  assert.equal(e.asks(), 0, 'kc-a after the restart: shell still trusted');
+  await finish(e);
+});
+
+test('stuck-cancel restart keeps an allow_always grant made under the set_mode agent (it comes back with the record) (F2)', { skip, timeout: 90_000 }, async () => {
+  let answer = 'allow_always';
+  const e = trustE2E(() => answer);
+  await e.c.initialize();
+  const sid = (await e.c.call('session/new', { cwd: e.t.work, mcpServers: [] }, 30_000)).sessionId as string;
+  await e.c.call('session/set_mode', { sessionId: sid, modeId: 'kc-b' }, 30_000);
+  await runShell(e.c, sid);
+  assert.equal(e.asks(), 1, 'kc-b asks once: allow_always');
+  answer = 'allow_once';
+  await hangAndCancel(e.c, sid);
+  await runShell(e.c, sid);
+  assert.equal(e.asks(), 1, 'kc-b after the restart: the allow_always grant still holds');
+  await e.c.call('session/set_mode', { sessionId: sid, modeId: 'kc-a' }, 30_000);
+  await runShell(e.c, sid);
+  assert.equal(e.asks(), 1, 'kc-a: still trusted by --trust-tools');
+  await finish(e);
+});
+
+test('hung child (mock): the replacement resumes without the launch --trust-tools (the record carries per-agent trust) (F2)', { timeout: 30_000 }, async () => {
+  const t = tmpEnv();
+  writeAgent(path.join(t.work, '.kiro'), 'probe', { description: 'probe', tools: ['*'], includeMcpJson: false });
+  const world = createWorld([{ match: /PING/, steps: [{ text: 'PONG' }] }]);
+  const c = new TestClient({ args: ['--agent', 'probe', '--trust-tools', 'shell,read'], env: t.env, cwd: t.work, createSession: hangingFactory(world), timings: { cancelGraceMs: 100 } });
+  clients.push(c);
+  await c.initialize();
+  const sid = (await c.call('session/new', { cwd: t.work, mcpServers: [] })).sessionId as string;
+  const hung = promptReq(c, sid, 'HANG', 10_000);
+  await c.waitFor((f) => isUpdate('agent_message_chunk')(f) && f.params.update.content.text === 'starting', 5_000, 'hung turn started');
+  c.notify('session/cancel', { sessionId: sid });
+  assert.deepEqual((await hung).result, { stopReason: 'cancelled' });
+  assert.equal((await promptReq(c, sid, 'PING', 10_000)).result?.stopReason, 'end_turn');
+  assert.deepEqual(world.created[0]!.trustTools, ['shell', 'read'], 'a new session gets the launch flag');
+  assert.deepEqual(world.created[1]!.resume, { sessionId: sid });
+  assert.equal(world.created[1]!.trustTools, undefined, 'the resumed record is not re-trusted with the launch flag');
+  assert.equal(await c.close(), 0);
+});
+
+// ───────────────────────────── 7. prompt usage / duration cover every Claude turn (F6) ─────────────────────────────
+
+const U = (input: number, output: number, read = 0, write = 0) => ({ inputTokens: input, outputTokens: output, cacheReadTokens: read, cacheCreationTokens: write });
+
+test('held-steer continuation (mock): PromptResponse.usage sums every Claude turn of the prompt; turnDurationMs is the prompt wall time (F6)', { timeout: 30_000 }, async () => {
+  const t = tmpEnv();
+  writeAgent(path.join(t.work, '.kiro'), 'probe', { description: 'probe', tools: ['*'], includeMcpJson: false });
+  const world = createWorld([
+    { match: /pineapple/, steps: [{ text: 'second' }, { raw: { type: 'result', subtype: 'success', duration_ms: 1 } }, { result: { usage: U(200, 3, 50, 5) } }] },
+    { steps: [{ sleepMs: 250 }, { text: 'first' }, { raw: { type: 'result', subtype: 'success', duration_ms: 2 } }, { result: { usage: U(100, 15, 10, 1) } }] },
+  ]);
+  const c = new TestClient({ args: ['--agent', 'probe'], env: t.env, cwd: t.work, createSession: mockFactory(world) });
+  clients.push(c);
+  await c.initialize();
+  const sid = (await c.call('session/new', { cwd: t.work, mcpServers: [] })).sessionId as string;
+  const t0 = Date.now();
+  const p = promptReq(c, sid, 'go', 10_000);
+  await until(() => world.sessions[0]!.turnCount === 1, 5_000, 'first turn');
+  await c.call('_session/steer', { sessionId: sid, message: 'say pineapple' });
+  const r = await p;
+  const wall = Date.now() - t0;
+  assert.equal(r.result.stopReason, 'end_turn');
+  assert.equal(world.sessions[0]!.turnCount, 2, 'the held steer ran as a continuation');
+  assert.deepEqual(r.result.usage, { totalTokens: 300 + 18 + 60 + 6, inputTokens: 300, outputTokens: 18, cachedReadTokens: 60, cachedWriteTokens: 6 });
+  const durs = c.notifications('_kiro.dev/metadata').filter((f) => 'turnDurationMs' in f.params).map((f) => f.params.turnDurationMs as number);
+  assert.equal(durs.length, 1);
+  assert.ok(durs[0]! >= 200 && durs[0]! <= wall, `turnDurationMs ${durs[0]} is the prompt's duration (wall ${wall} ms), not the last Claude result's duration_ms`);
+  assert.equal(await c.close(), 0);
+});
+
+/** `result` frames the fake claude wrote (FAKE_CLAUDE_LOG_STDOUT=1): what Claude reported per turn. */
+const fakeResults = (log: string): Frame[] => fakeLog(log).filter((x) => x.event === 'stdout' && x.frame?.type === 'result').map((x) => x.frame as Frame);
+const sumOf = (rs: Frame[], k: string): number => rs.reduce((a, r) => a + ((r.usage?.[k] as number | undefined) ?? 0), 0);
+
+test('held-steer continuation (real session): PromptResponse.usage and turnDurationMs cover both Claude turns (F6)', { skip, timeout: 60_000 }, async () => {
+  const e = e2e(
+    {
+      turns: [
+        { match: '^TASK', steps: [{ text: 'first part of a long answer here' }, { sleepMs: 600 }, { text: 'and the rest of it' }] },
+        { match: 'PAPAYA', steps: [{ text: 'PAPAYA' }] },
+      ],
+    },
+    { FAKE_CLAUDE_LOG_STDOUT: '1' },
+  );
+  await e.c.initialize();
+  const sid = (await e.c.call('session/new', { cwd: e.t.work, mcpServers: [] }, 30_000)).sessionId as string;
+  const t0 = Date.now();
+  const p = promptReq(e.c, sid, 'TASK: answer');
+  await e.c.waitFor(isUpdate('agent_message_chunk'), 15_000, 'first chunk');
+  assert.deepEqual(await e.c.call('_session/steer', { sessionId: sid, message: 'say PAPAYA' }), { queued: true });
+  const r = await p;
+  const wall = Date.now() - t0;
+  assert.equal(r.result.stopReason, 'end_turn');
+  const results = fakeResults(e.log);
+  assert.equal(results.length, 2, 'two Claude turns ran for this prompt');
+  assert.match(e.c.updates('agent_message_chunk', sid).map((u) => u.content.text).join(''), /PAPAYA/);
+  assert.equal(r.result.usage.outputTokens, sumOf(results, 'output_tokens'));
+  assert.equal(r.result.usage.inputTokens, sumOf(results, 'input_tokens'));
+  const durs = e.c.notifications('_kiro.dev/metadata').filter((f) => 'turnDurationMs' in f.params).map((f) => f.params.turnDurationMs as number);
+  const claudeMs = results.reduce((a, x) => a + (x.duration_ms as number), 0);
+  assert.ok(durs.at(-1)! >= claudeMs && durs.at(-1)! <= wall, `turnDurationMs ${durs.at(-1)} covers both Claude turns (${results.map((x) => x.duration_ms)}; wall ${wall})`);
+  await finish(e);
+});
+
+test('Stop-hook continuation (real session): PromptResponse.usage covers both Claude turns (F6)', { skip, timeout: 60_000 }, async () => {
+  const e = e2e(
+    {
+      turns: [
+        { match: '^start', steps: [{ text: 'first answer with several words in it' }] },
+        { match: '^keep going', steps: [{ text: 'continued' }] },
+      ],
+    },
+    { FAKE_CLAUDE_LOG_STDOUT: '1' },
+  );
+  const marker = path.join(e.t.root, 'stop-once');
+  fs.mkdirSync(path.join(e.t.work, '.kiro', 'hooks'), { recursive: true });
+  fs.writeFileSync(
+    path.join(e.t.work, '.kiro', 'hooks', 'stop.json'),
+    JSON.stringify({ version: 'v1', hooks: [{ name: 'more', trigger: 'Stop', action: { type: 'command', command: `if [ ! -f ${marker} ]; then touch ${marker}; echo '{"decision":"block","reason":"keep going"}'; fi` } }] }),
+  );
+  await e.c.initialize();
+  const sid = (await e.c.call('session/new', { cwd: e.t.work, mcpServers: [] }, 30_000)).sessionId as string;
+  const r = await promptReq(e.c, sid, 'start');
+  assert.equal(r.result.stopReason, 'end_turn');
+  const results = fakeResults(e.log);
+  assert.equal(results.length, 2, 'two Claude turns ran for this prompt (Stop-hook continuation)');
+  assert.equal(r.result.usage.outputTokens, sumOf(results, 'output_tokens'));
+  assert.equal(r.result.usage.inputTokens, sumOf(results, 'input_tokens'));
+  await finish(e);
+});
+
+test('Stop-hook continuation AND a held-steer continuation in one prompt: PromptResponse.usage and turnDurationMs cover all three Claude turns (F6)', { skip, timeout: 60_000 }, async () => {
+  const e = e2e(
+    {
+      turns: [
+        { match: '^start', steps: [{ text: 'first part of a long answer here' }, { sleepMs: 600 }, { text: 'and the rest of it' }] },
+        { match: '^keep going', steps: [{ text: 'continued after the hook' }] },
+        { match: 'PAPAYA', steps: [{ text: 'PAPAYA' }] },
+      ],
+    },
+    { FAKE_CLAUDE_LOG_STDOUT: '1' },
+  );
+  const marker = path.join(e.t.root, 'stop-once');
+  fs.mkdirSync(path.join(e.t.work, '.kiro', 'hooks'), { recursive: true });
+  fs.writeFileSync(
+    path.join(e.t.work, '.kiro', 'hooks', 'stop.json'),
+    JSON.stringify({ version: 'v1', hooks: [{ name: 'more', trigger: 'Stop', action: { type: 'command', command: `if [ ! -f ${marker} ]; then touch ${marker}; echo '{"decision":"block","reason":"keep going"}'; fi` } }] }),
+  );
+  await e.c.initialize();
+  const sid = (await e.c.call('session/new', { cwd: e.t.work, mcpServers: [] }, 30_000)).sessionId as string;
+  const t0 = Date.now();
+  const p = promptReq(e.c, sid, 'start now');
+  await e.c.waitFor(isUpdate('agent_message_chunk'), 15_000, 'first chunk');
+  assert.deepEqual(await e.c.call('_session/steer', { sessionId: sid, message: 'say PAPAYA' }), { queued: true });
+  const r = await p;
+  const wall = Date.now() - t0;
+  assert.equal(r.result.stopReason, 'end_turn');
+  const results = fakeResults(e.log);
+  assert.equal(results.length, 3, 'the first turn, the Stop-hook continuation and the held-steer continuation');
+  assert.match(e.c.updates('agent_message_chunk', sid).map((u) => u.content.text).join(''), /continued after the hook[\s\S]*PAPAYA/);
+  assert.equal(r.result.usage.outputTokens, sumOf(results, 'output_tokens'), 'each Claude turn counted once');
+  assert.equal(r.result.usage.inputTokens, sumOf(results, 'input_tokens'));
+  const durs = e.c.notifications('_kiro.dev/metadata').filter((f) => 'turnDurationMs' in f.params).map((f) => f.params.turnDurationMs as number);
+  const claudeMs = results.reduce((a, x) => a + (x.duration_ms as number), 0);
+  assert.ok(durs.at(-1)! >= claudeMs && durs.at(-1)! <= wall, `turnDurationMs ${durs.at(-1)} (Claude ${results.map((x) => x.duration_ms)}; wall ${wall})`);
+  await finish(e);
 });

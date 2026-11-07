@@ -14,6 +14,7 @@ import type { CliContext } from '../../src/types.js';
 import { stripAnsi } from '../../src/util/ansi.js';
 import { fakeClaudePath, fakeEnv } from '../claude/helpers.js';
 import { tempEnv } from './harness.js';
+import { DESIGN_MD, REQ_MD, TASKS_MD } from '../spec/helpers.js';
 
 async function drive(script: unknown, lines: string[], extraEnv: Record<string, string> = {}): Promise<{ code: number; out: string; log: Record<string, unknown>[]; t: ReturnType<typeof tempEnv> }> {
   const t = tempEnv();
@@ -120,11 +121,17 @@ test('e2e: a free-text answer redirects once (sent by the session, not duplicate
 // ───────────────────── Ctrl+C during commands and stuck turns (C11, C16) ─────────────────────
 
 /** The real runRepl over a live stdin (written step by step) and fake claude. */
-function live(script: unknown, opts: { tty?: boolean; extraEnv?: Record<string, string>; trustTools?: string[] } = {}) {
+function live(script: unknown, opts: { tty?: boolean; extraEnv?: Record<string, string>; trustTools?: string[]; isolate?: boolean } = {}) {
   const t = tempEnv();
   const logFile = path.join(t.root, 'fake.log');
+  // `isolate`: KIRO_HOME and the XDG runtime / cache dirs inside the temp root as well
+  const isolated: Record<string, string> = opts.isolate
+    ? { KIRO_HOME: path.join(t.home, '.kiro'), XDG_RUNTIME_DIR: path.join(t.root, 'run'), XDG_CACHE_HOME: path.join(t.root, 'cache') }
+    : {};
+  if (isolated.XDG_RUNTIME_DIR) fs.mkdirSync(isolated.XDG_RUNTIME_DIR, { recursive: true, mode: 0o700 });
   const env = fakeEnv({
     ...t.env,
+    ...isolated,
     FAKE_CLAUDE_SCRIPT_JSON: JSON.stringify(script),
     FAKE_CLAUDE_LOG: logFile,
     FAKE_CLAUDE_PERSIST: '1',
@@ -376,6 +383,166 @@ test('e2e: the restart after a forced stop keeps the trust as it was: a launch-t
     r.line('next');
     await r.waitFor(/second answer[\s\S]*> $/, 15_000, mark);
     assert.equal(await shellLabel(), untrusted, 'the launch trust must not come back over the user\'s /tools untrust');
+    r.line('/quit');
+    assert.equal(await r.exit, 0);
+  } finally {
+    r.end();
+    await r.exit.catch(() => undefined);
+    r.t.cleanup();
+  }
+});
+
+// ───────────── Ctrl+C during a command whose work runs in another session (F0) ─────────────
+
+const userLines = (log: Record<string, unknown>[]): string[] =>
+  log
+    .filter((e) => e.event === 'stdin' && (e.line as { type?: string })?.type === 'user')
+    .map((e) => JSON.stringify((e.line as { message?: { content?: unknown } }).message?.content ?? ''));
+
+function writeTodoSpec(r: ReturnType<typeof live>): void {
+  const dir = path.join(r.t.wsDir, '.kiro', 'specs', 'todo-export');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'requirements.md'), REQ_MD);
+  fs.writeFileSync(path.join(dir, 'design.md'), DESIGN_MD);
+  fs.writeFileSync(path.join(dir, 'tasks.md'), TASKS_MD);
+}
+
+const MAIN_AND_TASKS = {
+  turns: [
+    { repeat: true, match: 'Execute Task: (1\\.1|2\\.1)', steps: [{ text: 'done\nTASK_RESULT: completed' }] },
+    { repeat: true, match: 'main', steps: [{ text: 'MAIN-ANSWER to {{userText}}' }] },
+  ],
+};
+
+test('e2e: the first Ctrl+C while /spec run starts a task session stops the run; the second never stops the idle main session (F0)', { timeout: 60_000 }, async () => {
+  // initialize answered late: spawning a task session's Claude Code takes a while, like the real claude
+  const r = live(MAIN_AND_TASKS, { isolate: true, extraEnv: { FAKE_CLAUDE_CONTROL_DELAYS: JSON.stringify({ initialize: 2000 }) } });
+  try {
+    writeTodoSpec(r);
+    await r.waitFor(/> $/);
+    r.line('first main');
+    await r.waitFor(/MAIN-ANSWER to first main[\s\S]*> $/);
+    const mark = r.o().length;
+    r.line('/spec run todo-export 1.1 2.1');
+    await r.waitFor(/▶ Task 1\.1/, 10_000, mark);
+    await sleepMs(300); // the task session is still starting
+    r.ctrlC();
+    await sleepMs(50);
+    r.ctrlC();
+    await r.waitFor(/Spec run finished[\s\S]*> $/, 15_000, mark);
+    await sleepMs(1500); // past the forced-stop grace
+    const after = r.o().slice(mark);
+    assert.match(after, /✗ Task 1\.1 interrupted/);
+    assert.ok(!/▶ Task 2\.1/.test(after), `the run went on to the next task after the Ctrl+C:\n${after}`);
+    assert.ok(!/did not stop|Failed to execute command/.test(after), `the idle main session was stopped:\n${after}`);
+    assert.ok(!/To exit the CLI/.test(after), after);
+    assert.ok(!userLines(r.log()).some((u) => u.includes('Execute Task')), 'no task turn was sent');
+    const m2 = r.o().length;
+    r.line('back to main');
+    await r.waitFor(/MAIN-ANSWER to back to main[\s\S]*> $/, 15_000, m2);
+    assert.ok(!/The session is closed/.test(r.o().slice(m2)), r.o().slice(m2));
+    r.line('/quit');
+    assert.equal(await r.exit, 0);
+  } finally {
+    r.end();
+    await r.exit.catch(() => undefined);
+    r.t.cleanup();
+  }
+});
+
+test('e2e: a double Ctrl+C while /chat new starts its session reports no failure and never stops the idle session (F0)', { timeout: 60_000 }, async () => {
+  const r = live(MAIN_AND_TASKS, { isolate: true, extraEnv: { FAKE_CLAUDE_CONTROL_DELAYS: JSON.stringify({ initialize: 3000 }) } });
+  try {
+    await r.waitFor(/> $/);
+    r.line('first main');
+    await r.waitFor(/MAIN-ANSWER to first main[\s\S]*> $/);
+    const mark = r.o().length;
+    r.line('/chat new');
+    await sleepMs(300);
+    r.ctrlC();
+    await sleepMs(50);
+    r.ctrlC();
+    await r.waitFor(/Started a new chat session[\s\S]*> $/, 15_000, mark);
+    const after = r.o().slice(mark);
+    assert.ok(!/did not stop|Failed to execute command/.test(after), after);
+    assert.ok(!/To exit the CLI/.test(after), after);
+    const m2 = r.o().length;
+    r.line('main again');
+    await r.waitFor(/MAIN-ANSWER to main again[\s\S]*> $/, 15_000, m2);
+    r.line('/quit');
+    assert.equal(await r.exit, 0);
+  } finally {
+    r.end();
+    await r.exit.catch(() => undefined);
+    r.t.cleanup();
+  }
+});
+
+test('e2e: Ctrl+C while /spec new --type quick starts its questions session cancels the flow; no turn is sent and the REPL goes on (F0/F3)', { timeout: 60_000 }, async () => {
+  const script = {
+    turns: [
+      { repeat: true, match: 'Quick Spec', steps: [{ text: 'QUESTIONS [1]: a / b' }] },
+      { repeat: true, match: 'Phase: REQUIREMENTS', steps: [{ text: 'DRAFTING-REQUIREMENTS' }] },
+      { repeat: true, match: 'main', steps: [{ text: 'MAIN-ANSWER to {{userText}}' }] },
+    ],
+  };
+  const r = live(script, { isolate: true, extraEnv: { FAKE_CLAUDE_CONTROL_DELAYS: JSON.stringify({ initialize: 1500 }) } });
+  try {
+    await r.waitFor(/> $/);
+    r.line('first main');
+    await r.waitFor(/MAIN-ANSWER to first main[\s\S]*> $/);
+    const mark = r.o().length;
+    r.line('/spec new my-feature --type quick do it');
+    await r.waitFor(/Created \.kiro\/specs\/my-feature/, 10_000, mark);
+    await sleepMs(300); // the questions turn's session is still starting
+    r.ctrlC();
+    await r.waitFor(/✗ Quick Spec clarifying questions failed: interrupted[\s\S]*> $/, 20_000, mark);
+    const after = r.o().slice(mark);
+    assert.ok(!/QUESTIONS|DRAFTING-REQUIREMENTS|Answer with/.test(after), after);
+    assert.ok(!userLines(r.log()).some((u) => u.includes('Quick Spec') || u.includes('Phase: REQUIREMENTS')), 'a spec turn was sent after the Ctrl+C');
+    assert.ok(!/To exit the CLI|did not stop/.test(after), after);
+    const m2 = r.o().length;
+    r.line('back to main');
+    await r.waitFor(/MAIN-ANSWER to back to main[\s\S]*> $/, 15_000, m2);
+    r.line('/quit');
+    assert.equal(await r.exit, 0);
+  } finally {
+    r.end();
+    await r.exit.catch(() => undefined);
+    r.t.cleanup();
+  }
+});
+
+test('e2e: a /spec run task turn that ignores the interrupt is stopped by the second Ctrl+C; only the task session is closed and the run stops (F0, C16)', { timeout: 60_000 }, async () => {
+  const script = {
+    turns: [
+      { repeat: true, match: 'Execute Task: 1\\.1', steps: [{ text: 'working on 1.1' }, { sleepMs: 100000 }, { text: 'TASK_RESULT: completed' }] },
+      { repeat: true, match: 'Execute Task: 2\\.1', steps: [{ text: 'TASK_RESULT: completed' }] },
+      { repeat: true, match: 'main', steps: [{ text: 'MAIN-ANSWER to {{userText}}' }] },
+    ],
+  };
+  const r = live(script, { isolate: true, extraEnv: { FAKE_CLAUDE_CONTROL_DELAYS: JSON.stringify({ interrupt: 120000 }) } });
+  try {
+    writeTodoSpec(r);
+    await r.waitFor(/> $/);
+    r.line('first main');
+    await r.waitFor(/MAIN-ANSWER to first main[\s\S]*> $/);
+    const mark = r.o().length;
+    r.line('/spec run todo-export 1.1 2.1');
+    await r.waitFor(/working on 1\.1/, 15_000, mark);
+    r.ctrlC();
+    await sleepMs(100);
+    r.ctrlC();
+    await r.waitFor(/Spec run finished[\s\S]*> $/, 20_000, mark);
+    const after = r.o().slice(mark);
+    assert.match(after, /stopping it\./);
+    assert.match(after, /✗ Task 1\.1 interrupted/);
+    assert.ok(!/▶ Task 2\.1/.test(after), after);
+    assert.ok(!/Failed to execute command/.test(after), `the command was abandoned:\n${after}`);
+    const m2 = r.o().length;
+    r.line('back to main');
+    await r.waitFor(/MAIN-ANSWER to back to main[\s\S]*> $|The session is closed/, 20_000, m2);
+    assert.match(r.o().slice(m2), /MAIN-ANSWER to back to main/, r.o().slice(m2));
     r.line('/quit');
     assert.equal(await r.exit, 0);
   } finally {

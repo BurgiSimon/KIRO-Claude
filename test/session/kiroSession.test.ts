@@ -626,7 +626,7 @@ describe('session: events and tracking', () => {
       assert.equal(models[0]!.kiroId, 'auto');
       assert.ok(models.some((m) => m.kiroId === 'claude-haiku-5.5'));
       assert.deepEqual(s.hooks(), []);
-      await assert.rejects(s.runManualHook('nope'), /No manual hook named nope/);
+      assert.deepEqual(await s.runManualHook('nope'), { kind: 'not-found' });
     } finally {
       await closeAll(s);
     }

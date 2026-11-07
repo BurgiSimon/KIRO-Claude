@@ -238,6 +238,22 @@ test('new --yes with session flags; name normalization; bugfix and quick types',
   }
 });
 
+test('new --type quick (TTY): a cancelled clarifying-questions turn ends the spec with exit 1; no document turn is sent (F3)', async () => {
+  const log: string[] = [];
+  const r = rig({ log, override: (i) => (/^Quick Spec/.test(i.text) ? { text: '[1]: partial', stopReason: 'cancelled' } : undefined) }, { isTTY: true });
+  try {
+    (r.ctx.stdin as unknown as PassThrough).end(); // nothing more is typed: a later question would read EOF
+    const code = await runSpecCommandWith(['new', 'my-feature', '--type', 'quick', '--description', 'do it'], r.ctx, r.deps);
+    assert.deepEqual(log.map((t) => t.replace(/^(Quick Spec|Phase: [A-Z]+).*$/, '$1')), ['Quick Spec'], `turns sent:\n${r.out.data}\n${r.err.data}`);
+    assert.equal(code, 1);
+    assert.ok(`${r.out.data}${r.err.data}`.includes('✗ Quick Spec clarifying questions failed: interrupted'), `${r.out.data}\n${r.err.data}`);
+    assert.equal(fs.existsSync(path.join(r.w.specs, 'my-feature', 'requirements.md')), false);
+    assert.ok(r.sessions.every((s) => s.closed), 'the CLI closes its sessions');
+  } finally {
+    r.w.cleanup();
+  }
+});
+
 test('run: exit codes, summary on stdout, hooks from config are optional', async () => {
   const r = rig({ taskText: { '2.1': 'nope\nTASK_RESULT: blocked - flaky test' } });
   try {

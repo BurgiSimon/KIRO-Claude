@@ -134,6 +134,11 @@ export interface SpecRuntime {
   readonly commandPrefix: string;
   /** Max concurrently running task sessions per wave. */
   readonly maxParallelTasks: number;
+  /**
+   * The host's Ctrl+C for the running command (REPL: the slash command's signal): the default of
+   * {@link RunOptions.signal} for task runs.
+   */
+  readonly signal?: AbortSignal | undefined;
   print(text: string): void;
   /** Final results (findings, run summary). Defaults to print. */
   result?(text: string): void;
@@ -586,23 +591,37 @@ export async function createNewSpec(rt: SpecRuntime, req: NewSpecRequest): Promi
   if (req.useConversation) o.useConversation = true;
   const c = flowCtx(rt, s, o);
   return withFinish(rt, async () => {
-    if (c.quick) await quickClarify(c);
+    if (c.quick) {
+      // a cancelled (Ctrl+C) or failed questions turn ends the flow like a failed phase turn:
+      // no document is drafted after it (CLI exit 1)
+      const fail = await quickClarify(c);
+      if (fail) {
+        c.trace.push({ state: 'error' });
+        c.rt.print(`✗ Quick Spec clarifying questions failed: ${fail}`);
+        return result(c, 'error', { message: fail });
+      }
+    }
     return phaseLoop(c, c.order[0]!, true);
   });
 }
 
-/** Quick Spec clarifying-questions turn (03 §1.10.7); answers feed the requirements prompt. */
-async function quickClarify(c: FlowCtx): Promise<void> {
+/**
+ * Quick Spec clarifying-questions turn (03 §1.10.7); answers feed the requirements prompt.
+ * Returns why the turn failed ({@link turnFailure}), else undefined.
+ */
+async function quickClarify(c: FlowCtx): Promise<string | undefined> {
   if (!c.rt.interactive) {
     c.prompt.clarifications =
       'No clarifying questions were asked (non-interactive run): use your recommended defaults for every open question and state the assumptions in the Introduction.';
-    return;
+    return undefined;
   }
   const r = await specTurn(c.rt, specInput(c, quickQuestionsPrompt({ desc: c.prompt.desc })), { name: 'quick-questions', allowedWritePaths: [] });
-  if (turnFailure(r)) return;
+  const fail = turnFailure(r);
+  if (fail) return fail;
   const ans = (await c.rt.ask('Answer with "1=a, 2=b", your own answers, or "skip":')).trim();
   c.prompt.clarifications =
     ans === '' || ans.toLowerCase() === 'skip' ? 'The user skipped the questions: use your recommended defaults for every open question.' : ans;
+  return undefined;
 }
 
 export interface ResumeOptions {
@@ -882,7 +901,7 @@ export interface RunSummary {
 }
 
 export interface RunOptions {
-  /** Stop scheduling new tasks; running ones are interrupted. */
+  /** Stop scheduling new tasks; running ones are interrupted. Default: {@link SpecRuntime.signal}. */
   signal?: AbortSignal;
 }
 
@@ -1050,13 +1069,14 @@ export async function runSpecTasks(rt: SpecRuntime, name: string, sel: TaskSelec
   const outcomes: TaskOutcome[] = [];
   const running = new Set<TaskSessionHandle>();
   let stop = false;
+  const signal = opts.signal ?? rt.signal;
   const onAbort = (): void => {
     stop = true;
     for (const h of running) void h.interrupt?.().catch(() => undefined);
   };
-  if (opts.signal) {
-    if (opts.signal.aborted) stop = true;
-    else opts.signal.addEventListener('abort', onAbort, { once: true });
+  if (signal) {
+    if (signal.aborted) stop = true;
+    else signal.addEventListener('abort', onAbort, { once: true });
   }
   try {
     for (const step of plan.steps) {
@@ -1069,7 +1089,7 @@ export async function runSpecTasks(rt: SpecRuntime, name: string, sel: TaskSelec
           const t = tasks[idx++]!;
           let o: TaskOutcome;
           try {
-            o = await executeTask(rt, spec, t, isOptionalTask(t, parsed.byId), running, opts.signal);
+            o = await executeTask(rt, spec, t, isOptionalTask(t, parsed.byId), running, signal);
           } catch (e) {
             // never let one task's unexpected error reject the wave while sibling workers keep running
             o = { id: t.id, title: t.title, status: 'failed', reason: e instanceof Error ? e.message : String(e) };
@@ -1082,7 +1102,7 @@ export async function runSpecTasks(rt: SpecRuntime, name: string, sel: TaskSelec
       await Promise.all(Array.from({ length: Math.min(width, tasks.length) }, () => worker()));
     }
   } finally {
-    opts.signal?.removeEventListener('abort', onAbort);
+    signal?.removeEventListener('abort', onAbort);
   }
   const after = taskProgress(parseTasks(fs.readFileSync(s.docs.tasks.path, 'utf8')));
   const remainingRequired = after.requiredTotal - after.requiredDone;
@@ -1118,16 +1138,31 @@ export function editorOpener(env: NodeJS.ProcessEnv): ((file: string) => Promise
 }
 
 /**
+ * The REPL's per-command Ctrl+C signal (repl/types.ts ReplContext.commandSignal). ReplHost (the
+ * shared contract) does not declare it, so it is read duck-typed; undefined for other hosts.
+ */
+function commandSignalOf(host: ReplHost): AbortSignal | undefined {
+  const s = (host as { commandSignal?: unknown }).commandSignal;
+  return s && typeof s === 'object' && typeof (s as AbortSignal).addEventListener === 'function' && 'aborted' in s ? (s as AbortSignal) : undefined;
+}
+
+/**
  * SpecRuntime over a ReplHost: questions through ask/confirm/choose, turns through runTurn (full
  * REPL rendering and y/n/t approvals), task sessions via host.createSession + replaceSession
- * (restored afterwards), one task at a time.
+ * (restored afterwards), one task at a time; the REPL command's Ctrl+C signal stops task runs
+ * and cancels a spec turn whose phase session is still starting.
  */
 export function createReplRuntime(host: ReplHost, deps: ReplRuntimeDeps = {}): SpecRuntime & { readonly driver: SpecSessionDriver } {
+  // The command's Ctrl+C signal when the running spec turn was requested and not aborted yet: a
+  // press while the driver starts the turn's phase session (Claude Code spawning) cancels the turn
+  // before it is sent. A press an earlier turn handled does not cancel the later ones.
+  let turnSignal: AbortSignal | undefined;
   const port: SessionPort = {
     active: () => host.session,
     create: (o) => host.createSession(o),
     activate: (s) => host.replaceSession(s),
-    run: (_s, input) => host.runTurn(input),
+    run: (_s, input) =>
+      turnSignal?.aborted ? Promise.resolve<TurnResult>({ stopReason: 'cancelled', isError: false, text: '', permissionDenials: [] }) : host.runTurn(input),
   };
   const driver = new SpecSessionDriver(port, { phaseOptions: { origin: 'spec' }, finalOptions: {} });
   const factory = deps.hookRunnerFactory ?? ((hooks: readonly KiroHook[]) => new HookRunner([...hooks]));
@@ -1139,11 +1174,22 @@ export function createReplRuntime(host: ReplHost, deps: ReplRuntimeDeps = {}): S
     interactive: true,
     commandPrefix: '/spec',
     maxParallelTasks: 1,
+    get signal() {
+      return commandSignalOf(host);
+    },
     print: (t) => host.print(t),
     ask: (q) => host.ask(q),
     confirm: (q, d) => host.confirm(q, d),
     choose: (q, o) => host.choose(q, o),
-    runSpecTurn: (input, phase, o) => driver.runTurn(input, phase, o),
+    async runSpecTurn(input, phase, o) {
+      const sig = commandSignalOf(host);
+      turnSignal = sig && !sig.aborted ? sig : undefined;
+      try {
+        return await driver.runTurn(input, phase, o);
+      } finally {
+        turnSignal = undefined;
+      }
+    },
     async openTaskSession(): Promise<TaskSessionHandle> {
       const prev = host.session;
       const child = await host.createSession({ origin: 'spec' });

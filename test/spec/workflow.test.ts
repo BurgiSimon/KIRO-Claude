@@ -207,6 +207,76 @@ test('quick spec: questions turn (no writes), then three phases with one final c
   }
 });
 
+test('quick spec: a cancelled or failed questions turn ends the flow; no document turn runs (F3)', async () => {
+  const cases: [string, { text?: string; stopReason: 'cancelled' | 'error'; isError?: boolean; error?: string }, string][] = [
+    ['Ctrl+C', { text: '[1]: partial', stopReason: 'cancelled' }, 'interrupted'],
+    ['usage limit', { stopReason: 'error', isError: true, error: 'usage limit reached' }, 'usage limit reached'],
+  ];
+  for (const [label, turn, message] of cases) {
+    const { w, host, log } = setup({ override: (i) => (/^Quick Spec/.test(i.text) ? { ...turn } : undefined) });
+    try {
+      host.chooseAnswers = ['Approve tasks'];
+      host.askAnswers = ['1=a'];
+      const r = await createNewSpec(createReplRuntime(host, { openEditor: null }), { name: 'quick-one', kind: 'quick', description: 'CSV export' });
+      assert.deepEqual(log.filter((t) => !/^Quick Spec/.test(t)), [], `${label}: turns after the failed questions turn`);
+      assert.equal(r.status, 'error', label);
+      assert.equal(r.message, message, label);
+      assert.deepEqual(states(r), ['error'], label);
+      assert.deepEqual(host.asked, [], `${label}: the answers are not asked for`);
+      assert.equal(host.chosen.length, 0, label);
+      assert.ok(host.text.includes(`✗ Quick Spec clarifying questions failed: ${message}`), host.text);
+      assert.equal(fs.existsSync(path.join(specDir(w, 'quick-one'), 'requirements.md')), false, label);
+    } finally {
+      w.cleanup();
+    }
+  }
+});
+
+test("REPL runtime: Ctrl+C (the command signal) while a spec turn's phase session starts cancels that turn before it is sent (F0/F3)", async () => {
+  for (const kind of ['quick', 'feature'] as const) {
+    const { w, host, log } = setup();
+    try {
+      const ac = new AbortController();
+      // the REPL's per-command signal (repl/core.ts ReplContext.commandSignal), read duck-typed
+      Object.defineProperty(host, 'commandSignal', { get: () => ac.signal, configurable: true });
+      const create = host.createSession.bind(host);
+      // the press lands while the first phase session's Claude Code starts (the driver's fork)
+      host.createSession = async (o) => {
+        const s = await create(o);
+        if (o.specPhase) ac.abort();
+        return s;
+      };
+      const r = await createNewSpec(createReplRuntime(host, { openEditor: null }), { name: 'one', kind, description: 'CSV export' });
+      assert.deepEqual(log, [], `${kind}: a turn was sent after the Ctrl+C`);
+      assert.equal(r.status, 'error', kind);
+      assert.equal(r.message, 'interrupted', kind);
+      assert.ok(host.text.includes(kind === 'quick' ? '✗ Quick Spec clarifying questions failed: interrupted' : '✗ Drafting requirements.md failed: interrupted'), host.text);
+      assert.deepEqual(host.asked, [], kind);
+      assert.equal(host.chosen.length, 0, kind);
+    } finally {
+      w.cleanup();
+    }
+  }
+  // a press handled by an earlier turn that completed anyway (the interrupt came too late) does
+  // not cancel the turns after the user's own approval
+  const ac = new AbortController();
+  const { w, host, log } = setup({
+    override: (i) => {
+      if (/^Phase: REQUIREMENTS/.test(i.text)) ac.abort();
+      return undefined;
+    },
+  });
+  try {
+    Object.defineProperty(host, 'commandSignal', { get: () => ac.signal, configurable: true });
+    host.chooseAnswers = ['Approve and continue to design', 'Approve and continue to tasks', 'Approve tasks'];
+    const r = await createNewSpec(createReplRuntime(host, { openEditor: null }), { name: 'todo-export', kind: 'feature', description: 'd' });
+    assert.equal(r.status, 'ready', host.text);
+    assert.equal(log.length, 3, log.join('\n'));
+  } finally {
+    w.cleanup();
+  }
+});
+
 test('bugfix spec: bugfix.md → design → tasks with bugfix prompts', async () => {
   const { w, host } = setup();
   try {

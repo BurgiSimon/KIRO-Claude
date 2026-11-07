@@ -118,9 +118,12 @@ kiro-claude reads the same files as Kiro CLI:
 
 `KIRO_HOME` moves `~/.kiro`. `kiro-claude settings list --all` shows every setting; those
 described as not supported or ignored are stored (so a `cli.json` shared with Kiro CLI keeps
-working) but have no effect. Three Kiro settings are passed on to Claude Code when you set them:
-`chat.disableAutoCompaction` (as `DISABLE_AUTO_COMPACT`), `mcp.initTimeout` (as `MCP_TIMEOUT`)
-and `api.timeout` (as `API_TIMEOUT_MS`); a variable already set in your environment wins.
+working) but have no effect. These Kiro settings are passed on to Claude Code when you set them:
+`chat.disableAutoCompaction` (as `DISABLE_AUTO_COMPACT`), `api.timeout` (as `API_TIMEOUT_MS`)
+and the MCP start-up limit `MCP_TIMEOUT`, which Claude Code applies as a hard per-server cut-off:
+`mcp.noInteractiveTimeout` for `--no-interactive` runs, `mcp.initTimeout` for interactive and ACP
+sessions, only when above Claude Code's own 30 s default (in Kiro it is a wait before the prompt,
+not a failure). A variable already set in your environment wins.
 
 kiro-claude's own settings live in `kiro-claude.json` next to `cli.json`:
 

@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import type { ApprovalResponse, SlashCommand, ReplHost, SessionEvent } from '../../src/types.js';
 import { APPROVAL_QUESTION } from '../../src/repl/prompt.js';
 import { exitStatusText } from '../../src/repl/core.js';
+import type { ReplContext } from '../../src/repl/types.js';
 import { runToEnd, startRepl } from './harness.js';
 import { MockSession, agentOf, call } from './mockSession.js';
 
@@ -327,6 +328,7 @@ test('repl: a forced stop of a conversation without a finished turn starts a new
 
 test('repl: a second Ctrl+C stops Claude Code during a stuck slash command too (C16)', { timeout: 20_000 }, async () => {
   const s = new MockSession();
+  s.busy = true; // the command's work (e.g. /tangent merge's summary turn) runs in this session
   const cmd: SlashCommand = {
     name: 'stuck',
     summary: 'test: ignores the interrupt',
@@ -350,6 +352,67 @@ test('repl: a second Ctrl+C stops Claude Code during a stuck slash command too (
   run.send('/session-id');
   await run.waitFor(/\/session-id\n[\s\S]*> $/, 5000);
   assert.equal(run.sessions.length, 2, 're-created for the next command');
+  run.send('/quit');
+  assert.equal(await run.exit, 0);
+  run.t.cleanup();
+});
+
+test('repl: a double Ctrl+C during a command working in another session (/spec run, /chat new) neither stops the idle session nor abandons the command; the first press aborts the command signal (F0)', { timeout: 20_000 }, async () => {
+  const s = new MockSession(); // idle: nothing of the command runs in it
+  let started = false;
+  const cmd: SlashCommand = {
+    name: 'elsewhere',
+    summary: 'test: works in a session of its own',
+    async run(_a, _r, host) {
+      started = true;
+      const signal = (host as unknown as ReplContext).commandSignal;
+      await until(() => signal?.aborted === true, 5000);
+      // the other session's Claude Code is still starting, past the forced-stop grace and the
+      // abandon delay
+      await sleep(3500);
+      host.print(`elsewhere: done (${signal?.aborted ? 'cancelled' : 'not cancelled'})`);
+    },
+  };
+  const run = startRepl({ session: s, keepOpen: true, extraCommands: [cmd] });
+  await run.waitFor('> ');
+  run.send('/elsewhere');
+  await until(() => started);
+  run.send('\u0003');
+  await sleep(50);
+  run.send('\u0003');
+  await run.waitFor(/elsewhere: done \(cancelled\)\n[\s\S]*> $/, 10_000);
+  const out = run.out();
+  assert.ok(!out.includes('did not stop'), `the idle session was stopped:\n${out}`);
+  assert.ok(!out.includes('Failed to execute command'), `the command was abandoned:\n${out}`);
+  assert.equal(s.closed, false, 'the idle session stays open');
+  assert.ok(!out.includes('To exit the CLI'), out);
+  run.send('/session-id');
+  await run.waitFor(/\/session-id\n[\s\S]*> $/, 5000);
+  assert.equal(run.sessions.length, 1, 'nothing to re-create');
+  run.send('/quit');
+  assert.equal(await run.exit, 0);
+  assert.equal(s.closed, true);
+  run.t.cleanup();
+});
+
+test('repl: a Ctrl+C handled by a turn a command runs interrupts that turn and also aborts the command signal (F0)', { timeout: 20_000 }, async () => {
+  let run!: ReturnType<typeof startRepl>;
+  const s = new MockSession().script({ steps: [text('task working...'), { run: () => run.send('\u0003') }, { waitInterrupt: true }] });
+  const cmd: SlashCommand = {
+    name: 'tasks',
+    summary: 'test: runs turns until cancelled, like /spec run',
+    async run(_a, _r, host) {
+      const signal = (host as unknown as ReplContext).commandSignal;
+      const r = await host.runTurn({ text: 'task 1' });
+      host.print(`tasks: ${r.stopReason}, signal ${signal?.aborted ? 'aborted' : 'not aborted'}`);
+    },
+  };
+  run = startRepl({ session: s, keepOpen: true, extraCommands: [cmd] });
+  await run.waitFor('> ');
+  run.send('/tasks');
+  await run.waitFor(/tasks: cancelled, signal aborted\n[\s\S]*> $/, 5000);
+  assert.equal(s.interrupted, 1, 'the turn was interrupted once');
+  assert.ok(!run.out().includes('To exit the CLI'), run.out());
   run.send('/quit');
   assert.equal(await run.exit, 0);
   run.t.cleanup();
@@ -451,6 +514,74 @@ test('repl: a failed restart after a forced stop reports it and exits 1 (C16)', 
   assert.ok(run.out().includes('Failed to restart Claude Code: claude exited during start'), run.out());
   assert.equal(next.closed, true, 'the half-started session was closed');
   assert.deepEqual(next.prompts, []);
+  run.t.cleanup();
+});
+
+const setId = (s: MockSession, id: string): void => {
+  (s as unknown as { id: string }).id = id;
+};
+const TANGENT_ID = '00000000-0000-4000-8000-0000000000aa';
+
+async function storeRecord(run: ReturnType<typeof startRepl>, s: MockSession, id: string): Promise<void> {
+  const { SessionStore, sessionsDir } = await import('../../src/session/store.js');
+  new SessionStore(sessionsDir(run.ws)).write({ ...s.record, sessionId: id, turns: [{ userUuid: 'u0', assistantUuid: 'a0', preview: 'earlier', at: new Date().toISOString() }], messageCount: 1 });
+}
+
+test('repl: the restart after a forced stop inside a tangent says so and names the main conversation (C16)', { timeout: 20_000 }, async () => {
+  let run!: ReturnType<typeof startRepl>;
+  const s = stuckSession(() => run.send('\u0003'));
+  const mainId = s.id;
+  setId(s, TANGENT_ID);
+  s.tangent = { name: null, parentId: mainId };
+  const next = new MockSession({ id: TANGENT_ID }).script({ result: { text: 'second answer' } });
+  run = startRepl({ session: s, input: ['long task'], keepOpen: true, nextSession: () => next });
+  await storeRecord(run, s, TANGENT_ID);
+  await run.waitFor(/stopping it\.\n[\s\S]*> $/, 5000);
+  run.send('next');
+  await run.waitFor('second answer', 5000);
+  assert.deepEqual(run.created[1]!.resume, { sessionId: TANGENT_ID });
+  assert.ok(run.out().includes(`The tangent continues as its own conversation; the main one is saved as ${mainId} (/chat resume).`), run.out());
+  run.send('/quit');
+  assert.equal(await run.exit, 0);
+  run.t.cleanup();
+});
+
+test('repl: a forced stop while the record in use changes afterwards (/tangent falling back to main) names no tangent at the restart (F10)', { timeout: 20_000 }, async () => {
+  const s = new MockSession();
+  const mainId = s.id;
+  const cmd: SlashCommand = {
+    name: 'fork',
+    summary: 'test: like /tangent while its fork starts',
+    async run(_a, _r, host) {
+      const ss = host.session as MockSession;
+      // the tangent record is in use while its Claude Code starts
+      setId(ss, TANGENT_ID);
+      ss.tangent = { name: null, parentId: mainId };
+      ss.busy = true;
+      await until(() => ss.closed);
+      // the start fails on the closed session: back to the main record, the tangent is dropped
+      setId(ss, mainId);
+      ss.tangent = undefined;
+      ss.busy = false;
+      throw new Error('The session is closed');
+    },
+  };
+  const next = new MockSession({ id: mainId }).script({ result: { text: 'second answer' } });
+  const run = startRepl({ session: s, keepOpen: true, extraCommands: [cmd], nextSession: () => next });
+  await storeRecord(run, s, mainId);
+  await run.waitFor('> ');
+  run.send('/fork');
+  await sleep(50);
+  run.send('\u0003');
+  await sleep(50);
+  run.send('\u0003');
+  await run.waitFor(/stopping it\.\n[\s\S]*Failed to execute command: The session is closed[\s\S]*> $/, 5000);
+  run.send('next');
+  await run.waitFor('second answer', 5000);
+  assert.deepEqual(run.created[1]!.resume, { sessionId: mainId }, 'main is resumed');
+  assert.ok(!run.out().includes('The tangent continues'), `the restart claims a tangent while main is in use:\n${run.out()}`);
+  run.send('/quit');
+  assert.equal(await run.exit, 0);
   run.t.cleanup();
 });
 

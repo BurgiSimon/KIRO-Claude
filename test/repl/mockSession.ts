@@ -103,6 +103,8 @@ export class MockSession extends EventEmitter implements KiroSession {
   started = false;
   closed = false;
   interrupted = 0;
+  /** KiroSession.busy: work of its own in flight (a turn, an unanswered user line). */
+  busy = false;
   private interruptWaiters: (() => void)[] = [];
 
   listing: ToolListingEntry[] = [
@@ -330,9 +332,15 @@ export class MockSession extends EventEmitter implements KiroSession {
     return this.hookList;
   }
 
-  async runManualHook(name: string): Promise<string> {
+  /** Like HookRunner.runManual: a Manual hook of `hookList` by exact, then case-insensitive name. */
+  async runManualHook(name: string): Promise<import('../../src/types.js').ManualHookRun> {
     this.rec('runManualHook', name);
-    return `output of ${name}`;
+    const manual = this.hookList.filter((h) => h.trigger === 'Manual');
+    const h = manual.find((x) => x.name === name) ?? manual.find((x) => x.name.toLowerCase() === name.toLowerCase());
+    if (!h) return { kind: 'not-found' };
+    if (!h.enabled) return { kind: 'disabled' };
+    if (h.action.type === 'agent') return { kind: 'agent', prompt: h.action.prompt };
+    return { kind: 'command', output: `output of ${h.name}` };
   }
 
   async exportTo(p: string, force: boolean): Promise<string> {
