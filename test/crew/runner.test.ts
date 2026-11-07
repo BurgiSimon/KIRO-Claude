@@ -1,3 +1,5 @@
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -80,7 +82,7 @@ describe('crew runner', () => {
     assert.equal(defaultSys.isAlive(process.pid), true);
     assert.equal(defaultSys.isAlive(0), false);
     assert.equal(defaultSys.isAlive(2 ** 22 + 12345), false);
-    assert.equal(defaultSys.kill(-1.5, 'SIGTERM'), false);
+    assert.equal(defaultSys.kill(-1.5, 'SIGTERM', undefined), false);
     if (process.platform === 'linux') {
       const me = defaultSys.listProcesses().find((p) => p.pid === process.pid);
       assert.ok(me && me.argv[0]!.includes('node') && me.env?.PATH !== undefined);
@@ -137,5 +139,42 @@ describe('gateway process tree (crew stop)', () => {
     assert.deepEqual(pids(gatewayTree(procs, 100, 9999, true)), [101, 102, 103, 200, 201, 202]);
     assert.deepEqual(pids(gatewayTree(procs, 100, 9999, false)), [101, 103, 200, 201, 202]);
     assert.deepEqual(pids(gatewayTree(procs, 100, 202, true)), [101, 102, 103], 'self and ancestors are spared');
+  });
+});
+
+// K8: `crew stop` signals pids it read from /proc seconds (or, for the gateway, up to its --timeout)
+// before; by then a pid may name another process.
+describe('crew kill hygiene (K8)', () => {
+  it('sys.kill signals a pid only while it reads back the start time it was identified with', { skip: process.platform !== 'linux' ? 'needs /proc' : false }, async () => {
+    const ch = spawn(node, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
+    try {
+      await once(ch, 'spawn');
+      const pid = ch.pid!;
+      const start = defaultSys.startTime(pid);
+      assert.ok(start !== undefined);
+      assert.equal(defaultSys.kill(pid, 'SIGTERM', start + 1), false, 'a pid that names a process with another start time was signalled');
+      assert.equal(defaultSys.kill(pid, 'SIGTERM', undefined), false, 'a process identified with no start time is not one that shows one now');
+      assert.equal(defaultSys.isAlive(pid), true);
+      const exited = once(ch, 'exit');
+      assert.equal(defaultSys.kill(pid, 'SIGTERM', start), true);
+      assert.deepEqual(await exited, [null, 'SIGTERM']);
+      assert.equal(defaultSys.kill(pid, 'SIGTERM', start), false, 'gone');
+      assert.equal(defaultSys.processGroup(process.pid), defaultSys.listProcesses().find((p) => p.pid === process.pid)?.pgid);
+    } finally {
+      ch.kill('SIGKILL');
+    }
+  });
+
+  it("run()'s timeout and signal-forwarding kills go through Node's process handle, which signals nothing once the child is reaped", async () => {
+    const ch = spawn(node, ['-e', ''], { stdio: 'ignore' });
+    await once(ch, 'exit');
+    // run() calls child.kill(), never process.kill(child.pid): after the reap there is no kill(2)
+    assert.equal(ch.kill('SIGKILL'), false);
+    // (a timeout that cannot fire on a loaded machine: a 50 ms one made this test flaky)
+    const sigs = ['SIGTERM', 'SIGHUP', 'SIGINT'] as const;
+    const listeners = sigs.map((s) => process.listenerCount(s));
+    const r = await defaultRunner.run(node, ['-e', 'process.exit(0)'], { timeoutMs: 60_000, forwardSignals: true });
+    assert.deepEqual([r.code, r.timedOut], [0, false]);
+    assert.deepEqual(sigs.map((s) => process.listenerCount(s)), listeners, 'the signal forwarders are removed with the child');
   });
 });

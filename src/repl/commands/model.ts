@@ -16,6 +16,7 @@ import type { ModelEntry } from '../../types.js';
 import { c } from '../../util/ansi.js';
 import { notSupported } from '../prompt.js';
 import type { BuiltinCommand, ReplContext } from '../types.js';
+import { CANCELLED, cancelledLine, sessionCall } from './cancellable.js';
 
 export const EFFORT_LEVELS: readonly string[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 
@@ -73,9 +74,22 @@ export const modelCommand: BuiltinCommand = {
       }
     }
     if (!chosen) return;
-    await r.session.setModel(chosen.kiroId);
+    const target = chosen.kiroId;
+    const name = target === 'auto' ? 'auto' : chosen.displayName;
+    // a press before the switch was asked for cancels it
+    if (r.commandSignal?.aborted) {
+      r.write(cancelledLine('/model'));
+      return;
+    }
+    // Claude Code's `set_model` answer: Ctrl+C stops waiting for it (K9). The session has taken
+    // the model already and Claude Code switches when it reads the request, so the line says the
+    // switch is unconfirmed rather than cancelled.
+    if ((await sessionCall(r, (s) => s.setModel(target))) === CANCELLED) {
+      r.write(`\n${c.gray(`Claude Code has not confirmed the switch to ${name} yet.`)}\n\n`);
+      return;
+    }
     await r.refreshUsage();
-    r.write(`\n Using ${chosen.kiroId === 'auto' ? 'auto' : chosen.displayName}\n\n`);
+    r.write(`\n Using ${name}\n\n`);
   },
 };
 

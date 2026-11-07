@@ -12,6 +12,7 @@ import { c, isColorEnabled } from '../../util/ansi.js';
 import { notSupported } from '../prompt.js';
 import { formatResetTime, formatTodos, stripTerminalControls } from '../render.js';
 import type { BuiltinCommand, TranscriptEntry } from '../types.js';
+import { CANCELLED, cancelledLine, sessionCall } from './cancellable.js';
 
 const HOOKS_DOC = 'https://kiro.dev/docs/cli/hooks';
 
@@ -98,7 +99,12 @@ export const mcpCommand: BuiltinCommand = {
       r.write(`${c.yellow(notSupported(`mcp ${args[0]}`))}\nMCP authentication is handled by Claude Code (run claude, then /mcp).\n`);
       return;
     }
-    const list = await r.session.mcpStatus();
+    // Claude Code's `mcp_status` answer: Ctrl+C stops waiting for it (K9, commands/cancellable.ts)
+    const list = await sessionCall(r, (s) => s.mcpStatus());
+    if (list === CANCELLED) {
+      r.write(cancelledLine('/mcp'));
+      return;
+    }
     if (list.length === 0) {
       r.write('\nNo MCP servers configured.\n\n');
       return;
@@ -192,7 +198,12 @@ export const usageCommand: BuiltinCommand = {
   name: 'usage',
   summary: 'Show context window and subscription usage',
   async run(_args, _raw, r) {
-    const u = await r.session.usage();
+    // Claude Code's `get_context_usage` answer: Ctrl+C stops waiting for it (K9)
+    const u = await sessionCall(r, (s) => s.usage());
+    if (u === CANCELLED) {
+      r.write(cancelledLine('/usage'));
+      return;
+    }
     r.write(formatUsage(u, r.columns));
   },
 };

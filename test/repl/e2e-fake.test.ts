@@ -14,6 +14,7 @@ import { runRepl } from '../../src/repl/repl.js';
 import type { CliContext } from '../../src/types.js';
 import { stripAnsi } from '../../src/util/ansi.js';
 import { fakeClaudePath, fakeEnv } from '../claude/helpers.js';
+import { killIfSame, startTicksOf } from '../claude/pid-reuse-helpers.js';
 import { tempEnv } from './harness.js';
 import { DESIGN_MD, REQ_MD, TASKS_MD } from '../spec/helpers.js';
 
@@ -586,6 +587,7 @@ for (const hc of HOOK_CASES) {
     );
     const r = live(MAIN_AND_TASKS, { isolate: true, tty: hc.tty, extraEnv: { KIRO_HOME: kiroHome } });
     let pid: number | undefined;
+    let pidTicks: number | undefined;
     try {
       await r.waitFor(/> $/);
       r.line('first main');
@@ -598,6 +600,7 @@ for (const hc of HOOK_CASES) {
         await sleepMs(25);
       }
       pid = Number(fs.readFileSync(pidFile, 'utf8').trim());
+      pidTicks = startTicksOf(pid); // who it is, for the cleanup kill (K6)
       const pressedAt = Date.now();
       r.ctrlC();
       if (hc.presses === 2) {
@@ -623,7 +626,9 @@ for (const hc of HOOK_CASES) {
       r.line('/quit');
       assert.equal(await r.exit, 0);
     } finally {
-      if (pid !== undefined && pidAlive(pid)) {
+      // the shell's group, only while its leader is still the process whose pid was read: pids
+      // are reused, and kill(-pid) after it died could hit an unrelated group (K6)
+      if (pid !== undefined && pidTicks !== undefined && startTicksOf(pid) === pidTicks) {
         try {
           process.kill(-pid, 'SIGKILL');
         } catch {
@@ -1000,10 +1005,11 @@ function liveIn(t: ReturnType<typeof tempEnv>, script: unknown, sessionOptions: 
 for (const viaSpec of [false, true]) {
   test(
     `e2e: a chat resumed after its Claude transcript was lost (the saved history goes with the next line) keeps main's history${viaSpec ? ' through a /spec flow that reached Claude (G0)' : ' (control)'}`,
-    // the spec phase session forks from main's new Claude session (no transcript yet), falls back
-    // to a new conversation and restores ITS OWN record's journal, which is empty: the session
-    // group's kiroSession create(opts.fork) copies no journal from the fork's parent (enterTangent
-    // does). Then finish('keep') closes main, whose saved history was never sent.
+    // the spec phase session forks from main's new Claude session, which has no transcript yet
+    // (main's saved history waits for main's next line): it falls back to a new conversation and
+    // restores main's history from its own record's journal, a copy of main's that create({fork})
+    // makes (S1), and its record carries main's turns (K1). The continuation that finish('keep')
+    // hands to the chat forks the phase session, so the chat keeps main's history.
     { timeout: 60_000 },
     async () => {
       const script = {
@@ -1160,6 +1166,7 @@ for (const vc of VIA_SCRIPT_CASES) {
     const exportFile = path.join(dir, 'export.json');
     const r = live(MAIN_AND_TASKS, { isolate: true, tty: vc.tty });
     let pid: number | undefined;
+    let pidTicks: number | undefined;
     try {
       await r.waitFor(/> $/);
       r.line('first main');
@@ -1180,6 +1187,7 @@ for (const vc of VIA_SCRIPT_CASES) {
         await sleepMs(25);
       }
       pid = Number(fs.readFileSync(pidFile, 'utf8').trim());
+      pidTicks = startTicksOf(pid); // who it is, for the cleanup kill (K6)
       await sleepMs(200); // the load script has printed its export
       const pressedAt = Date.now();
       r.ctrlC();
@@ -1208,7 +1216,9 @@ for (const vc of VIA_SCRIPT_CASES) {
       r.line('/quit');
       assert.equal(await r.exit, 0);
     } finally {
-      if (pid !== undefined && pidAlive(pid)) {
+      // the shell's group, only while its leader is still the process whose pid was read: pids
+      // are reused, and kill(-pid) after it died could hit an unrelated group (K6)
+      if (pid !== undefined && pidTicks !== undefined && startTicksOf(pid) === pidTicks) {
         try {
           process.kill(-pid, 'SIGKILL');
         } catch {
@@ -1377,7 +1387,9 @@ for (const tty of [false, true]) {
     };
     const r = live(script, { isolate: true, tty });
     let pid: number | undefined;
+    let pidTicks: number | undefined;
     let holder: number | undefined;
+    let holderTicks: number | undefined;
     try {
       await r.waitFor(/> $/);
       r.line('make a file');
@@ -1391,7 +1403,9 @@ for (const tty of [false, true]) {
         await sleepMs(25);
       }
       pid = Number(fs.readFileSync(pidFile, 'utf8').trim());
+      pidTicks = startTicksOf(pid); // who it is, for the cleanup kill (K6)
       holder = Number(fs.readFileSync(holderPidFile, 'utf8').trim());
+      holderTicks = startTicksOf(holder);
       const pressedAt = Date.now();
       r.ctrlC();
       await r.waitFor(/Export via [\s\S]*? was cancelled\.\n\n[\s\S]*> $/, 5000, mark);
@@ -1416,20 +1430,16 @@ for (const tty of [false, true]) {
       r.line('/quit');
       assert.equal(await r.exit, 0);
     } finally {
-      if (pid !== undefined && pidAlive(pid)) {
+      // the shell's group, only while its leader is still the process whose pid was read: pids
+      // are reused, and kill(-pid) after it died could hit an unrelated group (K6)
+      if (pid !== undefined && pidTicks !== undefined && startTicksOf(pid) === pidTicks) {
         try {
           process.kill(-pid, 'SIGKILL');
         } catch {
           /* gone */
         }
       }
-      if (holder !== undefined && pidAlive(holder)) {
-        try {
-          process.kill(holder, 'SIGKILL');
-        } catch {
-          /* gone */
-        }
-      }
+      if (holder !== undefined) killIfSame(holder, holderTicks);
       r.end();
       await r.exit.catch(() => undefined);
       r.t.cleanup();
@@ -1439,7 +1449,8 @@ for (const tty of [false, true]) {
 }
 
 // /clear, /agent swap and a new session's start run the agentSpawn hooks again: commands of
-// kiro-claude's own, while the session is idle (so Ctrl+C neither interrupts nor stops anything).
+// kiro-claude's own, while the session is idle. Ctrl+C kills the hook (the start signal) and
+// gives the prompt back, but must not interrupt or stop the idle Claude Code (F0).
 const SPAWN_HOOK_CASES: { cmd: string; answer?: string }[] = [{ cmd: '/clear', answer: 'y' }, { cmd: '/agent swap other' }, { cmd: '/chat new' }];
 
 for (const sc of SPAWN_HOOK_CASES) {
@@ -1447,7 +1458,6 @@ for (const sc of SPAWN_HOOK_CASES) {
     `e2e: Ctrl+C while ${sc.cmd} re-runs a slow agentSpawn hook kills the hook and gives the prompt back, without stopping Claude Code (R2)`,
     {
       timeout: 60_000,
-      todo: 'session group: KiroSessionImpl.runSessionStartHooks (start / restart({sessionStart}) / clear) passes no signal to HookRunner.runSessionStart and interrupt() does not reach it, so Ctrl+C is swallowed until the hook ends (its timeout: V2 30 s, V3 60 s, 0 = never); for /chat new|resume|load the REPL must also interrupt the session being started (chat.ts activate)',
     },
     async () => {
       const kiroHome = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-spawnhook-')));
@@ -1462,6 +1472,7 @@ for (const sc of SPAWN_HOOK_CASES) {
       fs.writeFileSync(path.join(kiroHome, 'agents', 'other.json'), JSON.stringify({ name: 'other', description: 'another agent' }));
       const r = live(MAIN_AND_TASKS, { isolate: true, extraEnv: { KIRO_HOME: kiroHome } });
       let pid: number | undefined;
+      let pidTicks: number | undefined;
       try {
         await r.waitFor(/> $/);
         r.line('first main');
@@ -1478,6 +1489,7 @@ for (const sc of SPAWN_HOOK_CASES) {
           await sleepMs(25);
         }
         pid = Number(fs.readFileSync(pidFile, 'utf8').trim());
+        pidTicks = startTicksOf(pid); // who it is, for the cleanup kill (K6)
         await sleepMs(200);
         mark = r.o().length;
         const pressedAt = Date.now();
@@ -1500,7 +1512,9 @@ for (const sc of SPAWN_HOOK_CASES) {
         r.line('/quit');
         assert.equal(await r.exit, 0);
       } finally {
-        if (pid !== undefined && pidAlive(pid)) {
+        // the shell's group, only while its leader is still the process whose pid was read: pids
+        // are reused, and kill(-pid) after it died could hit an unrelated group (K6)
+        if (pid !== undefined && pidTicks !== undefined && startTicksOf(pid) === pidTicks) {
           try {
             process.kill(-pid, 'SIGKILL');
           } catch {
@@ -1514,4 +1528,127 @@ for (const sc of SPAWN_HOOK_CASES) {
       }
     },
   );
+}
+
+// ───── K9: read-only commands waiting on a control request of the idle session end at Ctrl+C ─────
+
+/** Control requests of `subtype` the fake got so far. */
+function controlRequests(r: ReturnType<typeof live>, subtype: string): number {
+  return r.log().filter((e) => e.event === 'stdin' && (e.line as { type?: string })?.type === 'control_request' && (e.line as { request: { subtype?: string } }).request.subtype === subtype).length;
+}
+
+test('e2e: Ctrl+C while /usage, /mcp, /tools or /model waits on a slow Claude Code gives the prompt back at once; the late answers print nothing and nothing is stopped (K9, F0)', { timeout: 90_000 }, async () => {
+  const LATE_MS = 3000;
+  const r = live(MAIN_AND_TASKS, {
+    isolate: true,
+    extraEnv: { FAKE_CLAUDE_CONTROL_DELAYS: JSON.stringify({ get_context_usage: LATE_MS, mcp_status: LATE_MS, set_model: LATE_MS }) },
+  });
+  try {
+    await r.waitFor(/> $/);
+    r.line('first main');
+    await r.waitFor(/MAIN-ANSWER to first main[\s\S]*> $/);
+    const mark = r.o().length;
+    const cases: [string, string, RegExp][] = [
+      ['/usage', 'get_context_usage', /\/usage was cancelled\.\n\n> $/],
+      ['/mcp', 'mcp_status', /\/mcp was cancelled\.\n\n> $/],
+      ['/tools', 'mcp_status', /\/tools was cancelled\.\n\n> $/],
+      ['/model claude-haiku-4.5', 'set_model', /Claude Code has not confirmed the switch to Haiku 4\.5 yet\.\n\n> $/],
+    ];
+    let lastSent = 0;
+    for (const [cmd, subtype, cancelled] of cases) {
+      const before = controlRequests(r, subtype);
+      const m = r.o().length;
+      r.line(cmd);
+      const t0 = Date.now();
+      while (controlRequests(r, subtype) === before) {
+        if (Date.now() - t0 > 10_000) throw new Error(`${cmd} sent no ${subtype}\n${r.o()}`);
+        await sleepMs(25);
+      }
+      lastSent = Date.now();
+      await sleepMs(200);
+      const pressedAt = Date.now();
+      r.ctrlC();
+      await r.waitFor(cancelled, 2000, m).catch((e: Error) => {
+        throw new Error(`Ctrl+C did not end ${cmd} while Claude Code had not answered ${subtype}: ${e.message}`);
+      });
+      assert.ok(Date.now() - pressedAt < 1500, `${cmd}: the prompt came back ${Date.now() - pressedAt} ms after the press`);
+    }
+    // a turn after them works; then every late answer arrives (nothing of them is printed)
+    const m2 = r.o().length;
+    r.line('main again');
+    await r.waitFor(/MAIN-ANSWER to main again[\s\S]*> $/, 15_000, m2);
+    await sleepMs(Math.max(0, lastSent + LATE_MS + 800 - Date.now()));
+    const after = r.o().slice(mark);
+    assert.ok(!/Current context window|Pro Tips|No MCP servers configured|Built-in:|Using Haiku/.test(after), `a late answer reached the output:\n${after}`);
+    assert.ok(!/did not stop|Failed to execute command|timed out|To exit the CLI/.test(after), after);
+    assert.equal(r.ended(), undefined, `the REPL quit:\n${after}`);
+    assert.equal(r.log().filter((e) => e.event === 'start' && (e.argv as string[]).includes('--input-format')).length, 1, 'Claude Code was not restarted');
+    assert.equal(interruptRequests(r.log()), 0, 'the idle Claude Code got no interrupt');
+    // the next /usage gets its own answer (the first one's late answer is not taken for it), once
+    const m3 = r.o().length;
+    r.line('/usage');
+    await r.waitFor(/Current context window[\s\S]*Pro Tips[\s\S]*> $/, LATE_MS + 5000, m3);
+    assert.equal(r.o().slice(m3).split('Current context window').length - 1, 1, r.o().slice(m3));
+    r.line('/quit');
+    assert.equal(await r.exit, 0);
+  } finally {
+    r.end();
+    await r.exit.catch(() => undefined);
+    r.t.cleanup();
+  }
+});
+
+// ───── repl verifier (K9): /mcp typed at an approval prompt, Claude Code slow to answer ─────
+
+for (const tty of [false, true]) {
+  test(`e2e: Ctrl+C while /mcp typed at an approval prompt waits on a slow Claude Code ends it and cancels the turn without asking the dead question again; the late answer prints nothing (K9, ${tty ? 'terminal' : 'line'} mode)`, { timeout: 60_000 }, async () => {
+    const LATE_MS = 2500;
+    const script = {
+      turns: [
+        { match: '^make', steps: [{ tool: { name: 'Bash', input: { command: 'touch made.txt' } } }, { text: 'TOOL-SAID {{lastToolResult}}' }] },
+        { repeat: true, match: 'main', steps: [{ text: 'MAIN-ANSWER to {{userText}}' }] },
+      ],
+    };
+    const r = live(script, { isolate: true, tty, extraEnv: { FAKE_CLAUDE_CONTROL_DELAYS: JSON.stringify({ mcp_status: LATE_MS }) } });
+    try {
+      await r.waitFor(/> $/);
+      r.line('make a file');
+      await r.waitFor(/\[y\/n\/t\]:[\s\S]*> $/);
+      const mark = r.o().length;
+      const before = controlRequests(r, 'mcp_status');
+      r.line('/mcp');
+      const t0 = Date.now();
+      while (controlRequests(r, 'mcp_status') === before) {
+        if (Date.now() - t0 > 10_000) throw new Error(`/mcp sent no mcp_status\n${r.o()}`);
+        await sleepMs(25);
+      }
+      const sentAt = Date.now();
+      await sleepMs(200);
+      const pressedAt = Date.now();
+      r.ctrlC();
+      await r.waitFor(/\/mcp was cancelled\.\n\n[\s\S]*> $/, 5000, mark).catch((e: Error) => {
+        throw new Error(`Ctrl+C did not end /mcp at the approval prompt: ${e.message}`);
+      });
+      assert.ok(Date.now() - pressedAt < 1500, `the prompt came back ${Date.now() - pressedAt} ms after the press`);
+      await sleepMs(Math.max(0, sentAt + LATE_MS + 800 - Date.now()));
+      const after = r.o().slice(mark);
+      const cancelledAt = after.indexOf('/mcp was cancelled.');
+      // the press interrupted the turn too: its approval is gone, so the question is not asked again
+      assert.ok(!after.slice(cancelledAt).includes('Allow this action?'), `the dead approval question was asked again:\n${after}`);
+      assert.ok(!/No MCP servers configured|connected/.test(after), `the late answer reached the output:\n${after}`);
+      assert.ok(!/did not stop|Failed to execute command|timed out|To exit the CLI/.test(after), after);
+      assert.equal(r.ended(), undefined, `the REPL quit:\n${after}`);
+      const m2 = r.o().length;
+      r.line('main again');
+      await r.waitFor(/MAIN-ANSWER to main again[\s\S]*> $/, 15_000, m2);
+      assert.ok(!fs.existsSync(path.join(r.t.wsDir, 'made.txt')), 'the tool ran');
+      assert.equal(r.log().filter((e) => e.event === 'start' && (e.argv as string[]).includes('--input-format')).length, 1, 'Claude Code was restarted');
+      r.line('/quit');
+      assert.equal(await r.exit, 0);
+    } finally {
+      r.end();
+      await r.exit.catch(() => undefined);
+      r.t.cleanup();
+    }
+  });
 }

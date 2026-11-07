@@ -9,7 +9,8 @@
  *   callers piping our output never hang — 08b §2.2).
  * - {@link CrewSys}: clock, sleep, signals, liveness, the `/proc` scan used by `crew stop` to
  *   reap orphaned `kiro-claude acp` processes and retire the gateway's tree (a process is told
- *   apart from a later one that reuses its pid by its start time), and free-disk queries.
+ *   apart from a later one that reuses its pid by its start time, and {@link CrewSys.kill} signals
+ *   a pid only while it reads back that start time), and free-disk queries.
  *
  * Programs are spawned without a shell (argv arrays), so paths with spaces need no quoting.
  */
@@ -89,12 +90,21 @@ export interface CrewSys {
   now(): number;
   sleep(ms: number): Promise<void>;
   isAlive(pid: number): boolean;
-  /** Returns false when the process does not exist or cannot be signalled. */
-  kill(pid: number, signal: NodeJS.Signals): boolean;
+  /**
+   * Signals `pid` only while it still is the process it was identified as: `startTime` is the
+   * start time {@link listProcesses} / {@link startTime} gave for it then, and the pid's start
+   * time is read again right before the signal (K8: a pid kept for seconds or minutes may name
+   * another process by now). Undefined counts as a value: the process showed no start time (not
+   * Linux, or a stat this user cannot read), and a pid that shows one now is another process.
+   * Returns false when nothing was signalled (another process, gone, or not permitted).
+   */
+  kill(pid: number, signal: NodeJS.Signals, startTime: number | undefined): boolean;
   /** Linux `/proc` scan; empty elsewhere. */
   listProcesses(): ProcessInfo[];
   /** {@link ProcessInfo.startTime} of `pid`; undefined when it does not exist or is unknown (not Linux). */
   startTime(pid: number): number | undefined;
+  /** {@link ProcessInfo.pgid} of `pid`; undefined when it does not exist or is unknown (not Linux). */
+  processGroup(pid: number): number | undefined;
   /**
    * This boot's id (`/proc/sys/kernel/random/boot_id`), undefined when unknown (not Linux): a start
    * time counts clock ticks since boot, so a pid and start time recorded before a reboot can name
@@ -187,6 +197,13 @@ export const defaultRunner: CrewRunner = {
         child.stdin.on('error', () => undefined);
         child.stdin.end(opts.input);
       }
+      // The two kills below go through Node's process handle, never a pid kept by number: while
+      // the handle is open libuv has not reaped the child, so its pid (alive or a zombie) cannot
+      // name another process; libuv reaps it and closes the handle in one uninterrupted run
+      // (uv__wait_children: waitpid, then the exit callback that sets `_handle = null`), and
+      // after that `child.kill()` signals nothing. Only JS running inside another child's exit
+      // callback could see a reaped child whose handle is still open, and these kills run from a
+      // timer and a signal handler, never from there (K8).
       let timedOut = false;
       let timer: NodeJS.Timeout | undefined;
       if (opts.timeoutMs && opts.timeoutMs > 0) {
@@ -327,8 +344,11 @@ export const defaultSys: CrewSys = {
     }
     return true;
   },
-  kill(pid, signal) {
+  kill(pid, signal, startTime) {
     if (!Number.isInteger(pid) || pid <= 0) return false;
+    // Read as late as possible; what is left is the microseconds to the kill(2) below, which no
+    // pidfd-free Node API can close.
+    if (defaultSys.startTime(pid) !== startTime) return false;
     try {
       process.kill(pid, signal);
       return true;
@@ -363,6 +383,11 @@ export const defaultSys: CrewSys = {
     if (process.platform !== 'linux' || !Number.isInteger(pid) || pid <= 0) return undefined;
     const stat = readProcFile(pid, 'stat');
     return stat ? parseProcStat(stat.toString('utf8'))?.startTime : undefined;
+  },
+  processGroup(pid) {
+    if (process.platform !== 'linux' || !Number.isInteger(pid) || pid <= 0) return undefined;
+    const stat = readProcFile(pid, 'stat');
+    return stat ? parseProcStat(stat.toString('utf8'))?.pgid : undefined;
   },
   bootId() {
     if (process.platform !== 'linux') return undefined;

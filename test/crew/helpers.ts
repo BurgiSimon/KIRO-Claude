@@ -144,11 +144,12 @@ export function makeFakeEnv(opts: { tools?: string[]; extraEnv?: NodeJS.ProcessE
       return dir;
     },
     cleanup() {
-      // Kill any fake gateway still running.
-      for (const f of findFiles(root, 'fake-gateway.json')) {
+      // Kill any fake gateway (and gateway child) still running: the file outlives a gateway that
+      // was killed, so its pid is signalled only while it still has the recorded start time (K8).
+      for (const f of [...findFiles(root, 'fake-gateway.json'), ...findFiles(root, 'fake-gateway-child.json')]) {
         try {
-          const { pid } = JSON.parse(fs.readFileSync(f, 'utf8')) as { pid: number };
-          process.kill(pid, 'SIGKILL');
+          const { pid, start } = JSON.parse(fs.readFileSync(f, 'utf8')) as { pid: number; start?: number };
+          if (stillRunsAs(pid, start)) process.kill(pid, 'SIGKILL');
         } catch {
           // gone
         }
@@ -175,6 +176,39 @@ export function cloneFakeEnv(base: FakeEnv, opts: { extraEnv?: NodeJS.ProcessEnv
     fs.writeFileSync(stateFile, fs.readFileSync(stateFile, 'utf8').split(base.root).join(fe.root), { mode: 0o600 });
   }
   return fe;
+}
+
+/** Start time of a process (`/proc/<pid>/stat` field 22, clock ticks since boot); undefined when gone or without /proc. */
+export function procStart(pid: number): number | undefined {
+  try {
+    const s = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const v = Number(s.slice(s.lastIndexOf(')') + 1).trim().split(/\s+/)[19]);
+    return Number.isInteger(v) ? v : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * `pid` still runs the process recorded with start time `start` (not a later one reusing the pid,
+ * nor a zombie). Without /proc (no start time recorded) only liveness can be checked.
+ */
+export function stillRunsAs(pid: number, start: number | undefined): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (process.platform !== 'linux') {
+    try {
+      process.kill(pid, 0);
+      return start === undefined;
+    } catch {
+      return false;
+    }
+  }
+  try {
+    if (fs.readFileSync(`/proc/${pid}/cmdline`).length === 0) return false; // a zombie
+  } catch {
+    return false;
+  }
+  return start !== undefined && procStart(pid) === start;
 }
 
 function findFiles(dir: string, name: string, depth = 6): string[] {

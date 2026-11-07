@@ -186,12 +186,23 @@ line uuid is the uuid the host sent). With persistence on, the fake mimics the r
 result, exit 1; `--resume` keeps id + history; `--fork-session` copies history to a new id (original
 untouched) and, like the real claude 2.1.319, writes the fork's transcript only when the fork gets its
 first user line: a fork that exits without one leaves no transcript, so `--resume <fork id>` (or a
-fork of it) reports `No conversation found`; `--resume-session-at <uuid>` keeps history up to and
+fork of it) reports `No conversation found`; a fork onto a `--session-id` whose transcript exists
+(`--resume X --fork-session --session-id T`, T already written, e.g. a re-fork of a fork that got its
+first line; also `--continue --fork-session --session-id T`) is refused like a new start onto it, as
+by the real claude 2.1.319: stderr `Error: Session ID T is already in use.`, exit 1, nothing on
+stdout, nothing written (T is not overwritten), and that check comes before any session is loaded
+(the same answer when X has no transcript; kiro-claude then resumes T, see
+`test/spec/fake-refork.test.ts`). As in the real CLI, only the cwd's project dir counts, and a fork
+onto the id it resumes (`--resume T --fork-session --session-id T`) is exempt (exit 0; the fake
+then continues T, what the real claude writes into T then is not verified). A fork onto an id
+without a transcript (a fork that never got a line) forks again; `--session-id` with `--resume` or
+`--continue` but no `--fork-session` is rejected (`Error: --session-id can only be used with
+--continue or --resume if --fork-session is also specified.`); `--resume-session-at <uuid>` keeps history up to and
 including that line, and, like the real claude 2.1.319, a uuid the resumed transcript does not hold
 (with or without `--fork-session`) fails: stderr `No message found with message.uuid of: <uuid>`, an
 `error_during_execution` result on stdout (`errors: [that text]`), exit 1, nothing written (a
 missing transcript still reports `No conversation found` first); `--continue` picks the newest
-transcript of the cwd; `/clear` starts a new transcript. Without persistence any `--resume` id is
+transcript of the cwd (with `--fork-session` too: the fake does not fork a continued session); `/clear` starts a new transcript. Without persistence any `--resume` id is
 accepted with empty history (and `--resume-session-at` cuts nothing). Never point
 `CLAUDE_CONFIG_DIR` at a real config dir.
 
@@ -240,7 +251,8 @@ not leak settings into each other.
 Real-binary tests make model calls on the user's Claude Code login (billed to their
 subscription), so every real-claude case **skips** (`t.skip(<reason>)`) unless `KIRO_CLAUDE_E2E=1`.
 The default `npm test` glob (`dist/test/**/*.test.js`) therefore only reports them as skipped (only
-the model-free `helpers.test.ts` self-tests run there).
+the model-free `helpers.test.ts` self-tests and, on Linux, the harness-timeout cases of
+`kirocrew.test.ts` run there).
 
 ```sh
 npm run build && KIRO_CLAUDE_E2E=1 node --test dist/test/e2e/cli-real.test.js   # or: npm run test:e2e
@@ -256,6 +268,12 @@ npm run build && KIRO_CLAUDE_E2E=1 node --test dist/test/e2e/cli-real.test.js   
   no model calls), so they **always run**: the Claude-project-dir removal only ever removes the
   dirs of `kc-e2e-*` temp cwds (both spellings of a symlinked temp dir), `e2eEnv()`'s isolation,
   and `cleanup()` stopping the project's CLI children before removing it.
+* `kirocrew.test.ts` — the KiroCrew stages B/C (`KIRO_CLAUDE_E2E_KIROCREW=1`, see its header). Its
+  harness runs each script as `bash -c` in a process group of its own; the timeout's SIGKILL of that
+  group goes through `src/claude/lifecycle` `signalChild`, so once the leader exited the group is
+  signalled only while a member that started before the exit is left (pids are reused: an emptied
+  group's number may belong to an unrelated group by then). Three model-free cases check that
+  (empty group: no kill; live leader; a member still holding the pipes) and always run on Linux.
 * `claude-real.test.ts` drives `ClaudeProcess` directly (initialize, one turn, a PreToolUse deny).
 * `cli-real.test.ts` runs the **built** CLI (`<outDir>/src/bin/kiro-claude.js`, resolved relative
   to the compiled test file) as a child process: (a) headless `chat --no-interactive`; (b) steering

@@ -16,11 +16,19 @@
  *    cancelled.`, neither success nor failure, and loads nothing of what it printed (R1).
  *  - `new` / `resume` create a fresh / resumed KiroSession with the current agent, model and
  *    effort and close the old one.
+ *  - Ctrl+C while `new` / `resume` / `load` run the next session's agentSpawn hooks (they can
+ *    take long: V2 30 s, V3 60 s, 0 = never) cancels the command (K3): the command signal is the
+ *    session's start signal (session/startSignal.ts), so its hooks are killed, nothing of it stays
+ *    and the current session stays active (`Starting a new chat session was cancelled.`,
+ *    `Resuming the chat session was cancelled.`, `Import from <path> was cancelled.`). A press
+ *    while Claude Code then starts changes nothing. The current session is idle meanwhile, so no
+ *    press force-stops it (F0).
  */
 
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { isSessionStartCancelled, withStartSignal } from '../../session/startSignal.js';
 import { SessionStore, formatListTime, formatSessionList, sessionsDir } from '../../session/store.js';
 import { c } from '../../util/ansi.js';
 import type { KiroSession } from '../../types.js';
@@ -62,10 +70,21 @@ export async function saveTo(r: ReplContext, args: string[]): Promise<void> {
 }
 
 /**
- * Start `next` and make it the active session. A session whose start fails is closed (it may
- * already own a claude child and the session lock) and the current one stays active.
+ * Create (and start) the next session with `create` and make it the active one; `'cancelled'`
+ * when Ctrl+C (the command signal) cancelled its start: its creation runs under that signal
+ * (withStartSignal), which kills its agentSpawn hooks and leaves nothing of it behind (K3), and
+ * the current session stays active. A press once the hooks are done (Claude Code is starting) is
+ * no failure: the session still becomes active (F0). A session whose start fails is closed (it
+ * may already own a claude child and the session lock) and the current one stays active.
  */
-async function activate(r: ReplContext, next: KiroSession): Promise<void> {
+async function activate(r: ReplContext, create: () => Promise<KiroSession>): Promise<KiroSession | 'cancelled'> {
+  let next: KiroSession;
+  try {
+    next = await withStartSignal(r.commandSignal, create);
+  } catch (e) {
+    if (isSessionStartCancelled(e)) return 'cancelled';
+    throw e;
+  }
   try {
     await next.start();
     await r.swapSession(next);
@@ -73,6 +92,11 @@ async function activate(r: ReplContext, next: KiroSession): Promise<void> {
     await next.close().catch(() => undefined);
     throw e;
   }
+  return next;
+}
+
+function cancelled(r: ReplContext, what: string): void {
+  r.write(`\n${c.gray(`${what} was cancelled.`)}\n\n`);
 }
 
 /** /chat new|resume|load replace the session: not while a turn runs (approval prompt). */
@@ -80,9 +104,10 @@ function assertIdle(r: ReplContext): void {
   if (r.busy) throw new Error(BUSY_MESSAGE);
 }
 
-async function importFile(r: ReplContext, file: string): Promise<void> {
+/** Import `file` as the active session; false when Ctrl+C cancelled it (nothing was loaded). */
+async function importFile(r: ReplContext, file: string): Promise<boolean> {
   assertIdle(r);
-  await activate(r, await r.importSession(file));
+  return (await activate(r, () => r.importSession(file))) !== 'cancelled';
 }
 
 export async function loadFrom(r: ReplContext, args: string[]): Promise<void> {
@@ -105,7 +130,7 @@ export async function loadFrom(r: ReplContext, args: string[]): Promise<void> {
     return;
   }
   try {
-    await importFile(r, file);
+    if (!(await importFile(r, file))) return cancelled(r, `Import from ${p}`);
     r.write(`\n${c.green(`✔ Imported conversation state from ${p}`)}\n\n`);
   } catch (e) {
     r.write(`\n${c.red(`Failed to import from ${p}: ${errText(e)}`)}\n\n`);
@@ -165,7 +190,7 @@ async function loadViaScript(r: ReplContext, script: string | undefined): Promis
   try {
     const file = path.join(dir, 'session.json');
     fs.writeFileSync(file, res.stdout, { mode: 0o600 });
-    await importFile(r, file);
+    if (!(await importFile(r, file))) return cancelled(r, `Import via ${script}`);
     r.write(`\n${c.green(`✔ Imported conversation state via ${script}`)}\n\n`);
   } catch (e) {
     r.write(`\n${c.red(`Failed to import via ${script}: ${errText(e)}`)}\n\n`);
@@ -176,8 +201,8 @@ async function loadViaScript(r: ReplContext, script: string | undefined): Promis
 
 async function newChat(r: ReplContext, prompt: string): Promise<void | 'quit'> {
   assertIdle(r);
-  const next = await r.createSession(r.baseSessionOptions());
-  await activate(r, next);
+  const next = await activate(r, () => r.createSession(r.baseSessionOptions()));
+  if (next === 'cancelled') return cancelled(r, 'Starting a new chat session');
   r.write(`\n${c.green('✔ Started a new chat session')} ${c.gray(`(${next.id})`)}\n\n`);
   if (prompt.trim()) return r.submit(prompt);
 }
@@ -196,8 +221,10 @@ async function resume(r: ReplContext): Promise<void> {
   );
   if (idx === undefined) return;
   const rec = list[idx]!;
-  const next = await r.createSession({ ...r.baseSessionOptions(), agentName: rec.agent, model: rec.model, ...(rec.effort ? { effort: rec.effort } : {}), resume: { sessionId: rec.sessionId } });
-  await activate(r, next);
+  const next = await activate(r, () =>
+    r.createSession({ ...r.baseSessionOptions(), agentName: rec.agent, model: rec.model, ...(rec.effort ? { effort: rec.effort } : {}), resume: { sessionId: rec.sessionId } }),
+  );
+  if (next === 'cancelled') return cancelled(r, 'Resuming the chat session');
   r.write(`\n${c.magenta('Picking up where we left off...')}\n\n`);
 }
 

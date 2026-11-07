@@ -22,11 +22,21 @@
 //                            outlives it (like KiroCrew's history-index worker after os._exit);
 //                            linger exits on SIGTERM, stubborn ignores it. late → the gateway starts a
 //                            SIGTERM-ignoring child only when it is told to stop, just before it exits
-//                            (not in crew stop's snapshot of the tree). Pid in fake-gateway-child.json
-//   $KIROCREW_HOME/fake-held  exists → `gateway-pid` answers {"holder":"held"} while the gateway runs
-//                            (a held lock whose holder KiroCrew cannot name); `stop` is unchanged (KiroCrew
+//                            (not in crew stop's snapshot of the tree). Pid (and start time) in
+//                            fake-gateway-child.json
+//   FAKE_LOCK_INHERIT        "1" → that child inherits the gateway's lock fd (KiroCrew's flock lives on in a
+//                            forked child): once the gateway is gone (a crash) while the child runs, the lock
+//                            stays held with no live holder to name. `gateway-pid` then answers what KiroCrew
+//                            answers on Linux, where /proc/locks names the dead acquirer: {"holder":
+//                            "indeterminate"} (exit 2), or {"holder":"held"} with $KIROCREW_HOME/fake-held;
+//                            `stop` refuses ("Not signalling anything", exit 1)
+//   $KIROCREW_HOME/fake-held  exists → `gateway-pid` answers {"holder":"held"} while the gateway runs, or
+//                            a child keeps its lock (a held lock whose holder KiroCrew cannot name); `stop` is unchanged (KiroCrew
 //                            tries its authenticated API shutdown first). A file, so a test can flip it
 //                            while one `crew stop` polls.
+// The gateway's pid is recorded with its start time (fake-gateway.json), and `gateway-pid`, `stop` and
+// `token` act on it only while that pid still has that start time: the file outlives a crashed gateway,
+// and its pid may be another process's by then (K8).
 import { spawn, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as http from 'node:http';
@@ -290,9 +300,44 @@ function alive(pid) {
     return e.code === 'EPERM';
   }
 }
+/** `/proc/<pid>/stat` of a running pid: its state and start time (field 22); undefined when gone or without /proc. */
+function procStat(pid) {
+  try {
+    const s = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const f = s.slice(s.lastIndexOf(')') + 1).trim().split(/\s+/);
+    const start = Number(f[19]);
+    return { state: f[0], start: Number.isInteger(start) ? start : undefined };
+  } catch {
+    return undefined;
+  }
+}
+function startOf(pid) {
+  return procStat(pid)?.start;
+}
+/** `rec` ({pid, start?}) still names the process it was written for: alive, not a zombie, same start time. */
+function stillThat(rec) {
+  if (!rec || !Number.isInteger(rec.pid) || rec.pid <= 0 || !alive(rec.pid)) return false;
+  const st = procStat(rec.pid);
+  if (st && (st.state === 'Z' || st.state === 'X')) return false;
+  return st?.start === rec.start;
+}
 function gwRecord() {
   const r = readJson(GW_FILE, undefined);
-  return r && alive(r.pid) ? r : undefined;
+  return stillThat(r) ? r : undefined;
+}
+/** The gateway's child that keeps its lock (FAKE_LOCK_INHERIT), while it runs. */
+function lockInheritor() {
+  const ch = readJson(path.join(KC_HOME, 'fake-gateway-child.json'), undefined);
+  return ch && ch.lock && stillThat(ch) ? ch : undefined;
+}
+/** KiroCrew's LockProbeError text (gateway_lock.py) for `cause`. */
+function lockProbeReason(cause) {
+  return `could not determine whether a gateway holds the lock at ${path.join(KC_HOME, 'gateway.lock')}: ${cause}`;
+}
+/** Its reason for a held lock whose acquirer is gone (gateway_lock.lock_holder: an inherited fd). */
+function inheritedLockReason() {
+  const acquirer = readJson(GW_FILE, undefined)?.pid;
+  return lockProbeReason(`the lock is held but its recorded acquirer (pid ${acquirer ?? 'unknown'}) is gone`);
 }
 function pyRepr(v) {
   if (v === true) return 'True';
@@ -321,7 +366,7 @@ function gateway() {
     const onTerm = kind === 'linger' ? '() => process.exit(0)' : '() => undefined';
     const code = `process.on('SIGTERM', ${onTerm}); setInterval(() => undefined, 1000); setTimeout(() => process.exit(0), 60000);`;
     const ch = spawn(process.execPath, ['-e', code], { stdio: 'ignore' });
-    fs.writeFileSync(path.join(KC_HOME, 'fake-gateway-child.json'), JSON.stringify({ pid: ch.pid }));
+    fs.writeFileSync(path.join(KC_HOME, 'fake-gateway-child.json'), JSON.stringify({ pid: ch.pid, start: startOf(ch.pid), lock: env.FAKE_LOCK_INHERIT === '1' }));
   };
   if (mode === 'ignore-term') process.on('SIGTERM', () => undefined);
   else process.on('SIGTERM', () => {
@@ -335,7 +380,7 @@ function gateway() {
   if (env.FAKE_GATEWAY_CHILD === 'linger' || env.FAKE_GATEWAY_CHILD === 'stubborn') startChild(env.FAKE_GATEWAY_CHILD);
   err('booting fake gateway');
   if (mode === 'hang') {
-    fs.writeFileSync(GW_FILE, JSON.stringify({ pid: process.pid, port: 0 }));
+    fs.writeFileSync(GW_FILE, JSON.stringify({ pid: process.pid, start: startOf(process.pid), port: 0 }));
     setInterval(() => undefined, 1000);
     return;
   }
@@ -366,7 +411,7 @@ function gateway() {
   });
   server.listen(portArg === 'auto' ? 0 : Number(portArg), '127.0.0.1', () => {
     const port = server.address().port;
-    fs.writeFileSync(GW_FILE, JSON.stringify({ pid: process.pid, port }));
+    fs.writeFileSync(GW_FILE, JSON.stringify({ pid: process.pid, start: startOf(process.pid), port }));
     out('Kiro Crew gateway starting');
     out(`KIROCREW_READY:${JSON.stringify({ port, token: readyToken, pid: process.pid, home: KC_HOME })}`);
   });
@@ -412,15 +457,26 @@ function kirocrew() {
   }
   if (verb === 'gateway-pid') {
     const r = gwRecord();
+    const held = fs.existsSync(path.join(KC_HOME, 'fake-held'));
     // KiroCrew's `held`: the lock is positively held but nothing names its holder (cli_server_stop.py).
-    if (r && fs.existsSync(path.join(KC_HOME, 'fake-held'))) return out(JSON.stringify({ holder: 'held', reason: `${path.join(KC_HOME, 'gateway.lock')}: the lock is held but no live holder pid can be established` }));
+    if ((r || lockInheritor()) && held) return out(JSON.stringify({ holder: 'held', reason: lockProbeReason('the lock is held but no live holder pid can be established') }));
+    if (!r && lockInheritor()) {
+      out(JSON.stringify({ holder: 'indeterminate', reason: inheritedLockReason() }));
+      process.exit(2);
+    }
     return out(JSON.stringify(r ? { holder: 'process', pid: r.pid, alive: true, source: 'lock' } : { holder: 'nobody' }));
   }
   if (verb === 'gateway') return gateway();
   if (verb === 'stop') {
-    const r = gwRecord();
-    if (!r) return out('No Kiro Crew gateway currently running on port 5476.');
-    if (env.FAKE_STOP_IGNORE === '1') return out('(fake) ignoring stop');
+    if (env.FAKE_STOP_IGNORE === '1' && gwRecord()) return out('(fake) ignoring stop');
+    const r = gwRecord(); // the recorded pid, checked again right before the signal
+    if (!r) {
+      if (lockInheritor()) {
+        out(`❌ ${inheritedLockReason()}. Not signalling anything; check the file and retry.`);
+        process.exit(1);
+      }
+      return out('No Kiro Crew gateway currently running on port 5476.');
+    }
     process.kill(r.pid, 'SIGTERM');
     return out(`✅ Sent SIGTERM to gateway (pid ${r.pid}).`);
   }

@@ -97,7 +97,9 @@ export interface ReplContext extends ReplHost {
    * Contributed commands, which only see {@link ReplHost}, read it duck-typed (spec/slash.ts:
    * `/spec run` stops scheduling tasks and interrupts the running one, 03 §1.7). A command that
    * waits on work outside the session (`/hooks run`'s hook command, `/chat *-via-script`'s
-   * script) must pass it on: the forced stop never ends a command while the session is idle (F0).
+   * script) must pass it on, and one awaiting Claude Code's answer to a control request of the
+   * idle session (`/usage`, `/mcp`, `/tools`, `/model`) races it (commands/cancellable.ts, K9):
+   * the forced stop never ends a command while the session is idle (F0).
    */
   readonly commandSignal: AbortSignal | undefined;
 }

@@ -462,6 +462,11 @@ export interface SessionRecord {
   title: string;
   createdAt: string;
   updatedAt: string;
+  /**
+   * User turns of the conversation the record holds (one per completed turn). A fork (tangent,
+   * rewind, `KiroSessionOptions.fork`) carries its parent's count with its `turns`; `/clear` resets
+   * both (the cleared conversation has no messages).
+   */
   messageCount: number;
   lastPreview: string;
   parentId: string | null;

@@ -237,9 +237,9 @@ function unwrittenEntry(s: KiroSession): ReturnType<typeof unwritten.get> {
  * The conversation `s` continues has history (`/spec new`: "Use the conversation so far as
  * input"): turns of its own (its record's turns; a tangent, rewind, resumed or imported record
  * carries those of the conversation it continues), or it is a fork a driver made that has no
- * message yet (the continuation a flow just handed over) of a conversation that had history: such
- * a record starts with no turns, although the conversation is carried. Not the record's message
- * count: `/clear` empties the turns but keeps that count, and the cleared conversation has none.
+ * message yet (the continuation a flow just handed over) of a conversation that had history. A
+ * fork made by `create({fork})` carries its parent's turns, so the unwritten entry is only a
+ * fallback (test doubles do not copy turns). The record's message count is not used.
  */
 export function conversationHasHistory(s: KiroSession | undefined): boolean {
   if (!s) return false;

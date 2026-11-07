@@ -41,7 +41,9 @@
  * while the session still has work of its own in flight ({@link KiroSession.busy}): a command
  * waiting on another session (a `/spec run` task session or `/chat new` starting) or on Claude
  * Code (re)starting is neither stopped nor abandoned; one waiting on a process of kiro-claude's
- * own (`/hooks run`, `/chat *-via-script`) ends through the command signal; `$EDITOR` and
+ * own (`/hooks run`, `/chat *-via-script`) or on Claude Code's answer to a control request of the
+ * idle session (`/usage`, `/mcp`, `/tools`, `/model`, which `busy` does not count; K9,
+ * commands/cancellable.ts) ends through the command signal; `$EDITOR` and
  * `!cmd` get the terminal and its SIGINT themselves. At the idle prompt the first Ctrl+C / Ctrl+D
  * prints Q's hint, the second exits.
  *
@@ -80,6 +82,7 @@ import type {
 import { c, colorEnabled, setColorEnabled } from '../util/ansi.js';
 import { shlexSplit } from '../util/shlex.js';
 import { classifyApprovalInput } from './approval.js';
+import { CANCELLED, untilCancelled } from './commands/cancellable.js';
 import { builtinCommands } from './commands/index.js';
 import { PLAN_EXECUTE_PROMPT, PLAN_EXECUTE_QUESTION, looksLikePlan } from './commands/plan.js';
 import { openEditor, runShellCommand } from './external.js';
@@ -380,8 +383,23 @@ export class Repl implements ReplContext {
 
   async refreshUsage(): Promise<void> {
     if (!this.usageIndicator) return;
-    const u = await withTimeout(this.current.usage(), USAGE_TIMEOUT_MS);
-    this.usagePct = u?.contextPercent;
+    // inside a command, a Ctrl+C during the refresh stops waiting for Claude Code's answer (K9):
+    // the value is kept. Not a press before it, which the command signal also carries: one that
+    // interrupted the command's turn, or one while Claude Code restarted, which changes nothing
+    // (F0); the conversation the command leaves behind still gets its own value
+    let press: AbortController | undefined;
+    const onPress = (): void => press?.abort();
+    if (this.cmdSignal) {
+      press = new AbortController();
+      this.reader.on('interrupt', onPress);
+    }
+    try {
+      const u = await withTimeout(untilCancelled(press?.signal, () => this.current.usage()), USAGE_TIMEOUT_MS);
+      if (u === CANCELLED) return;
+      this.usagePct = u?.contextPercent;
+    } finally {
+      if (press) this.reader.off('interrupt', onPress);
+    }
   }
 
   private childIo(): { inherit: boolean; out: (s: string) => void; err: (s: string) => void; cwd: string; env: NodeJS.ProcessEnv } {

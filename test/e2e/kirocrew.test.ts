@@ -25,6 +25,9 @@ import * as path from 'node:path';
 import { test, type TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+import { signalChild, trackChild } from '../../src/claude/lifecycle.js';
+import { killIfSame, startTicksOf } from '../claude/pid-reuse-helpers.js';
+
 const STAGE_B = process.env.KIRO_CLAUDE_E2E_KIROCREW === '1';
 const STAGE_C = STAGE_B && process.env.KIRO_CLAUDE_E2E === '1';
 const KEEP = process.env.KIRO_CLAUDE_E2E_KEEP === '1';
@@ -97,35 +100,45 @@ function newStage(): Stage {
   return { e2e, env, log: path.join(e2e, 'stage.log') };
 }
 
-/** Runs `bash -c '. env.sh && <cmd>'` in the repo root; resolves with exit code and output. */
-function sh(st: Stage, cmd: string, timeoutMs: number): Promise<{ code: number | null; out: string }> {
+/**
+ * Runs `bash -c <script>` as the leader of a new session and process group (`detached`); on
+ * `timeoutMs` appends a `FAIL harness-timeout <label>` line to the output and SIGKILLs the group.
+ * The timer is cleared only on 'close' (a member that keeps the pipes open is what it is there
+ * for), so it can fire long after the leader exited: the group is then signalled only while it is
+ * provably still ours (src/claude/lifecycle signalChild: a member of it that started before the
+ * leader's exit is left; an emptied group's number may be someone else's by now, K6).
+ */
+function runGroup(script: string, o: { cwd?: string; env: NodeJS.ProcessEnv; timeoutMs: number; label: string; onData?: (b: Buffer) => void }): Promise<{ code: number | null; out: string }> {
   return new Promise((resolve) => {
-    const child = spawn('bash', ['-c', `. "${TOOLS}/env.sh" >/dev/null && ${cmd}`], {
-      cwd: REPO,
-      env: st.env,
+    const child = spawn('bash', ['-c', script], {
+      ...(o.cwd ? { cwd: o.cwd } : {}),
+      env: o.env,
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: true,
     });
     let out = '';
     const onData = (b: Buffer): void => {
       out += b.toString('utf8');
-      fs.appendFileSync(st.log, b);
+      o.onData?.(b);
     };
     child.stdout.on('data', onData);
     child.stderr.on('data', onData);
+    // records the leader's start and exit times (Linux /proc) that signalChild checks
+    trackChild(child, true);
     const timer = setTimeout(() => {
-      out += `\nFAIL harness-timeout ${cmd.slice(0, 80)} exceeded ${timeoutMs} ms\n`;
-      try {
-        process.kill(-child.pid!, 'SIGKILL');
-      } catch {
-        // gone
-      }
-    }, timeoutMs);
+      out += `\nFAIL harness-timeout ${o.label} exceeded ${o.timeoutMs} ms\n`;
+      signalChild(child, 'SIGKILL', true);
+    }, o.timeoutMs);
     child.on('close', (code) => {
       clearTimeout(timer);
       resolve({ code, out });
     });
   });
+}
+
+/** Runs `bash -c '. env.sh && <cmd>'` in the repo root; resolves with exit code and output. */
+function sh(st: Stage, cmd: string, timeoutMs: number): Promise<{ code: number | null; out: string }> {
+  return runGroup(`. "${TOOLS}/env.sh" >/dev/null && ${cmd}`, { cwd: REPO!, env: st.env, timeoutMs, label: cmd.slice(0, 80), onData: (b) => fs.appendFileSync(st.log, b) });
 }
 
 /** One harness script as a subtest whose PASS/FAIL/SKIP rows become nested subtests. */
@@ -210,4 +223,123 @@ test('KiroCrew stage C: real kiro-claude, real Claude (haiku)', { timeout: 7_200
     return;
   }
   await runStage(t, 'C');
+});
+
+// ───── the harness timeout never signals a process group that may no longer be ours (K6) ─────
+// Pids are reused (pid_max is 32768 here): once the bash leader exited and its group emptied, the
+// number can become the pid, group and session of any detached spawn, `setsid` command or job of
+// a job-control shell (another `node --test` run), and a late `kill(-pid)` would kill that group.
+// The timeout is cleared only on 'close', so a daemon that keeps the pipes open lets it fire long
+// after the leader exited. Model-free, no KiroCrew needed: these always run (Linux).
+
+const LINUX_ONLY = process.platform === 'linux' ? undefined : 'process groups and /proc start times: Linux only';
+
+/** Records every `process.kill` call while `fn` runs (the real kill is still sent). */
+async function withKillSpy<T>(fn: (calls: [number, string | number | undefined][]) => Promise<T>): Promise<T> {
+  const real = process.kill;
+  const calls: [number, string | number | undefined][] = [];
+  process.kill = ((pid: number, sig?: string | number) => {
+    calls.push([pid, sig]);
+    return real.call(process, pid, sig);
+  }) as typeof process.kill;
+  try {
+    return await fn(calls);
+  } finally {
+    process.kill = real;
+  }
+}
+
+/** Resolves once `pid` is reaped (gone from /proc), failing after `ms`. */
+async function waitReaped(pid: number, what: string, ms = 10_000): Promise<void> {
+  const end = Date.now() + ms;
+  while (fs.existsSync(`/proc/${pid}`)) {
+    if (Date.now() > end) throw new Error(`${what} ${pid} still runs`);
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+/** The harness timeout of the post-exit cases; their leaders exit at once, long before it. */
+const POST_EXIT_TIMEOUT_MS = 3000;
+
+async function readPid(file: string, ms = 10_000): Promise<number> {
+  const end = Date.now() + ms;
+  for (;;) {
+    const text = fs.existsSync(file) ? fs.readFileSync(file, 'utf8').trim() : '';
+    if (/^\d+$/.test(text)) return Number(text);
+    if (Date.now() > end) throw new Error(`no pid in ${file}`);
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+test('harness timeout: a leader that exited and left an empty group (a daemon of its own session holds the pipes) gets no group kill', { skip: LINUX_ONLY, timeout: 30_000 }, async () => {
+  const dir = fs.realpathSync(fs.mkdtempSync('/tmp/kce-k6-'));
+  const daemonJs = path.join(dir, 'daemon.cjs');
+  fs.writeFileSync(daemonJs, "const c = require('child_process').spawn('sleep', ['30'], { detached: true, stdio: ['ignore', 'inherit', 'inherit'] }); require('fs').writeFileSync(process.argv[2], String(c.pid)); c.unref();\n");
+  let daemon: number | undefined;
+  let daemonTicks: number | undefined;
+  try {
+    await withKillSpy(async (calls) => {
+      const t0 = Date.now();
+      const run = runGroup(`echo $$ > '${dir}/leader.pid'; '${process.execPath}' '${daemonJs}' '${dir}/daemon.pid'; exit 0`, { env: process.env, timeoutMs: POST_EXIT_TIMEOUT_MS, label: 'k6-empty' });
+      const leader = await readPid(path.join(dir, 'leader.pid'));
+      daemon = await readPid(path.join(dir, 'daemon.pid'));
+      daemonTicks = startTicksOf(daemon);
+      await waitReaped(leader, 'the leader');
+      assert.ok(Date.now() - t0 < POST_EXIT_TIMEOUT_MS, 'precondition: the leader exited (its group emptied) before the timeout');
+      assert.ok(daemonTicks !== undefined, 'precondition: the daemon holding the pipes runs');
+      await new Promise((r) => setTimeout(r, t0 + POST_EXIT_TIMEOUT_MS + 500 - Date.now())); // past the timeout
+      assert.deepEqual(calls.filter(([p]) => p === -leader), [], `the timeout signalled group ${leader} after its leader exited and the group emptied`);
+      killIfSame(daemon, daemonTicks); // its pipes close: the run ends
+      const r = await run;
+      assert.match(r.out, new RegExp(`FAIL harness-timeout k6-empty exceeded ${POST_EXIT_TIMEOUT_MS} ms`));
+    });
+  } finally {
+    if (daemon !== undefined) killIfSame(daemon, daemonTicks);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('harness timeout (control): a leader still running gets its group killed', { skip: LINUX_ONLY, timeout: 30_000 }, async () => {
+  const dir = fs.realpathSync(fs.mkdtempSync('/tmp/kce-k6-'));
+  try {
+    await withKillSpy(async (calls) => {
+      const t0 = Date.now();
+      const run = runGroup(`echo $$ > '${dir}/leader.pid'; sleep 30; echo DONE`, { env: process.env, timeoutMs: 500, label: 'k6-live' });
+      const leader = await readPid(path.join(dir, 'leader.pid'));
+      const r = await run;
+      assert.ok(Date.now() - t0 < 10_000, 'the group was killed');
+      assert.ok(calls.some(([p, s]) => p === -leader && s === 'SIGKILL'), JSON.stringify(calls));
+      assert.equal(r.code, null);
+      assert.doesNotMatch(r.out, /DONE/);
+      assert.match(r.out, /FAIL harness-timeout k6-live/);
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('harness timeout (control): a leader that exited while a member of its group holds the pipes still gets that group killed', { skip: LINUX_ONLY, timeout: 30_000 }, async () => {
+  const dir = fs.realpathSync(fs.mkdtempSync('/tmp/kce-k6-'));
+  let member: number | undefined;
+  let memberTicks: number | undefined;
+  try {
+    await withKillSpy(async (calls) => {
+      const t0 = Date.now();
+      const run = runGroup(`echo $$ > '${dir}/leader.pid'; sleep 30 & echo $! > '${dir}/member.pid'; exit 0`, { env: process.env, timeoutMs: POST_EXIT_TIMEOUT_MS, label: 'k6-member' });
+      const leader = await readPid(path.join(dir, 'leader.pid'));
+      member = await readPid(path.join(dir, 'member.pid'));
+      memberTicks = startTicksOf(member);
+      await waitReaped(leader, 'the leader');
+      assert.ok(Date.now() - t0 < POST_EXIT_TIMEOUT_MS, 'precondition: the leader exited before the timeout');
+      assert.ok(memberTicks !== undefined, 'precondition: the member holding the pipes runs');
+      const r = await run;
+      assert.ok(Date.now() - t0 < 15_000, 'the member was killed');
+      assert.ok(calls.some(([p, s]) => p === -leader && s === 'SIGKILL'), JSON.stringify(calls));
+      assert.equal(startTicksOf(member), undefined, 'the member is gone');
+      assert.match(r.out, /FAIL harness-timeout k6-member/);
+    });
+  } finally {
+    if (member !== undefined) killIfSame(member, memberTicks);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

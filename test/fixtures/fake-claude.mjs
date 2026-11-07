@@ -573,7 +573,7 @@ function main() {
   const resumeArg = one(opts, '--resume');
   const resumeAt = one(opts, '--resume-session-at');
   if (resumeAt !== undefined && (resumeArg === undefined || resumeArg === true)) return fail('Error: --resume-session-at requires --resume');
-  if (sessionIdArg && resumeArg && !opts['--fork-session']) {
+  if (sessionIdArg && (resumeArg || opts['--continue']) && !opts['--fork-session']) {
     return fail('Error: --session-id can only be used with --continue or --resume if --fork-session is also specified.');
   }
 
@@ -610,6 +610,16 @@ function main() {
   // fork's transcript only with its first user line, so until then `--resume <fork id>` finds no
   // conversation (VERIFIED: a fork that exits without a message leaves no transcript)
   let forkPending = false;
+  // a --session-id whose transcript exists in the cwd's project dir: real claude 2.1.319 refuses it
+  // (VERIFIED: `Error: Session ID <id> is already in use.`, exit 1, nothing on stdout) for a new
+  // start and for a fork (`--resume X` or `--continue` with --fork-session) alike, BEFORE any
+  // session is loaded (the same answer when X has no transcript), so a re-fork of a fork that
+  // Claude already wrote never overwrites it. Exempt: a fork onto the very id it resumes
+  // (`--resume T --fork-session --session-id T`, VERIFIED exit 0, T untouched); transcripts of
+  // other project dirs do not count (VERIFIED)
+  if (persist && sessionIdArg && !(opts['--fork-session'] && resumeArg === sessionIdArg) && fs.existsSync(transcriptFile(sessionIdArg))) {
+    return fail(`Error: Session ID ${sessionIdArg} is already in use.`);
+  }
   if (resumeArg !== undefined && resumeArg !== true) {
     let loaded = [];
     if (persist) {
@@ -657,10 +667,7 @@ function main() {
     sessionId = newest ? newest.f.replace(/\.jsonl$/, '') : uuid();
     if (newest) historyLines = fs.readFileSync(path.join(projectDir, newest.f), 'utf8').split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
   } else {
-    sessionId = sessionIdArg || uuid();
-    if (persist && fs.existsSync(transcriptFile(sessionId))) {
-      return fail(`Error: Session ID ${sessionId} is already in use.`);
-    }
+    sessionId = sessionIdArg || uuid(); // an existing --session-id was refused above
   }
 
   /* --- static config --------------------------------------------------------------------- */

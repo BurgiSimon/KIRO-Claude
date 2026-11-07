@@ -162,12 +162,19 @@ export interface ReadyRecord {
   /** Start time and boot of `pid` when `crew start` recorded it (absent in an older kiro-claude's file, or without /proc). */
   startTime?: number;
   bootId?: string;
+  /**
+   * The process group of `pid` then (with a start time only): equal to `pid` for a gateway that
+   * led its own group, as `crew start` runs it (absent in an older kiro-claude's file).
+   */
+  pgid?: number;
 }
 
 /**
  * The key under which `crew start` adds, to the `KIROCREW_READY:{…}` object it stores as
- * `ready.json`, the identity of the gateway process: `{pid, startTime?, bootId?}`. A pid alone
- * outlives its process (a stale file, a reboot); with its start time and boot it names one process.
+ * `ready.json`, the identity of the gateway process: `{pid, startTime?, bootId?, pgid?}`. A pid
+ * alone outlives its process (a stale file, a reboot); with its start time and boot it names one
+ * process. `pgid` says whether it led its own process group (`crew stop` retires the members a
+ * crashed gateway left there).
  */
 export const READY_IDENTITY_KEY = 'kiroClaude';
 
@@ -187,6 +194,7 @@ export function readReady(paths: CrewPaths): ReadyRecord | undefined {
     if (id && typeof id === 'object' && pid !== undefined && id.pid === pid) {
       if (typeof id.startTime === 'number' && Number.isInteger(id.startTime)) rec.startTime = id.startTime;
       if (typeof id.bootId === 'string' && id.bootId) rec.bootId = id.bootId;
+      if (rec.startTime !== undefined && typeof id.pgid === 'number' && Number.isInteger(id.pgid) && id.pgid > 0) rec.pgid = id.pgid;
     }
     return rec;
   } catch {

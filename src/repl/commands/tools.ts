@@ -15,6 +15,7 @@ import type { ToolListingEntry } from '../../types.js';
 import { c } from '../../util/ansi.js';
 import { trustAllWarning } from '../prompt.js';
 import type { BuiltinCommand, ReplContext } from '../types.js';
+import { CANCELLED, cancelledLine, sessionCall } from './cancellable.js';
 
 const USAGE = [
   '/tools                    Show the tools and their permission',
@@ -97,7 +98,13 @@ export const toolsCommand: BuiltinCommand = {
       case 'list': {
         let pending: string[] = [];
         try {
-          pending = (await r.session.mcpStatus()).filter((m) => m.status === 'pending').map((m) => m.name);
+          // Claude Code's `mcp_status` answer (servers still loading): Ctrl+C stops waiting (K9)
+          const st = await sessionCall(r, (s) => s.mcpStatus());
+          if (st === CANCELLED) {
+            r.write(cancelledLine('/tools'));
+            return;
+          }
+          pending = st.filter((m) => m.status === 'pending').map((m) => m.name);
         } catch {
           pending = [];
         }
