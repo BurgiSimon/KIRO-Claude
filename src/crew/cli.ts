@@ -85,6 +85,18 @@ Options:
   stop: `Stop the Kiro Crew gateway
 
 Usage: kiro-claude crew stop [--timeout <SECONDS>]
+
+Runs 'kirocrew stop' and waits for the gateway to exit (--timeout, default 30 s). If it still
+runs and its pid is known, it gets SIGTERM and, 10 s later, SIGKILL. Then crew stop reaps
+orphaned 'kiro-claude acp' agent processes, ends what is left of the gateway's own process
+tree and removes the dashboard token.
+
+On Linux it also retires the processes that a gateway which crashed left running in its
+process group, proven from run/ready.json and run/crashed.json (crew start warns when there
+are any); elsewhere it signals none of them.
+
+Exit status: 0 stopped (or not running); 1 not set up, the gateway did not exit, its lock is
+still held, or, with no gateway running, a leftover of a crashed one survived SIGKILL.
 `,
   status: `Show the gateway state
 
@@ -113,9 +125,14 @@ Examples:
 
 Usage: kiro-claude crew unstub
 `,
-  uninstall: `Undo crew setup (restores Kiro Crew config, removes the shim and the identity stub)
+  uninstall: `Undo crew setup: stops the gateway, restores Kiro Crew's previous config, and removes
+the shim, the identity stub (only if crew setup created it), crew.json and the run files and
+logs under run/ (crashed.json included). Kiro Crew's data and the checkout are kept.
 
 Usage: kiro-claude crew uninstall [--purge]
+
+  --purge  also remove the private claude-agent-acp bridge and the build caches, then the crew
+           state directory itself when it is empty
 `,
 });
 

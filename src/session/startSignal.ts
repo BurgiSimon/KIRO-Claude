@@ -8,10 +8,26 @@
  * start signal instead:
  *
  *  - explicitly: `KiroSessionInternalOptions.startSignal` (session/kiroSession.ts);
- *  - or for every session created inside `fn`: {@link withStartSignal}. The REPL's `/chat new`,
- *    `/chat resume` and `/chat load` (repl/commands/chat.ts `activate`) pass their command signal
- *    (aborted by Ctrl+C) this way, through the REPL's own `createSession` / `importSession`, which
- *    take no signal of their own.
+ *  - or for every session created inside `fn`: {@link withStartSignal} (the session reads it once,
+ *    when it is created). The sources, by module:
+ *     - repl/core.ts `Repl.opening()`: every session the REPL creates (the chat, `/chat
+ *       new|resume|load`, the spec runtime's sessions, the forced-stop restart) starts under the
+ *       caller's start signal combined with the fatal-signal one, `ExitSignals.startSignal`
+ *       (repl/exitSignals.ts: SIGHUP / SIGTERM, or SIGINT while the chat starts or during its
+ *       final close), so a signal cancels a start that is still running its agentSpawn hooks.
+ *     - repl/core.ts `submit()`: the restart after a forced stop (second Ctrl+C) runs under a
+ *       press signal of its own; a Ctrl+C while the restarted session runs its agentSpawn hooks
+ *       cancels the restart (r5 P2).
+ *     - repl/commands/chat.ts `activate`: `/chat new`, `/chat resume` and `/chat load` pass their
+ *       command signal (aborted by Ctrl+C).
+ *     - spec/workflow.ts: the REPL spec runtime's phase sessions and continuation
+ *       (`createUnderPress`) start under the command's Ctrl+C signal or, once a press has aborted
+ *       it, under the next press (ReplContext.nextPressSignal, r5 P1); a task session of `/spec
+ *       run` or `kiro-claude spec run` (`executeTask`) under the run's Ctrl+C signal.
+ *     - headless/run.ts: the `chat --no-interactive` session under `ExitSignals.startSignal`.
+ *     - acp/server.ts `createUnderStop`: `session/new`, `session/load` and the restart after a
+ *       stuck cancel, under the server's stop signal (stdin EOF, a signal) and, for a request, its
+ *       own `$/cancel_request` or the connection closing.
  *
  * When the signal aborts before the session's agentSpawn hooks are done, the hook commands still
  * running are killed (with their process groups), Claude Code is never spawned, the creation

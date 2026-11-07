@@ -863,6 +863,10 @@ function main() {
     historyLines
       .filter((l) => l.type === 'user' && l.message && !l.localCommand && !(Array.isArray(l.message.content) && l.message.content.some((b) => b && b.type === 'tool_result')))
       .flatMap((l) => (l.isCompactSummary ? (Array.isArray(l.fakeSummarizedTexts) ? l.fakeSummarizedTexts : []) : [userTextOf(l.message.content)]));
+  // the session holds a message of the conversation (a compaction summary counts; the entries of
+  // local commands do not): /compact of a session without one fails (VERIFIED 2.1.319)
+  const hasConversation = () =>
+    historyLines.some((l) => (l.type === 'user' || l.type === 'assistant') && l.message && !l.localCommand && !l.isMeta);
   // the message /compact keeps verbatim: real claude 2.1.319 kept the last assistant message of a
   // conversation with two user turns or more and nothing after a single turn (VERIFIED);
   // $FAKE_CLAUDE_COMPACT_PRESERVE=none keeps nothing, =last always the last assistant message
@@ -1349,6 +1353,47 @@ function main() {
         return emitResult(t, { result: '', local_command: 'clear', stop_reason: null });
       }
       case 'compact': {
+        if (!hasConversation() && historyLines.length > 0) {
+          // a session holding only local-command entries (a /effort, a /compact refused before):
+          // real claude 2.1.319 starts the compaction and refuses it (VERIFIED, no model call): a
+          // failed compaction status with the reason, a synthetic assistant frame with it as
+          // stdout and no local_command_outcome, then a result with the text that says success;
+          // no boundary or summary; the transcript gets the command entries and a
+          // system/local_command entry with the stdout
+          const text = 'Not enough messages to compact.';
+          emit({ type: 'system', subtype: 'status', status: 'compacting', session_id: sessionId, uuid: uuid() });
+          emit({ type: 'system', subtype: 'status', status: null, compact_result: 'failed', compact_error: text, session_id: sessionId, uuid: uuid() });
+          emit(initFrame(t.uuids));
+          emit({
+            type: 'assistant',
+            message: { id: uuid(), container: null, model: '<synthetic>', role: 'assistant', stop_reason: 'end_turn', stop_sequence: null, type: 'message', usage: zeroUsage(), content: [{ type: 'text', text }], context_management: null },
+            parent_tool_use_id: null, local_command_source: `<local-command-stdout>${text}</local-command-stdout>`, session_id: sessionId,
+            uuid: uuid(), timestamp: now(), local_command_run: { command: 'compact', args },
+          });
+          recordLocalCommand(t.line, 'compact', args);
+          appendTranscript({ type: 'system', subtype: 'local_command', uuid: uuid(), content: `<local-command-stdout>${text}</local-command-stdout>`, level: 'info' });
+          t.localRecorded = true;
+          return emitResult(t, { result: text, local_command: 'compact', stop_reason: null, num_turns: 0 });
+        }
+        if (!hasConversation()) {
+          // a session with no messages (a new one, or one after /clear or a fallback): real claude
+          // 2.1.319 refuses it (VERIFIED, no model call): no status, boundary or summary; one
+          // synthetic assistant frame with the error and local_command_outcome failed, then a
+          // result that still says success; the transcript gets the command entries and a
+          // system/local_command entry with the stderr
+          emit(initFrame(t.uuids));
+          const text = 'Error: No messages to compact';
+          emit({
+            type: 'assistant',
+            message: { id: uuid(), container: null, model: '<synthetic>', role: 'assistant', stop_reason: 'end_turn', stop_sequence: null, type: 'message', usage: zeroUsage(), content: [{ type: 'text', text }], context_management: null },
+            parent_tool_use_id: null, local_command_source: `<local-command-stderr>${text}</local-command-stderr>`, session_id: sessionId,
+            uuid: uuid(), timestamp: now(), local_command_run: { command: 'compact', args }, local_command_outcome: { kind: 'failed' },
+          });
+          recordLocalCommand(t.line, 'compact', args);
+          appendTranscript({ type: 'system', subtype: 'local_command', uuid: uuid(), content: `<local-command-stderr>${text}</local-command-stderr>`, level: 'info' });
+          t.localRecorded = true;
+          return emitResult(t, { result: '', local_command: 'compact', stop_reason: null, num_turns: 0 });
+        }
         emit({ type: 'system', subtype: 'status', status: 'compacting', session_id: sessionId, uuid: uuid() });
         if (!(await sleep(Number(env.FAKE_CLAUDE_COMPACT_MS || 5), t.signal))) {
           emit({ type: 'system', subtype: 'status', status: null, compact_result: 'failed', session_id: sessionId, uuid: uuid() });

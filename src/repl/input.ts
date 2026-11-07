@@ -24,6 +24,14 @@
  *    terminal. A line that is exactly `\x03` stands for Ctrl+C (emitted as `'interrupt'` at
  *    once when a turn is listening, else queued) and `\x04` for Ctrl+D. End of input ⇒ `eof`.
  *
+ * In both modes an error on the input (a hung-up terminal: EIO from `setRawMode` or a read) is
+ * end of input: every pending read gets `eof`, never an unhandled 'error' (r5 #1); in terminal
+ * mode a half-typed line at the input's end (the terminal went away) is dropped, not delivered
+ * as a line (line mode keeps a last line without a newline: piped text). While the
+ * `muted` option says so (the REPL after a fatal signal) the reader writes nothing of its own:
+ * no prompt, no echo, nothing printed above the prompt; in terminal mode keys typed meanwhile
+ * are dropped (readline does not echo them either).
+ *
  * Reads nest (a stack): an approval prompt or `ask()` raised while the idle prompt is shown
  * takes the next line; when it finishes the previous prompt is shown again.
  *
@@ -82,6 +90,12 @@ export interface LineReaderOptions {
   completer?: (line: string) => [string[], string];
   /** Called for every logical input added to the history. */
   onHistory?: (entry: string) => void;
+  /**
+   * While true, nothing of the reader's own is written: no prompt, no line-mode echo, no
+   * {@link LineReader.printAbove} (the REPL after a fatal signal, r5 g2). Line-mode reads still
+   * get their lines; terminal-mode keys are dropped.
+   */
+  muted?: () => boolean;
 }
 
 interface PendingRead {
@@ -131,6 +145,8 @@ export class LineReader extends EventEmitter {
   private readonly stack: PendingRead[] = [];
   private readonly queue: string[] = [];
   private ended = false;
+  /** Terminal mode: the input ended (the terminal hung up). */
+  private inputEnded = false;
   private closed = false;
   private pasting = false;
   /** Time of a Return that was the most recent key (for collapsing CRLF), else 0. */
@@ -140,6 +156,7 @@ export class LineReader extends EventEmitter {
   private readlineAddedHistory = false;
   private ttyWrite: ((s: string | undefined, key: Key | undefined) => void) | undefined;
   private readonly onHistory: ((entry: string) => void) | undefined;
+  private readonly muted: () => boolean;
   private readonly historySize: number;
   private readonly fallbackHistory: string[] = [];
 
@@ -149,6 +166,7 @@ export class LineReader extends EventEmitter {
     this.input = opts.input;
     this.output = opts.output;
     this.onHistory = opts.onHistory;
+    this.muted = opts.muted ?? (() => false);
     this.historySize = opts.historySize ?? DEFAULT_HISTORY_SIZE;
     if (this.terminal) {
       const ifOpts: readline.ReadLineOptions = {
@@ -175,6 +193,11 @@ export class LineReader extends EventEmitter {
         this.readlineAddedHistory = true;
       });
       this.rl.on('line', (line: string) => this.onTerminalLine(line));
+      // The terminal hung up: readline hands the half-typed line over as a line when its input
+      // ends; nobody pressed Enter, so it is no input (marked before readline sees the end).
+      (opts.input as unknown as Partial<EventEmitter>).prependListener?.('end', () => {
+        this.inputEnded = true;
+      });
       // Bracketed paste keeps pasted newlines inside one input.
       this.output.write('\u001b[?2004h');
     } else {
@@ -182,6 +205,10 @@ export class LineReader extends EventEmitter {
       this.rl.on('line', (line: string) => this.onPipeLine(line));
     }
     this.rl.on('close', () => this.onClose());
+    // A failing input is its end: a hung-up terminal fails `setRawMode(false)` with EIO while
+    // readline closes on the input's end, and readline re-emits the input's errors here (r5 #1).
+    // Without a listener that 'error' would be thrown before the REPL could close the session.
+    this.rl.on('error', () => this.onClose());
   }
 
   /** Whether a read is waiting for input. */
@@ -218,7 +245,7 @@ export class LineReader extends EventEmitter {
       };
       const onAbort = (): void => {
         if (pending.done) return;
-        if (this.terminal && this.top() === pending) {
+        if (this.terminal && this.top() === pending && !this.muted()) {
           this.clearCurrentLine();
           this.output.write('\n');
         }
@@ -302,7 +329,7 @@ export class LineReader extends EventEmitter {
   }
 
   private showPrompt(p: PendingRead): void {
-    if (this.closed) return;
+    if (this.closed || this.muted()) return;
     if (this.terminal) {
       if (this.suspended) return;
       this.rl.setPrompt(p.prompt);
@@ -317,7 +344,7 @@ export class LineReader extends EventEmitter {
     const t = this.top();
     if (!t) return;
     t.prompt = prompt;
-    if (this.terminal && !this.suspended) {
+    if (this.terminal && !this.suspended && !this.muted()) {
       this.rl.setPrompt(prompt);
       this.rl.prompt(true);
     }
@@ -325,6 +352,7 @@ export class LineReader extends EventEmitter {
 
   /** Print `text` (ending with a newline) above the active prompt, then redraw it. */
   printAbove(text: string): void {
+    if (this.muted()) return;
     const t = this.top();
     if (!t || !this.terminal || this.suspended) {
       // line mode: the prompt is already on the current line; end it, then show it again
@@ -359,14 +387,15 @@ export class LineReader extends EventEmitter {
         return;
       }
       // echo like a terminal would, so transcripts read naturally
+      const echo = !this.muted();
       if (line === '\u0003') {
-        this.output.write('^C\n');
+        if (echo) this.output.write('^C\n');
         this.finish(t, { kind: 'interrupt' });
       } else if (line === '\u0004') {
-        this.output.write('\n');
+        if (echo) this.output.write('\n');
         this.finish(t, { kind: 'ctrl-d' });
       } else {
-        this.output.write(`${line}\n`);
+        if (echo) this.output.write(`${line}\n`);
         this.deliverLine(t, line, false);
       }
     }
@@ -415,6 +444,8 @@ export class LineReader extends EventEmitter {
 
   /** True when the key was consumed. */
   private handleKey(s: string | undefined, k: Key): boolean {
+    // muted (a fatal signal): keys typed now are dropped, not echoed, kept or delivered
+    if (this.muted()) return true;
     if (k.ctrl && k.name === 'c') {
       this.lastReturnAt = 0;
       if (!this.top() && !this.suspended && this.listenerCount('interrupt') === 0) {
@@ -488,6 +519,7 @@ export class LineReader extends EventEmitter {
     const hist = this.rlHistory();
     if (this.readlineAddedHistory && hist && hist[0] === line) hist.shift();
     this.readlineAddedHistory = false;
+    if (this.inputEnded) return;
     const t = this.top();
     if (!t) return;
     this.deliverLine(t, line, false);

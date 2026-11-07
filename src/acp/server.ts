@@ -33,10 +33,18 @@
  * changed; as prompt text: its message, then `stopReason:"cancelled"`, KC-ACP-07, never
  * `end_turn`); other commands that change state (`/model x`, `/effort x`) are not interrupted: they
  * finish and answer what they did. A command withdrawn by `$/cancel_request` while still queued
- * never runs. Every session start (`session/new|load`, the stuck-cancel restart) runs under a
- * start signal (session/startSignal.ts) that shutdown (stdin EOF, a signal) and the request's own
- * cancel abort: a start still running its agentSpawn hooks is cancelled, its hooks killed, and no
- * record or lock of it stays behind.
+ * never runs. A `commands/execute compact` is cancelled by the same three: its compaction turn is
+ * interrupted (status `failed`) and it answers `Command cancelled` once its status and metadata
+ * frames are out (nothing of it follows the answer); a compaction Claude finished before the
+ * cancel reached it (its compact_boundary seen) is `completed` and answers success. A mode change
+ * (`session/set_mode`, `set_config_option` `mode`) is cancelled only by its own
+ * `$/cancel_request` (`session/cancel` leaves it alone, 05 §4.6): queued, it never runs; during
+ * the target agent's agentSpawn hooks they are killed (K3) and it answers `-32800`, the agent
+ * unchanged; past them it finishes and answers what it did. Every session start
+ * (`session/new|load`, the stuck-cancel restart) runs under a start signal
+ * (session/startSignal.ts) that shutdown (stdin EOF, a signal) and the request's own cancel
+ * abort: a start still running its agentSpawn hooks is cancelled, its hooks killed, and no record
+ * or lock of it stays behind.
  *
  * Ordering (05 §3): every update a request produces is written before its response, except
  * where kiro-cli does otherwise: `/compact` answers `end_turn` first and then sends the
@@ -486,6 +494,8 @@ class TurnCtx {
   compactionPending = false;
   compactionSummary: string | undefined;
   compactionStarted = false;
+  /** A manual compaction's compact_boundary was seen: Claude compacted the conversation. */
+  compacted = false;
   readonly startedAt = Date.now();
   cancelTimer: NodeJS.Timeout | undefined;
   readonly cancelGrace = deferred<void>();
@@ -796,11 +806,11 @@ export class AcpServer {
         this.cancel(str(p.sessionId));
         return {};
       case 'session/set_mode':
-        return this.setMode(p);
+        return this.setMode(p, rc);
       case 'session/set_model':
         return this.setModel(p);
       case 'session/set_config_option':
-        return this.setConfigOption(p);
+        return this.setConfigOption(p, rc);
       case 'session/list':
         return this.sessionList(p);
       case 'session/close':
@@ -1259,8 +1269,37 @@ export class AcpServer {
     if (switched) this.conn.notify('_kiro.dev/agent/switched', { sessionId: st.id, agentName: st.session.agent.name });
   }
 
-  /** `session/set_mode` (05 §4.7, 08 KC-ACP-03). */
-  private setMode(p: Record<string, unknown>): Promise<unknown> {
+  /**
+   * A mode change (`session/set_mode`, `set_config_option` `mode`) under its request's own signal
+   * (`$/cancel_request`, the connection closing). Withdrawn before it starts, it never runs. While
+   * the target agent's agentSpawn hooks run (the swap's first step, nothing changed yet), the abort
+   * interrupts the session, which kills them (K3): the swap is cancelled and it answers `-32800`
+   * with the agent unchanged. A swap past its hooks (the session's restart) is not stopped: it
+   * finishes and answers what it did. Either way the answer says which agent later prompts run
+   * on; none runs on a half-switched one. `session/cancel` leaves a mode change alone (05 §4.6:
+   * it cancels prompt turns and commands).
+   */
+  private async swapUnder(st: AcpSessionState, modeId: string, request: AbortSignal): Promise<void> {
+    if (request.aborted || st.closed) throw new RpcError(ErrorCodes.REQUEST_CANCELLED, 'Request cancelled');
+    const before = st.session.agent.name;
+    const onAbort = (): void => {
+      if (!st.turn && !st.closed) st.session.interrupt().catch((e) => this.log.warn(`acp[${st.id}]: interrupt failed:`, e));
+    };
+    request.addEventListener('abort', onAbort, { once: true });
+    try {
+      await this.swapTo(st, modeId);
+    } catch (e) {
+      if (request.aborted && st.session.agent.name === before) {
+        throw new RpcError(ErrorCodes.REQUEST_CANCELLED, 'Request cancelled', e instanceof RpcError && typeof e.data === 'string' ? e.data : errMessage(e));
+      }
+      throw e;
+    } finally {
+      request.removeEventListener('abort', onAbort);
+    }
+  }
+
+  /** `session/set_mode` (05 §4.7, 08 KC-ACP-03); cancelled by its own `$/cancel_request` ({@link swapUnder}). */
+  private setMode(p: Record<string, unknown>, rc: RequestContext): Promise<unknown> {
     const st = this.getSession(p.sessionId);
     const modeId = str(p.modeId);
     if (!modeId) throw invalidParams('modeId is required');
@@ -1268,7 +1307,7 @@ export class AcpServer {
       if (st.closed) throw sessionNotFound();
       await st.whenReady();
       const before = st.session.agent.name;
-      await this.swapTo(st, modeId);
+      await this.swapUnder(st, modeId, rc.signal);
       if (before === st.session.agent.name) return {};
       return respondThen({}, async () => {
         await this.reportMcp(st);
@@ -1308,8 +1347,8 @@ export class AcpServer {
     });
   }
 
-  /** `session/set_config_option` (05 §4.9). */
-  private setConfigOption(p: Record<string, unknown>): Promise<unknown> {
+  /** `session/set_config_option` (05 §4.9); a `mode` change is cancelled like `set_mode` ({@link swapUnder}). */
+  private setConfigOption(p: Record<string, unknown>, rc: RequestContext): Promise<unknown> {
     const st = this.getSession(p.sessionId);
     const configId = str(p.configId);
     if (!configId) throw invalidParams('configId is required');
@@ -1333,7 +1372,7 @@ export class AcpServer {
         }
         case 'mode':
           if (typeof value !== 'string') throw invalidParams('mode value must be a string');
-          await this.swapTo(st, value);
+          await this.swapUnder(st, value, rc.signal);
           break;
         default:
           throw invalidParams(`Unknown config option: ${configId}`);
@@ -1351,14 +1390,17 @@ export class AcpServer {
     const cmd = parseCommandParam(p.command);
     if (!cmd) return Promise.resolve({ success: false, message: 'Unknown command: /' });
     if (cmd.name === 'compact') {
-      const done = deferred<unknown>();
-      st.enqueue(async () => {
+      // cancelled like a runOp command (C3), with its compaction turn interrupted (runCompaction);
+      // it answers after the compaction's frames, so nothing of it follows the answer
+      return st.enqueue(async () => {
         if (st.closed) throw sessionNotFound();
         await st.whenReady();
-        const ok = await this.runCompaction(st, argString(cmd.args, 'value', 'instructions'), undefined);
-        done.resolve(ok ? { success: true, message: 'Conversation compacted' } : { success: false, message: 'Compaction failed' });
-      }).catch((e) => done.reject(e));
-      return done.promise;
+        // withdrawn while it was queued (`$/cancel_request`), or its session closed: it never runs
+        if (rc.signal.aborted || st.closed) return { success: false, message: 'Command cancelled' };
+        const r = await this.runCompaction(st, argString(cmd.args, 'value', 'instructions'), undefined, rc.signal);
+        if (r.ok) return { success: true, message: 'Conversation compacted' };
+        return { success: false, message: r.cancelled ? 'Command cancelled' : r.reason || 'Compaction failed' };
+      });
     }
     return st.enqueue(async () => {
       if (st.closed) throw sessionNotFound();
@@ -1821,7 +1863,10 @@ export class AcpServer {
         this.update(st.id, planUpdate(st.todos));
         return;
       case 'compaction':
-        if (st.manualCompaction) return;
+        if (st.manualCompaction) {
+          if (ev.state === 'finished') turn.compacted = true;
+          return;
+        }
         if (ev.state === 'started') {
           turn.compactionStarted = true;
           this.conn.notify('_kiro.dev/compaction/status', { sessionId: st.id, status: { type: 'started' }, summary: null });
@@ -2281,11 +2326,23 @@ export class AcpServer {
 
   /**
    * `/compact` (05 §4.5.4, 08 KC-ACP-14): with `respond` (prompt path) answer `end_turn` first,
-   * then `compaction/status` started → completed{summary} | failed, then `_kiro.dev/metadata`.
-   * A cancelled compaction the child never ends is `failed` after the grace period and the stuck
-   * session is replaced before the metadata ({@link replaceStuckSession}), as for a prompt turn.
+   * then `compaction/status` started → completed{summary} | failed{reason}, then
+   * `_kiro.dev/metadata`. A compaction Claude refuses (VERIFIED 2.1.319: "No messages to compact"
+   * for a session with no messages, a failed local command) is `failed` with Claude's message.
+   * `request` (a `commands/execute compact`'s own signal: `$/cancel_request`) interrupts the
+   * compaction turn like `session/cancel` and the session's close do (C3). A cancelled compaction
+   * is `failed` (`cancelled`), unless Claude finished it first (its compact_boundary was seen):
+   * then it is `completed`, as it happened, also when the child then never ends. One the child
+   * never ends is reported after the grace period and the stuck session is replaced before the
+   * metadata ({@link replaceStuckSession}), as for a prompt turn. Returns once every frame of it
+   * is out.
    */
-  private async runCompaction(st: AcpSessionState, instructions: string | undefined, respond: ((r: unknown) => void) | undefined): Promise<boolean> {
+  private async runCompaction(
+    st: AcpSessionState,
+    instructions: string | undefined,
+    respond: ((r: unknown) => void) | undefined,
+    request?: AbortSignal,
+  ): Promise<{ ok: boolean; cancelled: boolean; reason: string }> {
     if (respond) {
       respond({ stopReason: 'end_turn' });
       // the response is written from a promise callback: let it go out before the status frames
@@ -2294,6 +2351,11 @@ export class AcpServer {
     this.conn.notify('_kiro.dev/compaction/status', { sessionId: st.id, status: { type: 'started' }, summary: null });
     const turn = this.beginTurn(st);
     st.manualCompaction = true;
+    // the request withdrawn while it runs: interrupt this compaction's turn (C3)
+    const onRequestAbort = (): void => {
+      if (st.turn === turn) this.cancelTurn(st);
+    };
+    request?.addEventListener('abort', onRequestAbort, { once: true });
     let ok = false;
     let reason = '';
     let stuck: Promise<unknown> | undefined;
@@ -2305,28 +2367,35 @@ export class AcpServer {
         this.log.warn(`acp[${st.id}]: compaction still running ${this.timings.cancelGraceMs} ms after cancel; restarting Claude Code`);
         turn.detached = true;
         stuck = work;
-        reason = 'Compaction cancelled';
+        // Claude compacted before it stopped answering (its boundary seen): that compaction
+        // happened (Claude's transcript holds it), whatever the stuck child does next
+        ok = turn.compacted;
+        if (!ok) reason = 'Compaction cancelled';
       } else {
-        ok = !r.isError && r.stopReason !== 'cancelled' && !turn.cancelled;
+        // a cancel that came after Claude compacted (its boundary seen) changed nothing
+        ok = !r.isError && (turn.compacted || (r.stopReason !== 'cancelled' && !turn.cancelled));
         if (!ok) reason = r.error || (turn.cancelled || r.stopReason === 'cancelled' ? 'Compaction cancelled' : 'Compaction failed');
       }
     } catch (e) {
       reason = errMessage(e);
     } finally {
+      request?.removeEventListener('abort', onRequestAbort);
       st.manualCompaction = false;
       this.failOpenTools(st);
       this.endTurn(st, turn);
     }
-    if (st.closed) return false;
+    // cancelled by `session/cancel`, the request's own `$/cancel_request` or the session's close
+    const cancelled = !ok && (turn.cancelled || st.closed);
+    if (st.closed) return { ok, cancelled, reason };
     if (ok) this.conn.notify('_kiro.dev/compaction/status', { sessionId: st.id, status: { type: 'completed' }, summary: turn.compactionSummary ?? '' });
     else this.conn.notify('_kiro.dev/compaction/status', { sessionId: st.id, status: { type: 'failed' }, summary: reason });
     if (stuck) {
       await this.replaceStuckSession(st, stuck);
-      if (st.closed) return false;
+      if (st.closed) return { ok, cancelled, reason };
     }
     const n = await this.contextNumbers(st, turn.rawResult);
     this.conn.notify('_kiro.dev/metadata', { sessionId: st.id, contextUsagePercentage: n.pct ?? 0 });
-    return ok;
+    return { ok, cancelled, reason };
   }
 }
 

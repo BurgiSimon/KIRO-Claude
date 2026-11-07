@@ -17,6 +17,12 @@ lessons, cron, heartbeat, delegation, compaction, checkpointed tasks, skills, re
 resume) and frame parity with captured kiro-cli frames. Stage C repeats the pipeline and the
 ACP scenarios against the real Claude Code.
 
+The unit suite also checks the signal handling described in docs/ARCHITECTURE.md ("Ctrl+C and
+signals", "Signals and child processes"): it signals the built CLI while a chat or a
+`chat --no-interactive` run starts, during a turn, during a `/spec` flow and during the final
+close, and closes a pseudo-terminal under the chat to check a real terminal hangup. The
+pseudo-terminal tests need Linux, python3 and bash and are skipped without them.
+
 Skipped checks: a real Claude Code sign-in (manual), on-disk effects of tool calls in stage B
 (the fake `claude` simulates tools; stage C checks them), and gateway-session runtime
 directories that KiroCrew's own teardown SIGKILLs.

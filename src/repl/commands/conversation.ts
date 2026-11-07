@@ -1,7 +1,10 @@
 /**
  * Conversation-shaping commands: /compact [instructions…] (00 §2.5: Claude's local `/compact`,
  * Kiro-only flags accepted and ignored), /tangent [name | ls | root | merge | tail]
- * (01 §5.11, 06 §6.4 Classic strings; V3 errors), /rewind [N] (00 §2.5, §8 C25).
+ * (01 §5.11, 06 §6.4 Classic strings; V3 errors), /rewind [N] (00 §2.5, §8 C25: it names the
+ * saved record that keeps the original conversation). /compact prints its success line only for
+ * a compaction Claude made: a failed one (Claude's "No messages to compact", "Not enough messages
+ * to compact.") is the turn's error.
  */
 
 import { SessionStore, sessionsDir } from '../../session/store.js';
@@ -160,8 +163,26 @@ export const rewindCommand: BuiltinCommand = {
       n = idx + 1;
     }
     const before = r.session.id;
+    const parent = r.session.record?.parentId ?? undefined;
     await r.session.rewind(n);
     await r.refreshUsage();
-    r.write(`\n${c.green(`✔ Rewound the conversation to turn ${n}.`)} ${c.gray(`The original conversation is kept as ${before}.`)}\n\n`);
+    const kept = keptRecord(r, before, parent);
+    r.write(`\n${c.green(`✔ Rewound the conversation to turn ${n}.`)}${kept ? ` ${c.gray(`The original conversation is kept as ${kept}.`)}` : ''}\n\n`);
   },
 };
+
+/**
+ * The saved record that holds the conversation /rewind left: that record, or, when the rewind
+ * dropped it (an untouched copy, e.g. a /spec continuation, whose parent holds every one of its
+ * turns: KiroSession.rewind), its parent; never an id that no longer exists (r5 #2).
+ */
+function keptRecord(r: ReplContext, before: string, parent: string | undefined): string | undefined {
+  let store: SessionStore;
+  try {
+    store = new SessionStore(sessionsDir(r.ws));
+  } catch {
+    return undefined;
+  }
+  if (store.read(before)) return before;
+  return parent !== undefined && store.read(parent) ? parent : undefined;
+}

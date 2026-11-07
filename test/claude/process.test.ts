@@ -292,6 +292,14 @@ describe('turns', () => {
     assert.equal(h.proc.sessionId, reset.new_conversation_id);
     assert.equal(clr.result.session_id, reset.new_conversation_id);
 
+    // claude 2.1.319 refuses /compact of a conversation with no messages (VERIFIED): right after
+    // /clear it answers a failed local command and writes no boundary
+    const empty = await collectTurn(h.proc.turn('/compact'));
+    assert.equal(empty.result.local_command, 'compact');
+    assert.ok(!empty.frames.some((f) => f.type === 'system' && (f as { subtype?: string }).subtype === 'compact_boundary'));
+    assert.ok(empty.frames.some((f) => f.type === 'assistant' && (f as { local_command_outcome?: { kind?: string } }).local_command_outcome?.kind === 'failed'));
+
+    await collectTurn(h.proc.turn('remember the API notes'));
     const cmp = await collectTurn(h.proc.turn('/compact keep the API notes'));
     assert.equal(cmp.result.local_command, 'compact');
     assert.ok(cmp.frames.some((f) => f.type === 'system' && (f as { subtype?: string }).subtype === 'compact_boundary'));

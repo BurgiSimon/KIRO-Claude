@@ -233,7 +233,7 @@ export const SETTINGS_SCHEMA: Record<string, SettingSchemaEntry> = {
     type: 'string',
     description: 'Default spec workflow: requirements-first or design-first (unset: ask)',
   },
-  'kiroClaude.spec.maxParallelTasks': { type: 'number', default: 1, description: 'Spec tasks run concurrently by /spec run (1-4)' },
+  'kiroClaude.spec.maxParallelTasks': { type: 'number', default: 1, description: 'Tasks of one wave that kiro-claude spec run runs at once (1-4); /spec run in chat runs one task at a time' },
   'kiroClaude.autonomy': {
     type: 'string',
     default: 'autopilot',

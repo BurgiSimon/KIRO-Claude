@@ -104,7 +104,7 @@ describe('r5 S3: a pending restored history is capped at load', () => {
 });
 
 describe('r5 S4: a never-used main left in the tangent stack by a quit inside a tangent is not listed', () => {
-  it('main whose only actions were /compact and a respawn, quit inside its tangent: main is dropped, the tangent kept', async () => {
+  it('main whose only actions were /compact and a respawn, quit inside its tangent: main is dropped (and the empty tangent, r5 g1)', async () => {
     const sb = mkSandbox({ script: SCRIPT, env: { FAKE_CLAUDE_PERSIST: '1' } });
     const s = await open(sb);
     const mainId = s.id;
@@ -120,7 +120,9 @@ describe('r5 S4: a never-used main left in the tangent stack by a quit inside a 
     assert.equal(read(sb, mainId), undefined, 'a main that never had a message is not saved');
     assert.ok(!fs.existsSync(path.join(sb.sessionsDir, `${mainId}.jsonl`)), 'nor its journal');
     assert.ok(!fs.existsSync(path.join(sb.sessionsDir, `${mainId}.lock`)), 'nor its lock');
-    assert.deepEqual(store.list({ cwd: sb.cwd }).map((r) => r.forkKind), ['tangent']);
+    // r5 g1: the tangent never had a message either, so it is dropped with main
+    // (test/session/r5f-session-gaps.test.ts; one with a message of its own is kept)
+    assert.deepEqual(store.list({ cwd: sb.cwd }).map((r) => r.forkKind), []);
   });
 
   it('…but kept when a /tangent merge left a carry for its next line (a reopen delivers it)', async () => {

@@ -20,6 +20,13 @@
  * warnings go to stderr; assistant text and results (list, status, findings, run summary) to
  * stdout (00 §2.5 "Headless output"). Exit codes: 0 ok, 1 failure/stopped run, 2 usage error.
  *
+ * Ctrl+C during `spec run`: the first press stops scheduling and interrupts the running tasks.
+ * The PostTaskExec hooks of a task it interrupted run under the NEXT press, as in the REPL
+ * (SpecRuntime.nextPressSignal, {@link NextPress}): the second press kills them with their process
+ * group and the run ends normally (summary, sessions closed, exit 1). A second press with no such
+ * hook running exits at once (the default SIGINT action). SIGTERM / SIGHUP are not handled here:
+ * claude/lifecycle.ts forwards them to every tracked child (task hooks included) and re-raises.
+ *
  * Sessions come from session/kiroSession.ts `createSession` (loaded lazily; injectable for tests).
  */
 
@@ -29,6 +36,7 @@ import type {
   ApprovalRequest,
   ApprovalResponse,
   CliContext,
+  HookRunContext,
   HookRunnerLike,
   KiroHook,
   KiroSession,
@@ -337,6 +345,67 @@ async function defaultCreateSession(): Promise<CreateSessionFn> {
   return mod.createSession;
 }
 
+// ───────────────────────────── Ctrl+C during `spec run` ─────────────────────────────
+
+/**
+ * The NEXT Ctrl+C of `spec run` after the first one (the REPL's ReplContext.nextPressSignal): the
+ * PostTaskExec hooks of a task the first press interrupted run under {@link signal} (workflow
+ * executeTask), so the next press kills them with their process group (hooks/runner.ts) and the
+ * run ends normally. The next press after a {@link signal} call aborts it; a call after that
+ * press gets a fresh one. {@link press} reports whether a task hook was running under the signal
+ * IT aborts, so a press with nothing under it can still exit at once: also one that comes while
+ * a hook an earlier press killed has not settled yet (runShell's close grace, a process the
+ * kernel has not reaped), which must not swallow every later press.
+ */
+export class NextPress {
+  private ac: AbortController | undefined;
+  private readonly issued = new WeakSet<AbortSignal>();
+  /** Task hooks running, per signal handed out (entries removed at 0). */
+  private readonly running = new Map<AbortSignal, number>();
+
+  /** A signal the next press aborts. */
+  signal(): AbortSignal {
+    this.ac ??= new AbortController();
+    this.issued.add(this.ac.signal);
+    return this.ac.signal;
+  }
+
+  /** `runner`, with its task hooks that run under one of our signals counted as work under the next press. */
+  track(runner: HookRunnerLike): HookRunnerLike {
+    return new Proxy(runner, {
+      get: (target, key) => {
+        const v = Reflect.get(target, key, target) as unknown;
+        if (typeof v !== 'function') return v;
+        const fn = v as (...a: unknown[]) => unknown;
+        if (key !== 'runTaskHook') return fn.bind(target);
+        return async (...args: unknown[]): Promise<unknown> => {
+          const sig = (args[0] as HookRunContext | undefined)?.signal;
+          const ours = sig !== undefined && this.issued.has(sig) ? sig : undefined;
+          if (ours) this.running.set(ours, (this.running.get(ours) ?? 0) + 1);
+          try {
+            return await fn.apply(target, args);
+          } finally {
+            if (ours) {
+              const n = (this.running.get(ours) ?? 1) - 1;
+              if (n > 0) this.running.set(ours, n);
+              else this.running.delete(ours);
+            }
+          }
+        };
+      },
+    });
+  }
+
+  /** A press: abort the signal handed out; true when a task hook was running under it. */
+  press(): boolean {
+    const ac = this.ac;
+    this.ac = undefined;
+    const busy = ac !== undefined && (this.running.get(ac.signal) ?? 0) > 0;
+    ac?.abort();
+    return busy;
+  }
+}
+
 // ───────────────────────────── runtime ─────────────────────────────
 
 interface CliRuntimeOptions {
@@ -347,7 +416,8 @@ interface CliRuntimeOptions {
   trustTools?: string[];
 }
 
-function cliRuntime(ctx: CliContext, o: CliRuntimeOptions, deps: SpecCliDeps, io: () => SpecCliIO): SpecRuntime {
+/** `press`: `spec run`'s next Ctrl+C (SpecRuntime.nextPressSignal); the other commands have none. */
+function cliRuntime(ctx: CliContext, o: CliRuntimeOptions, deps: SpecCliDeps, io: () => SpecCliIO, press?: NextPress): SpecRuntime {
   const ui = sessionUI(ctx, o.interactive, io);
   let createFn: CreateSessionFn | undefined = deps.createSession;
   const base = (): KiroSessionOptions => {
@@ -424,13 +494,17 @@ function cliRuntime(ctx: CliContext, o: CliRuntimeOptions, deps: SpecCliDeps, io
           const { agents } = loadAgents(ctx.ws, { settings: ctx.settings });
           const { agent } = selectAgent(ctx.ws, agents, ctx.settings, o.agentName, { interactive: o.interactive });
           const all = allHooksFor(ctx.ws, agent);
-          hooks = all.some((h) => h.trigger === 'PreTaskExec' || h.trigger === 'PostTaskExec') ? { runner: factory(all), sessionId: randomUUID() } : null;
+          if (all.some((h) => h.trigger === 'PreTaskExec' || h.trigger === 'PostTaskExec')) {
+            const runner = factory(all);
+            hooks = { runner: press ? press.track(runner) : runner, sessionId: randomUUID() };
+          } else hooks = null;
         } catch {
           hooks = null;
         }
       }
       return hooks ?? undefined;
     },
+    ...(press ? { nextPressSignal: () => press.signal() } : {}),
     readyHint: (name) => `Spec ready. Run all tasks: ${prog} spec run ${name} · Step through: ${prog} spec run ${name} --next`,
     finish: () => driver.finish('close'),
   };
@@ -642,13 +716,17 @@ export async function runSpecCommandWith(args: string[], ctx: CliContext, deps: 
         if (ids.length) sel = { kind: 'ids', ids, includeOptional };
         else if (p.flags.has('--next')) sel = { kind: 'next', includeOptional };
         else sel = { kind: 'scope', includeOptional };
-        const rt = cliRuntime(ctx, rtOpts, deps, io);
+        const press = new NextPress();
+        const rt = cliRuntime(ctx, rtOpts, deps, io, press);
         const ac = new AbortController();
         let sigints = 0;
         const onSig = (): void => {
           sigints++;
           ctx.stderr.write(sigints === 1 ? '\nInterrupting… (press Ctrl+C again to exit)\n' : '\n');
           if (sigints > 1) {
+            // a PostTaskExec hook of a task the first press interrupted runs under this press:
+            // killing it lets the run end normally (summary, sessions closed); else exit now
+            if (press.press()) return;
             process.off('SIGINT', onSig);
             process.kill(process.pid, 'SIGINT'); // default action: terminate
             return;

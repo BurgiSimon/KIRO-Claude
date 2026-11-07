@@ -97,7 +97,21 @@ Flags with an effect: `--session-id`, `--resume`, `--fork-session`, `--resume-se
   (`system/status compacting` → `compact_boundary` (`compact_metadata.preserved_segment` /
   `preserved_messages` when it keeps a message verbatim, `logical_parent_uuid`) → synthetic summary
   user frame → `<local-command-stdout>Compacted </local-command-stdout>` replay → result
-  `local_command:"compact"`, same id; see Persistence for what it writes and keeps), `/effort <level>`, `/model [name]`, `/cost`, `/usage`,
+  `local_command:"compact"`, same id; see Persistence for what it writes and keeps; a session with
+  no message of the conversation — a new one, one after `/clear`, a fresh session after a
+  fallback — is refused as by the real 2.1.319 (VERIFIED, no model call): `system/init`, one
+  synthetic assistant frame with the text `Error: No messages to compact`,
+  `local_command_source:"<local-command-stderr>…</local-command-stderr>"`,
+  `local_command_run:{command:"compact",args}` and `local_command_outcome:{kind:"failed"}`, then a
+  result that still says `subtype:"success"`, `is_error:false`, `result:""`,
+  `local_command:"compact"`; no status, boundary or summary; a session holding only
+  local-command entries — after an `/effort`, or a `/compact` refused like that — is refused the
+  other way 2.1.319 does (VERIFIED, no model call): `system/status compacting`, then
+  `system/status` `{status:null, compact_result:"failed", compact_error:"Not enough messages to
+  compact."}`, `system/init`, a synthetic assistant frame with that text,
+  `local_command_source:"<local-command-stdout>…</local-command-stdout>"` and `local_command_run`
+  but no `local_command_outcome`, then a success result with `result:"Not enough messages to
+  compact."`, `num_turns:0`; no boundary or summary), `/effort <level>`, `/model [name]`, `/cost`, `/usage`,
   `/context`, `/help`. Any other `/x` is "forwarded to the model", i.e. handled by the script.
 * A non-JSON stdin line is fatal (`Error parsing streaming input line …`, exit 1), like the real CLI.
 * stdin EOF: finishes queued turns and exits 0 (1 if the last result was an error). If a CLI→host
@@ -228,7 +242,10 @@ at the `Compacted` entry or later holds the compacted conversation; a fork at th
 summary. What is kept: the last assistant message when the conversation has two user turns or more,
 nothing after a single turn (what the real claude kept in those probes; its rule may depend on more);
 `FAKE_CLAUDE_COMPACT_PRESERVE=none` keeps nothing, `=last` always the last assistant message. An
-interrupted `/compact` writes only the command entries. `/clear` and `/help` write nothing (the real
+interrupted `/compact` writes only the command entries; a refused one (no messages) the command
+entries and a `system`/`local_command` `<local-command-stderr>Error: No messages to compact…`
+entry, so that session then has a transcript too (one refused for "Not enough messages" the
+command entries and a `<local-command-stdout>Not enough messages to compact.…` entry). `/clear` and `/help` write nothing (the real
 2.1.319 writes a file for `/clear`'s new session; not modeled). Without persistence any `--resume` id is
 accepted with empty history (and `--resume-session-at` cuts nothing). Never point
 `CLAUDE_CONFIG_DIR` at a real config dir.

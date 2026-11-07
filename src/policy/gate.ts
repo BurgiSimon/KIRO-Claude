@@ -17,7 +17,10 @@
  *     `tools` selection (P1 enforcement of `@srv/tool` partial selections,
  *     excluded MCP tools, `subagent/<name>` lists) ⇒ deny; spec phase: an `fs_write` outside
  *     the phase's allowed paths ⇒ `Spec phase <name>: only <paths> may be written now`, one
- *     inside them is auto-allowed unless policy denies (03 §1.11.3).
+ *     inside them is auto-allowed unless policy denies (03 §1.11.3). "Inside" is decided by
+ *     policy/specwrite.ts, anchored to the spec folder: never through a symbolic link at the
+ *     document (or the call's path), never outside the workspace (r5 #3); a phase document it
+ *     refuses gets that denial with the reason in parentheses, also in plan mode.
  *  3. Policy per agent — the session agent and, for calls inside a Claude subagent
  *     (`agent_type`), the matching Kiro agent too; the stricter verdict wins (deny > ask >
  *     allow). V2 agents: qengine.evaluateQ; V3 agents: capengine.evaluateCap over agent rules,
@@ -70,13 +73,11 @@ import type {
   ToolOutcome,
   WorkspaceContext,
 } from '../types.js';
-import { globMatch, hasGlobMeta } from '../util/glob.js';
-import { expandTilde, isSubpath } from '../util/paths.js';
 import { collectRules, evaluateCap, ruleAppliesTo, V3_DEFAULT_RULES } from './capengine.js';
 import { checkInvariants } from './invariants.js';
-import { canonicalizePath, canonicalizePattern } from './pathmatch.js';
 import { effectiveAllowedTools, evaluateQ, toolSettings } from './qengine.js';
 import { isToolInAllowlist, matchesAnyPattern } from './qmatch.js';
+import { checkSpecWrite, type SpecWriteCheck } from './specwrite.js';
 import {
   FILE_WRITE_TOOLS,
   NEVER_EXPOSE_TOOLS,
@@ -112,6 +113,17 @@ export const ALLOW_REASON = 'kiro';
 /** Q denial sentence sent to the model for rule denials (06 §2.4). */
 export function forbiddenMessage(toolName: string): string {
   return `Tool use with ${toolName} was rejected because the arguments supplied were forbidden`;
+}
+
+/**
+ * Spec-phase denial (03 §1.11.3): `Spec phase <name>: only <paths> may be written now`, with the
+ * reason in parentheses when the call names a phase document the allowance refused
+ * (policy/specwrite.ts: a symbolic link, a folder that leaves the workspace).
+ */
+function specDenial(phase: { name: string; allowedWritePaths: readonly string[] }, check: SpecWriteCheck | undefined): StaticEval {
+  const paths = phase.allowedWritePaths.length ? phase.allowedWritePaths.join(', ') : '(nothing)';
+  const reason = `Spec phase ${phase.name}: only ${paths} may be written now${check?.refused ? ` (${check.refused})` : ''}`;
+  return { kind: 'deny', reason, reasons: [reason] };
 }
 
 /** Q preToolUse block text (06 §3.7). */
@@ -744,20 +756,22 @@ export class Gate {
     const ws = this.deps.ws;
     const inv = checkInvariants(call, ws, this.deps.isIgnored ? { isIgnored: (p) => this.deps.isIgnored!(p) } : undefined);
     if (inv?.effect === 'deny') return { kind: 'deny', reason: inv.reason, reasons: [inv.reason] };
+    const phase = this.deps.specPhase();
+    const spec = phase && call.capability === 'fs_write' && !call.mcp ? checkSpecWrite(call, phase.allowedWritePaths, ws) : undefined;
     // plan mode denies every mutating call. The one exception is a spec phase of a plan-mode chat
     // (its phase sessions take the chat's plan mode, SpecSessionDriver): a write of that phase's own
-    // documents, every path named and allowed, goes on to the spec-phase rule below (T2)
-    if (this.deps.planMode() && call.mutating && !this.isSpecPhaseWrite(call)) return { kind: 'deny', reason: PLAN_MODE_DENY, reasons: [PLAN_MODE_DENY] };
+    // documents, every path named and allowed (policy/specwrite.ts), goes on to the spec-phase rule
+    // below (T2). A write of a phase document the allowance refuses (a symbolic link, a folder that
+    // leaves the workspace; r5 #3) gets the spec-phase denial with that reason instead
+    if (this.deps.planMode() && call.mutating && !spec?.ok) {
+      if (phase && spec?.refused) return specDenial(phase, spec);
+      return { kind: 'deny', reason: PLAN_MODE_DENY, reasons: [PLAN_MODE_DENY] };
+    }
     const sel = this.selectionDenial(call);
     if (sel) return { kind: 'deny', reason: sel, reasons: [sel] };
     let specAllowed = false;
-    const phase = this.deps.specPhase();
     if (phase && call.capability === 'fs_write') {
-      if (!this.specAllows(call, phase.allowedWritePaths)) {
-        const paths = phase.allowedWritePaths.length ? phase.allowedWritePaths.join(', ') : '(nothing)';
-        const reason = `Spec phase ${phase.name}: only ${paths} may be written now`;
-        return { kind: 'deny', reason, reasons: [reason] };
-      }
+      if (!spec?.ok) return specDenial(phase, spec);
       specAllowed = true;
     }
     const { verdict, name } = this.evaluatePolicy(call);
@@ -775,27 +789,6 @@ export class Gate {
       reasons = [inv.reason, ...(verdict.kind === 'ask' ? verdict.reasons : [])];
     }
     return { kind, reasons };
-  }
-
-  /** `call` writes only files the current spec phase allows (and names at least one). */
-  private isSpecPhaseWrite(call: KiroToolCall): boolean {
-    const phase = this.deps.specPhase();
-    return !!phase && call.capability === 'fs_write' && !call.mcp && call.subjects.length > 0 && phase.allowedWritePaths.length > 0 && this.specAllows(call, phase.allowedWritePaths);
-  }
-
-  private specAllows(call: KiroToolCall, allowedWritePaths: string[]): boolean {
-    const ws = this.deps.ws;
-    const base = ws.workspaceRoot || ws.cwd;
-    return call.subjects.every((s) => {
-      const c = canonicalizePath(s, call.cwd || ws.cwd, ws.env);
-      return allowedWritePaths.some((e) => {
-        if (hasGlobMeta(e, 'v3path')) {
-          return globMatch(canonicalizePattern(e, base, ws.env, ws.home, 'v3path').pattern, c, 'v3path');
-        }
-        const abs = canonicalizePath(path.resolve(base, expandTilde(e, ws.env)), base, ws.env);
-        return c === abs || isSubpath(c, abs);
-      });
-    });
   }
 
   /**

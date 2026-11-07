@@ -318,9 +318,11 @@ export function journalSize(dir: string, sid: string): number {
  * history) is kept: a reopen delivers it. KiroSession's close drops such a record (unusedRecord;
  * also one a quit inside its tangent leaves in the tangent stack, r5 S4); the session index skips
  * one left behind by a process that died before its close (store.ts `list`, r4 #4).
+ * `opts.tangent`: a tangent record by the same rules too (a tangent of such a chat, which holds
+ * nothing either: KiroSession's close drops it with that chat, r5 g1).
  */
-export function recordNeverUsed(dir: string, rec: SessionRecord): boolean {
-  if (rec.forkKind !== 'main' || rec.origin === 'acp') return false;
+export function recordNeverUsed(dir: string, rec: SessionRecord, opts: { tangent?: boolean } = {}): boolean {
+  if (!(rec.forkKind === 'main' || (opts.tangent === true && rec.forkKind === 'tangent')) || rec.origin === 'acp') return false;
   if (rec.turns.length > 0 || rec.messageCount > 0) return false;
   if (rec.pendingContext?.length || rec.pendingHistory !== undefined) return false;
   let text: string;
@@ -357,6 +359,37 @@ export function journalPrefix(records: readonly JournalRecord[], prompts: number
 export function journalBeforeMessage(records: readonly JournalRecord[], messageId: string): JournalRecord[] {
   const i = records.findIndex((r) => r.kind === 'Prompt' && r.data.message_id === messageId);
   return i < 0 ? [...records] : records.slice(0, i);
+}
+
+/**
+ * A compaction (a `Compaction` record) follows turn `index` (0-based) of `turns`: after the
+ * `Prompt` record of that turn (by message id). False when no Prompt names the turn.
+ */
+export function compactedAfterTurn(records: readonly JournalRecord[], turns: readonly { userUuid: string }[], index: number): boolean {
+  const id = turns[index]?.userUuid;
+  if (id === undefined) return false;
+  const i = records.findIndex((r) => r.kind === 'Prompt' && r.data.message_id === id);
+  return i >= 0 && records.slice(i + 1).some((r) => r.kind === 'Compaction');
+}
+
+/**
+ * The exchange of the turn whose `Prompt` has the message id `userUuid`: that prompt's text and
+ * the text of the turn's last assistant message (steer prompts inside the turn skipped; the
+ * turn ends at the next prompt of `turnIds`, or at the end). What a `/tangent tail` carries of a
+ * tangent rewound to that turn (KiroSession.rewind). Undefined when no `Prompt` names the turn.
+ */
+export function turnExchange(records: readonly JournalRecord[], userUuid: string, turnIds: ReadonlySet<string> = new Set()): { user: string; assistant: string } | undefined {
+  const i = records.findIndex((r) => r.kind === 'Prompt' && r.data.message_id === userUuid);
+  if (i < 0) return undefined;
+  let assistant = '';
+  for (const r of records.slice(i + 1)) {
+    if (r.kind === 'Prompt' && typeof r.data.message_id === 'string' && turnIds.has(r.data.message_id)) break;
+    if (r.kind === 'Compaction') break;
+    if (r.kind !== 'AssistantMessage') continue;
+    const text = blocksText(r.data.content);
+    if (text !== '') assistant = text;
+  }
+  return { user: blocksText(records[i]!.data.content), assistant };
 }
 
 /**

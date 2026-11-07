@@ -100,7 +100,8 @@ function remember(host: ReplHost, name: string): void {
  * {@link SPEC_IN_TANGENT_REFUSED} (Q disables checkpoints in tangent mode the same way, 06 §6.4).
  * A tangent that has no message of its own yet (just entered, directly under the main
  * conversation) holds nothing to lose: it is left first (`/tangent`), with
- * {@link SPEC_TANGENT_LEFT}, and the spec continues the main conversation (G0). `name`: only when
+ * {@link SPEC_TANGENT_LEFT}, and the spec continues the main conversation (G0), in the plan mode
+ * the user last set (plan mode is session state: KiroSession.exitTangent keeps it, r5 #0). `name`: only when
  * that spec still has a document to draft or review (a spec in task execution only steps through
  * its tasks, which runs no spec turn). True when the command must not run.
  */

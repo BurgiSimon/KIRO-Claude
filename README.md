@@ -102,6 +102,65 @@ as in Kiro.
 Model ids are Kiro-style (`claude-sonnet-5.5`, `claude-haiku-4.5`, …) and map to Claude Code
 model ids; `auto` lets Claude Code pick its default. Run `kiro-claude chat --list-models`.
 
+## Ctrl+C and signals
+
+In chat:
+
+* **Ctrl+C** while Kiro is answering interrupts the turn. While a slash command runs, it also
+  cancels the command: `/spec run` starts no further task, `/hooks run` and
+  `/chat save-via-script|load-via-script` stop their command, `/usage`, `/mcp`, `/tools` and
+  `/model` stop waiting for Claude Code, and `/chat new|resume|load` cancel a session start that
+  is still running its agentSpawn hooks.
+* What a command starts after that press, such as the PostTaskExec hooks of a task the press
+  interrupted or the start of the chat that continues a `/spec`, is cancelled by the **next
+  Ctrl+C**.
+* A **second Ctrl+C** stops Claude Code when the turn is still running 1 s later. Your next input
+  restarts it with the conversation (`--resume`); a Ctrl+C while the restarted session runs its
+  agentSpawn hooks cancels the restart. An idle Claude Code is never stopped this way.
+* At the prompt, Ctrl+C or Ctrl+D twice exits (or type `/quit`).
+
+`chat --no-interactive`: the first Ctrl+C interrupts the answer (exit status 130), a second one
+closes the session.
+
+Closing the terminal (SIGHUP), `kill` (SIGTERM) and Ctrl+C while the chat is still starting make
+kiro-claude close every open session first, your chat first (a session still starting is
+cancelled): SessionEnd hooks run, the conversation's record is saved and its lock released, so
+`kiro-claude chat --resume` continues that conversation. The close gets at most 2 s; then
+kiro-claude exits with the signal (a shell shows 128 + the signal number, e.g. 143 for SIGTERM)
+and ends any child process still running. A second signal ends it at once, unless it is the same
+signal within half a second of the first (closing a terminal tab can send SIGHUP twice). After
+the signal nothing more is printed and nothing you type is run. Details:
+[Ctrl+C and signals](docs/ARCHITECTURE.md#ctrlc-and-signals) and
+[Signals and child processes](docs/ARCHITECTURE.md#signals-and-child-processes).
+
+## Specs
+
+`/spec` in chat and `kiro-claude spec` run Kiro's spec workflow: requirements (or a bugfix
+analysis) → design → tasks, with a review after each phase (a quick spec drafts all three and has
+one review at the end), then `run` to implement the tasks. Each phase may write only its own
+documents in `.kiro/specs/<feature>/`.
+
+* In **plan mode** the phases still run and write their documents, and nothing else; `/spec run`
+  (and running tasks from `/spec <name>`) is refused, and turning plan mode on during a run stops
+  it before the next task.
+* In a **tangent**, the commands that draft a spec (`/spec new`, `approve`, `revise`, `analyze`,
+  `sync`) are refused, because the spec conversation would replace the tangent: go back with
+  `/tangent` (or `/tangent merge`) first. A tangent of the main conversation that has no message
+  of its own yet is left for you; an empty tangent nested in another one is refused too. Leaving
+  a tangent keeps the plan mode you last set.
+* The phases and the chat that continues the spec start from your current trust settings and plan
+  mode; a tool you untrusted during a task stays untrusted afterwards.
+* `/spec run` in chat runs one task at a time;
+  `kiro-claude spec run` runs up to `kiroClaude.spec.maxParallelTasks` tasks of a wave at once.
+* A spec document that is a symbolic link is never written by a phase (the write is denied, with
+  the reason). A `.kiro`, `.kiro/specs` or feature folder that is a symbolic link works when it
+  resolves inside the workspace; one that points outside it is refused the same way.
+* Ctrl+C stops a run before its next task and interrupts the running one; the next Ctrl+C kills
+  the PostTaskExec hooks of a task it interrupted. In `kiro-claude spec run` that second Ctrl+C
+  lets the run print its summary; without such a hook it exits at once.
+
+Details: [Specs](docs/ARCHITECTURE.md#specs).
+
 ## Configuration
 
 kiro-claude reads the same files as Kiro CLI:
@@ -134,7 +193,7 @@ kiro-claude's own settings live in `kiro-claude.json` next to `cli.json`:
 | `kiroClaude.claudeSettingSources` | `''` | Value for `claude --setting-sources` (`''` = only Kiro semantics; e.g. `user,project` also loads your Claude Code settings, hooks and permissions) |
 | `kiroClaude.extraClaudeArgs` | `[]` | Extra arguments for every `claude` invocation |
 | `kiroClaude.spec.defaultWorkflow` | ask | `requirements-first` or `design-first` |
-| `kiroClaude.spec.maxParallelTasks` | `1` | Spec tasks run concurrently (1–4) |
+| `kiroClaude.spec.maxParallelTasks` | `1` | Tasks of one wave that `kiro-claude spec run` runs at once (1–4); `/spec run` in chat runs one task at a time |
 
 Settings that change how `claude` is launched or authenticated are only read from the global
 settings, so a cloned repository cannot change them.
@@ -159,6 +218,13 @@ example in Zed's `settings.json`:
 
 Tool permission requests appear in the editor. Sessions are stored in `~/.kiro/sessions/cli`
 and can be loaded again.
+
+`session/cancel` also stops a Kiro command that is waiting for Claude Code: a
+`_kiro.dev/commands/execute` such as `usage` or `compact` answers `Command cancelled`, and `/usage`
+sent as prompt text ends with `stopReason: "cancelled"`. A `$/cancel_request` for a `session/new`
+or `session/load` cancels a start that is still running agentSpawn hooks, and nothing of that
+session stays. See
+[Cancelling commands and session starts](docs/ARCHITECTURE.md#cancelling-commands-and-session-starts-acp).
 
 ## KiroCrew on Claude Code
 
@@ -191,10 +257,21 @@ What `crew setup` does:
    `kiro-claude crew unstub` removes the stub again, and only if kiro-claude created it.
 
 KiroCrew's main agent, schedules, heartbeats, delegation and memory all run through
-`kiro-claude acp`, and therefore on your Claude Code subscription. `kiro-claude crew uninstall`
-undoes the setup and restores KiroCrew's previous configuration. `--purge` also removes the
-files kiro-claude created for it (launcher, bridge, logs). Your KiroCrew data and the checkout
-are kept.
+`kiro-claude acp`, and therefore on your Claude Code subscription.
+
+`kiro-claude crew stop` runs `kirocrew stop` (then SIGTERM and SIGKILL if the gateway does not
+exit), reaps orphaned agent processes and ends what is left of the gateway's process tree. On
+Linux it also retires the leftover processes that a gateway which crashed left in its process
+group; the evidence for that is kept in `run/crashed.json` of the crew state directory
+(`~/.local/share/kiro-claude/crew/`; no token, at most 16 gateways, dropped after a reboot), and
+`crew start` warns while such leftovers run. It exits 1 when the gateway or its lock could not
+be freed. See [KiroCrew](docs/ARCHITECTURE.md#kirocrew-persistent-pipeline-on-claude-code).
+
+`kiro-claude crew uninstall` stops the gateway, restores KiroCrew's previous configuration and
+removes what setup added: the launcher, the identity stub (only if kiro-claude created it),
+`crew.json`, and the run files and logs under `run/` (`crashed.json` included). `--purge` also
+removes the private claude-agent-acp bridge and the build caches, then the crew state directory
+itself when it is empty. Your KiroCrew data and the checkout are kept.
 
 ## Differences from Kiro CLI
 

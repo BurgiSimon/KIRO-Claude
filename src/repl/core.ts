@@ -6,14 +6,20 @@
  * SessionUI) → greeting → optional initial input → read/dispatch loop → on exit close the
  * session and print `To resume this session: <prog> chat --resume-id <id>` for the record the
  * close kept (`KiroSession.resumeId`; none for a chat that never had a message) (exit 0;
- * 1 when the session could not start or Claude reported an auth failure). SIGHUP / SIGTERM,
- * and Ctrl+C while the session starts, close it before kiro-claude dies of the signal
+ * 1 when the session could not start or Claude reported an auth failure). SIGHUP / SIGTERM (a
+ * closed terminal included: two SIGHUPs within a millisecond count as one, and the hung-up
+ * terminal's EIO ends the input, r5 #1), and Ctrl+C while the session starts or during the final
+ * close after `/quit` (r5 #6), close it before kiro-claude dies of the signal
  * ({@link ExitSignals}): every session the REPL and its spec runtime opened that is still open,
  * the user's chat first (during a `/spec` flow the current session is a phase or task session;
- * the chat is the one the command started from), then its record is made the newest, so
- * `chat --resume` reaches the user's conversation ({@link Repl.closeOnSignal}, r5 P3). From the
- * signal on no session is created and no turn is sent; a running command's signal is aborted and
- * what it still prints (ReplHost.print) is dropped.
+ * the chat is the one the command started from), then its record is made the newest, under its
+ * lock, so `chat --resume` reaches the user's conversation ({@link Repl.closeOnSignal}, r5 P3,
+ * g1). From the signal on no session is created and no turn is sent; a running command's signal
+ * is aborted; nothing more is printed (no prompt, no turn error, no notice, nothing a command
+ * prints through ReplHost.print, no output of a `!cmd` still running, and a spinner animating at
+ * the signal is cleared; only the resume hint of a `/quit` whose close the signal came
+ * into), and input typed during the grace is neither sent nor run (r5 g2). The same silence holds
+ * while kiro-claude dies of a signal the lifecycle forwarder owns (no REPL handlers, r5 g3).
  *
  * Input handling order (01 §4.3): empty ⇒ re-prompt; `/…` ⇒ built-in command, else a file
  * prompt (`/<prompt> args`, prompts take precedence, 00 §2.2), else a skill (inlined with
@@ -70,6 +76,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { dyingSignal } from '../claude/lifecycle.js';
 import { loadPrompts, findPrompt, expandPrompt, parsePromptInvocation } from '../config/prompts.js';
 import { discoverSkills, expandSkillInvocation, pluginSkillName } from '../config/skills.js';
 import { loadSteering } from '../config/steering.js';
@@ -323,7 +330,27 @@ export class Repl implements ReplContext {
     return this.ctx.stdout.isTTY ? this.columns : undefined;
   }
 
+  /**
+   * A fatal signal came in ({@link ExitSignals}), or kiro-claude dies of one the lifecycle
+   * forwarder owns (claude/lifecycle.ts `dyingSignal()`, without the REPL's own handlers): from
+   * then on the REPL prints nothing of its own (r5 P3/P4, g2/g3). What a command (a `/spec` flow
+   * winding down as its sessions are closed) or a turn the close ended still reports is no longer
+   * for the user, and may be wrong (a continuation start the signal cancelled is no Ctrl+C, a
+   * restart refused as 'kiro-claude is exiting' no failure); no prompt is shown either (the line
+   * reader is muted), a `!cmd` still running is not echoed (stdout nor stderr), no spinner is
+   * started ({@link closeOnSignal} clears a running one) and headless prints nothing more. Only
+   * the resume hint of a `/quit` whose close the signal came into is still printed ({@link run}).
+   */
+  private get silent(): boolean {
+    return this.exits?.received !== undefined || dyingSignal() !== undefined;
+  }
+
   write(text: string): void {
+    if (this.silent) return;
+    this.out(text);
+  }
+
+  private out(text: string): void {
     if (text === '') return;
     this.spinner.stop();
     this.ctx.stdout.write(text);
@@ -333,14 +360,12 @@ export class Repl implements ReplContext {
   /** Raw output for the renderer (it tracks its own writes). */
   private rendererOut(text: string): void {
     this.spinner.stop();
+    if (this.silent) return;
     this.ctx.stdout.write(text);
   }
 
   print(text: string): void {
-    // SIGHUP / SIGTERM came in: what a command (a `/spec` flow winding down as its sessions are
-    // closed) still reports is no longer for the user, and may be wrong (a continuation start the
-    // signal cancelled is no Ctrl+C); the headless front end prints nothing more either (r5 P3/P4)
-    if (this.exits?.received) return;
+    if (this.silent) return;
     this.write(text.endsWith('\n') ? text : `${text}\n`);
   }
 
@@ -506,6 +531,8 @@ export class Repl implements ReplContext {
       inherit,
       out: (s: string) => this.write(s),
       err: (s: string) => {
+        // a `!cmd` still running at a fatal signal: its stderr is dropped like its stdout (write())
+        if (this.silent) return;
         this.spinner.stop();
         this.ctx.stderr.write(s);
       },
@@ -605,7 +632,7 @@ export class Repl implements ReplContext {
     } finally {
       this.approving = false;
       this.flushDeferred();
-      if (this.turnActive && !this.quitting) this.spinner.start();
+      if (this.turnActive && !this.quitting && !this.silent) this.spinner.start();
     }
   }
 
@@ -616,6 +643,8 @@ export class Repl implements ReplContext {
   }
 
   notice(level: 'info' | 'warn' | 'error', message: string): void {
+    // a fatal signal: the sessions' notices (a SessionEnd hook during the grace) are not printed
+    if (this.silent) return;
     // while a prompt (idle or approval) is shown, print above it so the input line survives
     if (!this.reader || !this.reader.reading) {
       this.spinner.stop();
@@ -1032,7 +1061,7 @@ export class Repl implements ReplContext {
         }
         this.spinner.stop();
         this.renderer.handle(n.value);
-        if (n.value.type === 'tool_end') this.spinner.start();
+        if (n.value.type === 'tool_end' && !this.silent) this.spinner.start();
       }
     } catch (e) {
       result = errorResult(errText(e), scope.presses > 0 || ac.signal.aborted);
@@ -1149,7 +1178,8 @@ export class Repl implements ReplContext {
   }
 
   /**
-   * SIGHUP / SIGTERM ({@link ExitSignals}, bounded by its grace; r5 P3): stop what runs (the running
+   * SIGHUP / SIGTERM, or SIGINT while the chat starts or during the final close ({@link ExitSignals},
+   * bounded by its grace; r5 P3, #6; from then on the REPL is {@link silent}): stop what runs (the running
    * commands' signals and next-press waiters are aborted: `/spec run` stops, hook commands are
    * killed; no session is created and no turn sent from now on), then close every session this REPL
    * opened that is still open: the user's chat first ({@link userChat}), once it is closed the
@@ -1160,6 +1190,9 @@ export class Repl implements ReplContext {
    * opens.
    */
   private async closeOnSignal(): Promise<void> {
+    // silent from now on: a spinner animating at the signal (a turn whose Claude is slow to stop)
+    // is cleared now, not left drawing frames for the whole grace
+    this.spinner.stop();
     for (const ac of [...this.cmdAborts]) ac.abort();
     for (const ac of [...this.pressWaiters.keys()]) {
       this.dropPressWaiter(ac);
@@ -1179,17 +1212,24 @@ export class Repl implements ReplContext {
   /**
    * After {@link closeOnSignal}: when a record of `others` (closed after the user's chat, so saved
    * later) is newer than the chat's, save the chat's record again as the newest, so `chat --resume`
-   * (the newest record) reaches the user's conversation. Only a record nobody holds (its lock is
-   * gone: the chat's close finished) is rewritten, unchanged but for `updatedAt`.
+   * (the newest record) reaches the user's conversation. Only a record nobody holds (no lock file:
+   * the chat's close finished) is rewritten, unchanged but for `updatedAt`, and only under its
+   * lock, taken for the read and the write (r5 g1): another kiro-claude opening the record meanwhile
+   * either took the lock first (nothing is rewritten here) or is refused for those milliseconds
+   * ('Session is active in another process'), so its writes are never overwritten with our copy.
    */
   private makeNewest(user: KiroSession, others: readonly KiroSession[]): void {
+    let lock: { release(): void } | undefined;
     try {
       const store = new SessionStore(sessionsDir(this.ws));
       // a tangent's main conversation (chat --resume never opens a tangent)
       const id = user.tangent?.parentId ?? (user.resumeId ? user.resumeId() : user.id);
       if (!id) return;
+      // a lock on disk is never taken over here: it may be ours (a close still running) or another process's
+      if (!store.read(id) || store.lockInfo(id)) return;
+      lock = store.acquireLock(id);
       const rec = store.read(id);
-      if (!rec || store.lockInfo(id)) return;
+      if (!rec) return;
       let newest = 0;
       for (const o of others) {
         const r = o.id === id ? undefined : store.read(o.id);
@@ -1200,6 +1240,9 @@ export class Repl implements ReplContext {
       store.write(rec);
     } catch {
       // best effort: the records are all saved; only which one `chat --resume` opens is at stake
+      // (the lock is held by another process now: it owns the record)
+    } finally {
+      lock?.release();
     }
   }
 
@@ -1226,6 +1269,7 @@ export class Repl implements ReplContext {
       history,
       ...(onHistory ? { onHistory } : {}),
       completer: (line: string) => this.complete(line),
+      muted: () => this.silent,
     });
     this.reader.on('shift-tab', () => {
       this.current.planMode = !this.current.planMode;
@@ -1244,7 +1288,11 @@ export class Repl implements ReplContext {
       if ((await this.submit(initial)) === 'quit') return;
     }
     while (!this.quitting) {
+      // SIGHUP / SIGTERM: the sessions are being closed; no prompt and no input from now on (input
+      // typed during the grace is neither sent nor run as a command, r5 g2)
+      if (this.exits?.received) return;
       const r = await this.reader.readInput(this.promptString(), { history: true });
+      if (this.exits?.received) return;
       this.renderer.freshLine();
       if (r.kind === 'eof') return;
       if (r.kind === 'aborted') continue;
@@ -1260,8 +1308,8 @@ export class Repl implements ReplContext {
   }
 
   async run(): Promise<number> {
-    // SIGHUP / SIGTERM, and Ctrl+C until the prompt is up: close the session, then die of the
-    // signal (ExitSignals, r4 #4)
+    // SIGHUP / SIGTERM, and Ctrl+C until the prompt is up and after /quit: close the session, then
+    // die of the signal (ExitSignals, r4 #4, r5 #6)
     const exits = this.deps.installSignalHandlers && process.platform !== 'win32'
       ? new ExitSignals(() => this.closeOnSignal(), [this.ctx.stdin, this.ctx.stdout, this.ctx.stderr])
       : undefined;
@@ -1314,6 +1362,9 @@ export class Repl implements ReplContext {
     } finally {
       this.spinner.stop();
       if (this.sigHandler) process.off('SIGINT', this.sigHandler);
+      // the final close: a Ctrl+C (line mode, `kill -INT`) now closes first like SIGTERM, then the
+      // signal ends the process (ExitSignals.closing, r5 #6)
+      exits?.closing();
       // a SIGHUP / SIGTERM is closing the session: the signal ends the process (the terminal may be gone)
       if (exits?.received) await exits.die();
       const s = this.current;
@@ -1323,9 +1374,10 @@ export class Repl implements ReplContext {
         // best effort
       }
       // the record close() kept, never one it dropped (r4 #5/#9): an untouched spec-phase copy
-      // names the record holding its conversation, a chat that never had a message none
+      // names the record holding its conversation, a chat that never had a message none. The user
+      // quit before any signal: the hint is printed even when one came in during this close.
       const id = s.resumeId ? s.resumeId() : s.id;
-      this.write(id !== undefined ? `\n${resumeHint(this.progName, id)}\n` : '\n');
+      this.out(id !== undefined ? `\n${resumeHint(this.progName, id)}\n` : '\n');
       exits?.dispose();
       this.reader.close();
     }

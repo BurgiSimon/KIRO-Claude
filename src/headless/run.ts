@@ -27,20 +27,23 @@
  * `You are not logged in, please log in with <prog> login` (00 §2.1, Q `cli/mod.rs:145-150`).
  * Ctrl+C interrupts the turn (first press) or closes the session (second press).
  *
- * SIGHUP / SIGTERM during the run, and SIGINT / SIGHUP / SIGTERM while the session starts, close
- * the session first (SessionEnd hooks, its record saved, its lock released; a start still running
- * its agentSpawn hooks is cancelled through its start signal, leaving nothing; the children running
- * at the signal still get it, and SIGKILL with their surviving group members after the lifecycle
- * grace, r4 #11), bounded by
- * repl/exitSignals.ts SIGNAL_CLOSE_GRACE_MS, then kiro-claude dies of the signal as the REPL does
- * ({@link ExitSignals}, r5 P4). From the signal on nothing more is printed and no status is
- * returned: the exit status is the signal's, as before (the lifecycle forwarder used to end the
- * process at once, without the close). Not on Windows, and not with `installSignalHandlers: false`.
+ * SIGHUP / SIGTERM during the run, and SIGINT / SIGHUP / SIGTERM while the session starts and
+ * during the final close (after the answer, r5 #6), close the session first (SessionEnd hooks,
+ * its record saved, its lock released; a start still running its agentSpawn hooks is cancelled
+ * through its start signal, leaving nothing; during the turn the children running at the signal
+ * still get it, and SIGKILL with their surviving group members after the lifecycle grace, r4 #11;
+ * once the final close began nothing is signalled, so a running SessionEnd hook finishes, r5 #5),
+ * bounded by repl/exitSignals.ts SIGNAL_CLOSE_GRACE_MS, then kiro-claude dies of the signal as
+ * the REPL does ({@link ExitSignals}, r5 P4). From the signal on nothing more is printed (session
+ * notices included) and no status is returned: the exit status is the signal's, as before (the
+ * lifecycle forwarder used to end the process at once, without the close). Not on Windows, and
+ * not with `installSignalHandlers: false`; there a signal is the lifecycle forwarder's
+ * (`dyingSignal()`), and the turn it ends prints no error and no notice (r5 g3).
  */
 
 import type { CliContext, KiroSession, SessionEvent, SessionUI, TurnResult } from '../types.js';
 import { isAuthError } from '../claude/auth.js';
-import { shutdownTrackedChildren } from '../claude/lifecycle.js';
+import { dyingSignal, shutdownTrackedChildren } from '../claude/lifecycle.js';
 import { loadCreateSession, type CreateSessionFn, type FrontEndSessionOptions } from '../cli/entries.js';
 import { readAll } from '../cli/io.js';
 import { ExitSignals } from '../repl/exitSignals.js';
@@ -167,23 +170,32 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<number> {
 
   const ui: SessionUI = {
     requestApproval: async () => ({ kind: 'deny', message: HEADLESS_DENIAL }),
-    notice: (level, message) => renderer.notice(level, message),
+    // from a fatal signal on nothing more is printed (a SessionEnd hook ending during the grace)
+    notice: (level, message) => {
+      if (!exits?.received && dyingSignal() === undefined) renderer.notice(level, message);
+    },
     confirmStopHook: async () => undefined,
   };
 
   let session: KiroSession | undefined;
+  /** The front end's own final close (the finally block) has begun. */
+  let frontEndClosing = false;
   // SIGHUP / SIGTERM, and SIGINT until the session is up: close it, then die of the signal (r5 P4).
   // The children running at the signal (Claude Code, a hook command) still get the signal's
   // SIGTERM and, after claude/lifecycle.ts's grace, SIGKILL with any member of their groups that
   // survives it (r4 #11), as when the lifecycle forwarder handled the signal: the session is
   // closed first (close() marks it closed at once, so nothing respawns Claude Code or sends the
-  // prompt), and its SessionEnd hooks, started after that, are not signalled.
-  const exits =
+  // prompt), and its SessionEnd hooks, started after that, are not signalled. A signal after the
+  // front end's own final close began (the answer is out, SessionEnd hooks may be running) only
+  // waits for that close: the turn is over, close() ends Claude Code itself, and sweeping the
+  // children would kill the running SessionEnd hook (r5 #5). Should the grace run out, the
+  // re-raised signal is the lifecycle forwarder's, which ends whatever is left.
+  const exits: ExitSignals | undefined =
     opts.installSignalHandlers !== false && process.platform !== 'win32'
       ? new ExitSignals(async () => {
           if (!session) return;
           const closing = session.close();
-          await Promise.all([closing, shutdownTrackedChildren()]);
+          await Promise.all([closing, frontEndClosing ? undefined : shutdownTrackedChildren()]);
         }, [ctx.stdin, ctx.stdout, ctx.stderr])
       : undefined;
   /** `p`'s outcome, unless a signal came in meanwhile: the session is closing, the signal ends the process. */
@@ -242,7 +254,8 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<number> {
   const onStdoutError = (e: NodeJS.ErrnoException): void => {
     if (stdoutBroken) return;
     stdoutBroken = true;
-    if (e.code === 'EPIPE' || e.code === 'ERR_STREAM_DESTROYED') void s.interrupt().catch(() => undefined);
+    // a reader that went away, or a hung-up terminal (EIO, r5 #1): the answer cannot be delivered
+    if (e.code === 'EPIPE' || e.code === 'ERR_STREAM_DESTROYED' || e.code === 'EIO') void s.interrupt().catch(() => undefined);
   };
   const onStderrError = (): void => undefined;
   process.on('SIGINT', onSigint);
@@ -301,6 +314,9 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<number> {
       }
       result = step.value;
     } catch (e) {
+      // dying of a signal the lifecycle forwarder owns (an embedder without these handlers): the
+      // turn ended because Claude Code got the signal; nothing is printed (r5 g3)
+      if (dyingSignal() !== undefined) return 1;
       const msg = errText(e);
       const message = isAuthError(msg) ? notLoggedInMessage(ctx.progName) : `error: ${msg}`;
       fatal(message);
@@ -308,6 +324,7 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<number> {
       return 1;
     }
 
+    if (dyingSignal() !== undefined && (result.isError || result.stopReason === 'cancelled')) return 1;
     renderer.result(result, { sessionId: s.id });
     if (stdoutBroken) return 1;
     if (result.stopReason === 'cancelled' || (interrupted && result.isError)) {
@@ -322,8 +339,11 @@ export async function runHeadless(opts: RunHeadlessOptions): Promise<number> {
     return 0;
   } finally {
     process.removeListener('SIGINT', onSigint);
+    // the final close: a Ctrl+C now closes first like SIGTERM, then the signal ends the process (r5 #6)
+    exits?.closing();
     if (typeof stdoutEmitter.removeListener === 'function') stdoutEmitter.removeListener('error', onStdoutError);
     renderer.finish();
+    frontEndClosing = true;
     await s.close().catch(() => undefined);
     // a signal during the close: the signal ends the process, not a status
     if (exits?.received) await exits.die();

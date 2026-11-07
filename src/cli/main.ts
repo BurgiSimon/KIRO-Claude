@@ -277,18 +277,25 @@ export async function runCli(argv: readonly string[], io: CliIo = {}): Promise<n
   }
 }
 
+/**
+ * main()'s 'error' listener on stdout / stderr: a closed output is ignored, anything else is
+ * rethrown. Closed means a reader that went away (EPIPE), a destroyed stream, or a hung-up
+ * terminal (EIO: the terminal window was closed, r5 #1).
+ */
+export function ignoreClosedOutput(e: NodeJS.ErrnoException): void {
+  if (e.code !== 'EPIPE' && e.code !== 'ERR_STREAM_DESTROYED' && e.code !== 'EIO') throw e;
+}
+
 /** Entry point used by src/bin/kiro-claude.ts. */
 export async function main(argv: string[]): Promise<number> {
   // A closed stdout (`kiro-claude --help | head -1`) or stderr (`… 2>&1 | head`, a reader of
-  // the tool lines that went away) must not crash the process: an unhandled 'error' would kill
-  // it before the session is closed (SessionEnd hooks, session lock, runtime dir). Lost
-  // diagnostics are harmless; a lost stdout is noticed by the commands that write answers there
-  // (headless interrupts and exits 1).
-  const ignoreEpipe = (e: NodeJS.ErrnoException): void => {
-    if (e.code !== 'EPIPE' && e.code !== 'ERR_STREAM_DESTROYED') throw e;
-  };
-  process.stdout.on('error', ignoreEpipe);
-  process.stderr.on('error', ignoreEpipe);
+  // the tool lines that went away), or a closed terminal window (EIO on every write), must not
+  // crash the process: an unhandled 'error' would kill it before the session is closed
+  // (SessionEnd hooks, session lock, runtime dir). Lost diagnostics are harmless; a lost stdout
+  // is noticed by the commands that write answers there (headless interrupts and exits 1); a
+  // closed terminal also sends SIGHUP, which closes the session (repl/exitSignals.ts).
+  process.stdout.on('error', ignoreClosedOutput);
+  process.stderr.on('error', ignoreClosedOutput);
   return runCli(argv);
 }
 
