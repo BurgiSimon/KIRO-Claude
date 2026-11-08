@@ -493,11 +493,14 @@ export interface SessionRecord {
   pendingContext?: string[];
   /**
    * This record's conversation is a fork (a tangent, rewind, transferred copy, spec-phase session
-   * or continuation) that has not completed a turn of its own yet, and this is where it forks
-   * from (`--resume <from> --fork-session [--resume-session-at <at>]`). Claude Code writes a
-   * fork's transcript only with its first message, so until then `claudeSessionId` may name no
-   * transcript: a resume of this record (also after a quit) forks this source again instead,
-   * without `at` at the record's own last turn (the source may have moved on since).
+   * or continuation, a `/chat load` import without a transcript) that has not completed a turn of
+   * its own yet, and this is where it forks from (`--resume <from> --fork-session
+   * [--resume-session-at <at>]`). A record kiro-claude makes as a fork holds it from its first
+   * write, before its Claude Code is up (a crash while it starts still forks again, r7 #1, r8 #7).
+   * Claude Code writes a fork's transcript only with its first message, so until then
+   * `claudeSessionId` may name no transcript: a resume of this record (also after a quit) forks
+   * this source again instead, without `at` at the record's own last turn (the source may have
+   * moved on since).
    * Removed once a turn completes in the record (or `/clear` starts a new conversation). Absent
    * in records written before this field existed (they resume `claudeSessionId`).
    */

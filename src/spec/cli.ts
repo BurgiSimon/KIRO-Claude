@@ -30,7 +30,9 @@
  * or into a folder the user cannot enter), or one it cannot enter or read, is not
  * enumerated: `list` and `status` without a name are an error with the reason (exit 1), and a
  * named spec not found under it is that error too, not "not found" (r7 #7). Resume hints name
- * commands this CLI accepts ({@link cliResumeHint}, r7 #8).
+ * commands this CLI accepts ({@link cliResumeHint}, r7 #8); a checkpoint's Stop resumes its
+ * review (`approve` / `revise`), also at tasks.md (r8 #10), unless its document was not written
+ * (then the hint is the one outside a checkpoint).
  *
  * Ctrl+C during `spec run`: the first press stops scheduling and interrupts the running tasks.
  * The PostTaskExec hooks of a task it interrupted run under the NEXT press, as in the REPL
@@ -519,23 +521,32 @@ function cliRuntime(ctx: CliContext, o: CliRuntimeOptions, deps: SpecCliDeps, io
     },
     ...(press ? { nextPressSignal: () => press.signal() } : {}),
     readyHint: (name) => `Spec ready. Run all tasks: ${prog} spec run ${name} · Step through: ${prog} spec run ${name} --next`,
-    resumeHint: (name) => cliResumeHint(ctx, name),
+    resumeHint: (name, awaiting) => cliResumeHint(ctx, name, awaiting),
     finish: () => driver.finish('close'),
   };
 }
 
 /**
  * The spec CLI's resume hint (SpecRuntime.resumeHint, r7 #8): the CLI has no `spec <name>` form,
- * so it names commands it accepts, by where the spec stands now: `approve` / `revise` for a
- * document awaiting review, `run <name> --next` once the tasks are approved, `status <name>` for
- * a spec with a refused file (it says why). A spec whose next step is drafting a document nothing
- * awaits approval before (an existing folder without its first document) can only be continued
- * in chat (`new` refuses an existing folder): `/spec <name> in kiro-claude chat`.
+ * so it names commands it accepts, by where the spec stands now: `status <name>` for a spec with a
+ * refused file (it says why); `approve` / `revise` for the document under review at a checkpoint
+ * the user stops at (`awaiting`) when that review is the one they resume (the document the files
+ * say awaits review, or tasks.md once it has tasks: a tasks.md under review derives as
+ * `execution`, but its review is what resumes, r8 #10) and for a document awaiting review; `run
+ * <name> --next` outside a checkpoint once the tasks are approved. At the checkpoint of a document
+ * the turn did not write (or a revision emptied), `approve` / `revise` would act on another
+ * document or on none ("Nothing to approve yet"), so the hint comes from where the spec stands, as
+ * outside a checkpoint. A spec whose next step is drafting a document nothing awaits approval
+ * before (an existing folder without its first document, also at its checkpoint) can only be
+ * continued in chat (`new` refuses an existing folder): `/spec <name> in kiro-claude chat`.
  */
-function cliResumeHint(ctx: CliContext, name: string): string {
+function cliResumeHint(ctx: CliContext, name: string, awaiting?: SpecDocKind): string {
   const prog = `${ctx.progName || 'kiro-claude'} spec`;
   const s = summarizeSpec(ctx.ws, name);
   if (!s || s.refused) return `${prog} status ${name}`;
+  // the review `approve` / `revise` resume (workflow.approveSpec / reviseSpec)
+  const review = s.awaitingApproval ?? (s.phase === 'execution' || s.phase === 'done' ? 'tasks' : undefined);
+  if (awaiting && awaiting === review) return `${prog} approve ${name} · ${prog} revise ${name} <feedback>`;
   if (s.phase === 'execution' || s.phase === 'done') return `${prog} run ${name} --next`;
   if (s.awaitingApproval) return `${prog} approve ${name} · ${prog} revise ${name} <feedback>`;
   return `/spec ${name} in ${ctx.progName || 'kiro-claude'} chat`;

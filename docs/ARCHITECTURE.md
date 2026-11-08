@@ -99,7 +99,17 @@ tasks). Approval is a menu choice; the model never moves on by itself.
   <feedback>` for a document awaiting review, `kiro-claude spec run <name> --next` once the tasks
   are approved, `kiro-claude spec status <name>` for a spec with a refused file, and `/spec <name>
   in kiro-claude chat` when only the chat can draft the next document (an existing folder without
-  its first document: `new` refuses an existing folder).
+  its first document: `new` refuses an existing folder). A checkpoint's Stop label and stop hint
+  pass the document under review (`resumeHint(name, awaiting)`), so at every checkpoint, the
+  tasks.md one included, the CLI names `approve` / `revise`, as the headless stop there does: the
+  approval of tasks.md is not saved anywhere, so a tasks.md under review derives as `execution`,
+  and `run <name> --next` would run a task and skip the review (r8 #10). That holds when the
+  document under review was written: at the checkpoint of one the turn did not write (or a
+  revision emptied), `approve` / `revise` act on the document the files say awaits review, or on
+  none, so the hint is the one outside a checkpoint (for the first document `/spec <name> in
+  kiro-claude chat`, where both would answer "Nothing to approve yet"). Outside a checkpoint
+  (`new` of an existing spec, `run` or `analyze` without its document) a spec with tasks still
+  gets `run <name> --next`.
 * **Trust and plan mode, carried in and back.** Every phase session and the continuation start
   from the trust and plan mode of the session they continue, as the chat has them at that moment
   (a `/tools untrust`, a revoked tool, a `t` answer, Shift+Tab), never from the launch flags
@@ -146,9 +156,16 @@ tasks). Approval is a menu choice; the model never moves on by itself.
   be entered are not known to exist: `status` gives the phase as `unknown (not read)`). Such a
   document is marked `refused` with the reason: `list` and `status`
   show the phase `refused` and say why, `view` prints the reason instead of the text, and it is
-  never drafted over as if it were missing. Its checkpoint offers no Approve and `approve` refuses
-  it (a headless flow ends with an error there); a revision turn still runs and the gate denies
-  its write. The same holds
+  never drafted over as if it were missing. It also counts as present when the type of a spec
+  without a usable `specType` (no `.config.kiro`, a legacy `{"generationMode": …}` one) is
+  inferred: an existing `bugfix.md` that is refused keeps the spec a bugfix spec with `bugfix.md`
+  awaiting approval, never a feature spec at "drafting requirements.md" (r8 #9). Such a
+  document's checkpoint offers no Approve and `approve` refuses
+  it (a headless flow ends with an error there); a revision turn still runs and its write of the
+  document is denied: the gate refuses a link there (with the reason), and a document that is not
+  a regular file or that the user cannot read, whose write the gate would allow without asking,
+  is left out of the turn's write allowance (`workflow.restrictionFor`: "only (nothing) may be
+  written now"). The same holds
   for every phase of a spec with any refused file, also an input document (`requirements.md`
   under review of the design) or `.config.kiro` (the spec's type and workflow are then unknown):
   each checkpoint names every reason and offers no Approve, and no phase is drafted from it.
@@ -249,7 +266,13 @@ journal); Claude Code keeps its own transcript, which kiro-claude resumes and fo
   `/agent swap` switches to it inside a tangent (when it is a valid one), and a `/model` or
   `/effort` made inside a tangent, are written to the records under it at once and kept when the
   chat leaves the tangent, so the main conversation runs the new agent on its model, not on the
-  model it had before. A `tail` carries the
+  model it had before. Claude Code runs the model at the session's effort: a Claude Code started
+  on a model without that level (some models have no effort levels; after a resume on one, an
+  `/agent swap` to an agent that pins one) runs without one, and a later `/model` to a model
+  that has the level sends it (a silent `/effort <level>`, queued for the next prompt while a
+  turn runs or a restored history waits for its line). A Claude Code that already has the level gets no extra command,
+  also after a `/model` through a model without the level: Claude Code keeps the level across
+  model switches and applies it again on a model that has it (verified). A `tail` carries the
   tangent's own last exchange: also after a return from a tangent nested in it (the exchange it
   had before), and after a `/rewind N` inside it turn N's (also when Claude Code compacted
   automatically during that turn), never a turn rewound away. What a nested tangent's `merge`
@@ -263,7 +286,12 @@ journal); Claude Code keeps its own transcript, which kiro-claude resumes and fo
   the original conversation. The new record (like a tangent's) is written with the chat's trust,
   agent, model, effort and plan mode and the fork still to be made, so a crash while its Claude
   Code starts leaves `chat --resume`, which opens it, neither a revoked tool trusted nor the
-  conversation lost (the resume makes the fork again). An untouched copy (a `/spec` continuation with no message of its
+  conversation lost (the resume makes the fork again). The other records that start as a fork
+  are written with the fork still to be made from the start too: a `/spec` phase session, the
+  continuation a `/spec` flow hands to the chat, and a `/chat load` of an export without a
+  transcript. A crash while their Claude Code starts makes `chat --resume` fork the source again;
+  it does not fall back on the saved history (`Claude Code could not find the saved
+  conversation…`). An untouched copy (a `/spec` continuation with no message of its
   own) is dropped only when its parent record still holds every one of its turns. After a
   `/compact` Claude Code keeps the conversation from its summary on: a rewind to the turn the
   compaction followed forks the compacted conversation at that turn's answer when Claude Code kept
@@ -344,11 +372,26 @@ journal); Claude Code keeps its own transcript, which kiro-claude resumes and fo
   of its own and keeps running; what it writes waits in the pipe, and a permission request waits
   for its answer, until `fg`. Pressed while a turn runs, Ctrl+Z is kept as type-ahead and the
   stop happens at the prompt that follows (an approval prompt drops it with the rest of the
-  type-ahead). DECISION: Q stops at once there (its terminal is in cooked mode while it answers),
-  but kiro-claude's hook commands also run in groups of their own and go on while it is stopped,
-  and its timers do not wait: a stop that outlasted a running preToolUse hook's timeout counted
-  that hook as timed out, which never blocks, even when it had blocked the tool, and a trusted
-  tool then ran.
+  type-ahead); presses typed ahead stop the chat once, as in a cooked-mode program, where the
+  first press stops the job and the next ones go to the shell (one is kept, and a replayed one
+  drops any other). DECISION: Q stops at once there (its terminal is in cooked mode while it
+  answers); kiro-claude stops between turns, when nothing of the turn goes on without it (hook
+  commands too run in process groups of their own and keep running while it is stopped).
+  DECISION (r8): however kiro-claude is stopped (its own Ctrl+Z, also at an approval prompt
+  in the middle of a turn while other concurrent calls' preToolUse hooks run; `kill -TSTP` or
+  `kill -STOP` from elsewhere), the stop does not count against a hook command's timeout nor
+  against a control request's (initialize included): `runningTimeout` (`util/process.ts`) decides
+  an expiry one event-loop turn after its timer fired, so a hook's exit or Claude Code's answer
+  that arrived meanwhile is handled first (libuv runs expired timers before the poll phase that
+  delivers them), and a stop's duration (an unref'd 100 ms heartbeat while such timers are armed,
+  confirmed by the SIGCONT that ends it; never more than the stop, unless the event loop was
+  blocked right before it) is given back, so a hook still running after the stop gets the rest
+  of its time. A hook that exited during the stop is judged by its exit status, a block included;
+  a hung one still times out after its timeout of running time; a blocked event loop extends
+  nothing, neither without a SIGCONT nor when the loop ran on before one came (r8
+  verification: a block, then a short or stray stop, gave the block back too). Before, a stop
+  that outlasted a running preToolUse hook's timeout counted that hook as timed out, which never
+  blocks, even when it had blocked the tool, and a trusted tool then ran.
   After `fg` raw mode and bracketed paste are back and the prompt being read is drawn again with
   its half-typed line; an approval prompt still takes its answer. As the terminal's session
   leader (`ssh -t host kiro-claude chat`, `docker run -it`, `tmux new 'kiro-claude chat'`) there
@@ -359,7 +402,10 @@ journal); Claude Code keeps its own transcript, which kiro-claude resumes and fo
   leaves the terminal in the shell's cooked mode; the reader takes it back at SIGCONT the same
   way, the prompt being read drawn on the shell's fresh line. While `$EDITOR` or `!cmd` owns the
   terminal, Ctrl+Z is the terminal's own: it stops that program and kiro-claude together, as one
-  job.
+  job. When the child is done the reader turns raw mode and bracketed paste on again: bash turns
+  bracketed paste off before `fg` continues the job, and vim does at exit (r8). The spec
+  workflow's "Open in $EDITOR" goes the same way in the chat (`ReplContext.openEditor`, with
+  `$VISUAL` or `$EDITOR` as the command).
 
 `chat --no-interactive`: the first Ctrl+C interrupts the turn (exit status 130 once it ends); a
 second one closes the session.
@@ -369,11 +415,19 @@ second one closes the session.
 Both front ends use `ExitSignals` (`repl/exitSignals.ts`) on POSIX:
 
 * It handles SIGHUP and SIGTERM for the whole run (a closed terminal tab, `kill`), and SIGINT
-  while the session starts (Claude Code initializing, agentSpawn hooks) and during the final
-  close (after `/quit`, after the headless answer). In between, Ctrl+C belongs to the front end
-  (above). In an interactive terminal the chat's input is still in raw mode during its final
-  close, so a Ctrl+C key is ignored there; `kill -INT` and piped input get the close described
-  here.
+  while the session starts (Claude Code initializing, agentSpawn hooks), during the final close
+  (after `/quit`, after the headless answer) and from the first SIGHUP or SIGTERM on (a SIGINT
+  after one is a second signal, below). Otherwise Ctrl+C belongs to the front end (above). After
+  a SIGHUP or SIGTERM the front end's own SIGINT handler still runs for such a SIGINT, and does
+  nothing visible: the REPL's ends its muted read or interrupts the turn being closed,
+  headless's interrupts a session that is already closing. In an interactive terminal the chat's
+  input is in raw mode from its first prompt on, also during its final close and during a
+  SIGHUP's or SIGTERM's close, so a Ctrl+C key there is a key, which the muted reader drops, not
+  a SIGINT: the close goes on. `kill -INT`, and a Ctrl+C where the terminal is in cooked mode,
+  get the handling described here: headless, a chat whose input is piped, a chat still starting
+  (its line reader is not up yet) and one whose terminal a `!cmd` or `$EDITOR` holds (they run
+  in kiro-claude's process group, so the terminal's SIGINT reaches kiro-claude too, unless the
+  program reads Ctrl+C as a key itself).
 * From the signal on no session is created and no turn is sent. A running command's signal and
   every next-press signal are aborted (`/spec run` stops, hook commands are killed), and a start
   still running its agentSpawn hooks is cancelled (they are killed; nothing of that session
@@ -389,26 +443,27 @@ Both front ends use `ExitSignals` (`repl/exitSignals.ts`) on POSIX:
   lifecycle forwarder ends any child still running. Should anything swallow the re-raised signal,
   kiro-claude exits with that status 5 s later.
 * A second signal re-raises at once: one more than 500 ms after the first
-  (`DUPLICATE_SIGNAL_WINDOW_MS`), or a SIGINT after a SIGHUP or SIGTERM inside that window. A
-  repeat inside the window is the same event delivered twice, not an impatient user: a terminal
-  tab closing under an interactive shell sends SIGHUP twice within a millisecond, an `npm` or
-  `npx` wrapper forwards the terminal's SIGINT, and a supervisor may signal both the process and
-  its group. So is a SIGTERM right after a SIGHUP, or the other way round: closing the terminal
-  of an interactive bash while the chat is stopped (Ctrl+Z) sends SIGHUP and then SIGTERM (each
-  with a SIGCONT) within microseconds.
+  (`DUPLICATE_SIGNAL_WINDOW_MS`), or a different one inside that window: a SIGINT after a SIGHUP
+  or SIGTERM (also in the main phase of the chat and of the headless run, above), or a SIGHUP or
+  SIGTERM after a SIGINT. A repeat inside the window is the same event delivered twice, not an
+  impatient user: a terminal tab closing under an interactive shell sends SIGHUP twice within a
+  millisecond, an `npm` or `npx` wrapper forwards the terminal's SIGINT, and a supervisor may
+  signal both the process and its group. So is a SIGTERM right after a SIGHUP, or the other way
+  round: closing the terminal of an interactive bash while the chat is stopped (Ctrl+Z) sends
+  SIGHUP and then SIGTERM (each with a SIGCONT) within microseconds.
 * After the signal kiro-claude prints nothing more. The REPL shows no prompt, no turn error, no
   notice and nothing a command prints, drops the output of a `!cmd` still running, clears a
   spinner, and neither sends nor runs input typed during the grace. Nor does such input answer a
   question that was already waiting: a command's question (`/spec new`'s name, a `[y/n]`, a menu)
   gets no answer, so the command stops without acting, and an approval prompt still open (a
-  `/spec` phase session's, closed after the chat) is cancelled. A process SIGINT (`kill -INT`) or
-  a terminal resize during the grace draws nothing either (no fresh line, no redrawn prompt; the
-  terminal reader lets readline redraw its prompt line at a resize only while a read is active and
-  no child owns the terminal, so a resize while an answer streams never draws a stale prompt over
-  it). The one exception is the
-  resume hint of a `/quit` whose close the signal came into. Headless prints nothing more (notices
-  included) and returns no status. The same silence holds while kiro-claude dies of a signal the
-  lifecycle forwarder owns (an embedder that turned these handlers off).
+  `/spec` phase session's, closed after the chat) is cancelled. A process SIGINT (`kill -INT`,
+  which after a SIGHUP or SIGTERM also ends kiro-claude at once) or a terminal resize during the
+  grace draws nothing either (no fresh line, no redrawn prompt; the terminal reader lets readline
+  redraw its prompt line at a resize only while a read is active and no child owns the terminal,
+  so a resize while an answer streams never draws a stale prompt over it). The one exception is
+  the resume hint of a `/quit` whose close the signal came into. Headless prints nothing more
+  (notices included) and returns no status. The same silence holds while kiro-claude dies of a
+  signal the lifecycle forwarder owns (an embedder that turned these handlers off).
 * A hung-up terminal also fails reads and writes with EIO: the line reader takes the input error
   for the end of input, EIO on stdout and stderr is ignored (headless interrupts its turn, since
   the answer cannot be delivered, and exits 1 unless the signal ends it first), and a half-typed
@@ -544,6 +599,22 @@ down backend processes every turn. `crew setup` therefore writes a token-less id
 KiroCrew itself is untouched; every model call it makes goes through kiro-claude to your
 installed Claude Code.
 
+**Where the checkout may live.** `crew setup` refuses (preflight, exit 1; only `run/setup.log` is
+written before, nothing is fetched or built and `crew.json` is untouched) a checkout, whether named
+by `--dir`, `KIRO_CLAUDE_CREW_DIR` or an earlier setup, that is
+in a linked git worktree, under the system temp directory without `--allow-tmp`, or that is or is
+inside one of crew's own directories under the state directory, compared as given and by real
+path: the npm and pip build caches (`cache/npm`, `cache/pip`; every build empties them) and the
+claude-agent-acp bridge prefix (`node/`; npm keeps only packages in its `node_modules`).
+`crew uninstall --purge` removes all three (unless they hold a checkout, below). The build (also
+run by `crew doctor --fix`) does not start in such a checkout either (`crew/build.ts`
+`crewDirHolding`). Nor does a build start while a cache holds a directory that looks like a Kiro
+Crew checkout (`bin/kirocrew` or a `.git`), nor the bridge install (setup's, or `crew doctor
+--fix`'s reinstall) while `node/` holds one (`crewDirCheckout`): an earlier kiro-claude could set a
+checkout up there, and the build or npm would delete it while setting up another one. Setup says
+so at preflight (`<dir> looks like a Kiro Crew checkout … Move it out of there first.`), doctor in
+the row's `fixed:` line.
+
 **Stopping the gateway.** `kiro-claude crew stop` (`crew/gateway.ts`):
 
 1. runs `kirocrew stop` and waits up to `--timeout` (default 30 s) for the gateway to exit; if it
@@ -586,11 +657,17 @@ launcher, the identity stub (only if kiro-claude created it), `crew.json`, and t
 logs under `run/` (`gateway.out`, `gateway.err`, `setup.log`, `ready.json`, `token`,
 `crashed.json`). `--purge` also removes the private claude-agent-acp bridge (only while it holds
 nothing else), the npm and pip build caches, and then the crew state directory itself when it is
-empty. KiroCrew's data home and its checkout are kept. Both purge paths print what they removed
+empty. KiroCrew's data home and its checkout are kept: a cache or the bridge that is or holds the
+checkout `crew.json` names (compared as given and by real path), or a directory that looks like a
+Kiro Crew checkout (it has `bin/kirocrew` or a `.git`; symbolic links are not followed), is not
+removed. The closing line says the checkout was kept only while it exists (`the checkout <dir>
+does not exist` otherwise). Both purge paths print what they removed
 (also crew's files inside a folder that is kept, such as `cache/npm`) and what they kept:
 `Purged <dir>` only when the state directory is really gone (lstat fails with `ENOENT`);
 otherwise `Purged <entries> from <dir>` or `Nothing to purge in <dir>`, then `; kept <entries>`
-(with `crew.json`, the checkout it names is labelled as such when it is inside), or, when nothing
+(with `crew.json`, the checkout it names is labelled as such when it is inside, e.g.
+`cache (holds the Kiro Crew checkout)`; on both paths an entry kept for holding another checkout
+reads `cache (holds a Kiro Crew checkout)`), or, when nothing
 is left, why the directory itself stays:
 it is a symbolic link (purged through the link, crew's entries of its target only; the link is
 never removed) or rmdir failed (its error code, e.g. `EBUSY` for a mount point). Without

@@ -3,33 +3,49 @@
  * (repl/core.ts) and `chat --no-interactive` (headless/run.ts).
  *
  * SIGHUP / SIGTERM during the whole run (a closed terminal tab, `kill`), and SIGINT while the
- * session starts (Claude Code initializing, agentSpawn hooks) and during the final close
- * (below); in between Ctrl+C belongs to the front end: the REPL's line reader, the headless
- * interrupt handler. Without this, claude/lifecycle.ts's
- * forwarder kills kiro-claude before any session's close(), which drops a chat that never had a
- * message (Q saves a conversation only after a reply, r4 #4), saves the record and releases its
- * lock, and runs SessionEnd hooks. Here the front end's `close` callback closes what it opened (a
- * start still running is cancelled through {@link ExitSignals.startSignal}, startSignal.ts:
- * agentSpawn hooks are killed and nothing of it stays), then the signal is re-raised with these
- * listeners removed, so kiro-claude still dies of it (the forwarder ends any child left). The
- * wait is bounded by {@link SIGNAL_CLOSE_GRACE_MS} from the signal; a second signal re-raises at
- * once: one more than {@link DUPLICATE_SIGNAL_WINDOW_MS} after the first, or a different one
- * (a SIGINT: a Ctrl+C) inside it. A repeat inside that window is the same event delivered twice,
- * not an impatient user: a terminal tab closing under an interactive shell sends SIGHUP twice
- * within a millisecond (the shell's hangup of its jobs, then the kernel's to the old foreground
- * group once the session leader exits; r5 #1), and a supervisor may signal both the process and
- * its group. So are a SIGHUP and a SIGTERM inside it, either way round: closing the terminal of an
- * interactive bash while kiro-claude is stopped (Ctrl+Z) sends SIGHUP + SIGCONT (its hangup of
- * the jobs), then SIGTERM + SIGCONT (its exit's termination of stopped jobs) within microseconds,
- * and a supervisor may send both.
+ * session starts (Claude Code initializing, agentSpawn hooks), during the final close (below)
+ * and from the first SIGHUP / SIGTERM on (a SIGINT after one is a second signal, below); else
+ * Ctrl+C belongs to the front end: the REPL's line reader, the headless interrupt handler.
+ * Without this, claude/lifecycle.ts's forwarder kills kiro-claude before any session's close(),
+ * which drops a chat that never had a message (Q saves a conversation only after a reply, r4
+ * #4), saves the record and releases its lock, and runs SessionEnd hooks. Here the front end's
+ * `close` callback closes what it opened (a start still running is cancelled through
+ * {@link ExitSignals.startSignal}, startSignal.ts: agentSpawn hooks are killed and nothing of it
+ * stays), then the signal is re-raised with these listeners removed, so kiro-claude still dies of
+ * it (the forwarder ends any child left). The wait is bounded by {@link SIGNAL_CLOSE_GRACE_MS}
+ * from the signal; a second signal re-raises at once: one more than
+ * {@link DUPLICATE_SIGNAL_WINDOW_MS} after the first, or a different one inside it (a SIGINT
+ * after a SIGHUP / SIGTERM, or one of them after a SIGINT). A repeat inside that window is the
+ * same event delivered twice, not an impatient user: a terminal tab closing under an interactive
+ * shell sends SIGHUP twice within a millisecond (the shell's hangup of its jobs, then the
+ * kernel's to the old foreground group once the session leader exits; r5 #1), and a supervisor
+ * may signal both the process and its group. So are a SIGHUP and a SIGTERM inside it, either
+ * way round: closing the terminal of an interactive bash while kiro-claude is stopped (Ctrl+Z)
+ * sends SIGHUP + SIGCONT (its hangup of the jobs), then SIGTERM + SIGCONT (its exit's termination
+ * of stopped jobs) within microseconds, and a supervisor may send both.
+ *
+ * A SIGINT after a SIGHUP / SIGTERM is such a second signal also in the front end's main phase
+ * (after {@link ExitSignals.ready}, r8 #6): from the first SIGHUP / SIGTERM on SIGINT is held
+ * here again. The front end's own SIGINT listener, still installed there, runs first and does
+ * nothing visible (both front ends are silent from the signal on): the REPL's ends its muted read
+ * (its loop then awaits {@link ExitSignals.die}) or interrupts the turn being closed, headless's
+ * interrupts a session that is already closing. In the interactive chat's terminal (raw mode from
+ * its first prompt on) Ctrl+C is a key, which the muted reader drops, not a SIGINT; `kill -INT`
+ * is one, and so is a Ctrl+C where the terminal is in cooked mode (headless, a chat whose input
+ * is piped, a chat still starting, a `!cmd` or `$EDITOR` holding the terminal: they run in
+ * kiro-claude's process group).
  *
  * SIGINT during the front end's final close ({@link ExitSignals.closing}: after `/quit` or the
  * end of a headless run the front end's own Ctrl+C handling is gone, r5 #6) is handled like
  * SIGTERM again: the close the front end started finishes (bounded by the grace), then
- * kiro-claude dies of SIGINT; a second press re-raises at once.
+ * kiro-claude dies of SIGINT. A second press re-raises at once once the window has passed (one
+ * inside it is the same press forwarded: an `npm` / `npx` wrapper), and so does a SIGHUP /
+ * SIGTERM at any time.
  *
- * A record left anyway (the grace ran out, SIGKILL, a crash) is skipped by the session index
- * (store.ts `list`). Not used on Windows (no POSIX re-raise).
+ * A chat that never had a message and is left anyway (the grace ran out, a second signal, SIGKILL,
+ * a crash) is dropped by the session index (store.ts `list`); any other record left stays listed,
+ * and its stale lock is taken over when it is opened again. Not used on Windows (no POSIX
+ * re-raise).
  *
  * A hung-up terminal also fails reads and writes (EIO): the line reader takes an input error for
  * end of input (repl/input.ts) and cli/main.ts ignores EIO on stdout / stderr, so neither crashes
@@ -112,10 +128,14 @@ export class ExitSignals {
     return this.startAbort.signal;
   }
 
-  /** The session is up: SIGINT is the front end's from now on; a signal closes what it opened. */
+  /**
+   * The session is up: SIGINT is the front end's from now on (until a SIGHUP / SIGTERM or the
+   * final close, module doc); a signal closes what it opened.
+   */
   ready(): void {
     this.started = true;
-    this.off('SIGINT');
+    // (a signal already received keeps SIGINT here: the front ends check it before this call)
+    if (!this.received) this.off('SIGINT');
   }
 
   /**
@@ -124,6 +144,15 @@ export class ExitSignals {
    * {@link dispose}; nothing is re-armed once disposed.
    */
   closing(): void {
+    this.holdSigint();
+  }
+
+  /**
+   * SIGINT is handled here again ({@link closing}, and from the first SIGHUP / SIGTERM on: then a
+   * SIGINT is a second signal, module doc, r8 #6); one listener at most, none once disposed.
+   * Appended: a front end's own SIGINT listener, still there in its main phase, runs first.
+   */
+  private holdSigint(): void {
     if (this.disposed || this.reraised || this.listeners.has('SIGINT')) return;
     const l = (): void => this.onSignal('SIGINT');
     this.listeners.set('SIGINT', l);
@@ -186,6 +215,8 @@ export class ExitSignals {
     }
     this.received = sig;
     this.receivedAt = performance.now();
+    // a SIGHUP / SIGTERM in the main phase: a SIGINT from now on is a second signal (r8 #6)
+    this.holdSigint();
     const noop = (): void => undefined;
     for (const st of this.streams) (st as { on?: (e: string, f: () => void) => void } | undefined)?.on?.('error', noop);
     this.startAbort.abort();

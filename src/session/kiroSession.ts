@@ -158,7 +158,17 @@
  *    `/effort` made inside a tangent are saved at once on those records and kept on the return,
  *    whose one restart starts the child with them (r7 #3). A tangent / rewind record is created
  *    with the session's trust, agent, model, effort, plan mode and its pending fork, so it is
- *    never on disk weaker than the session while its child starts (r7 #1).
+ *    never on disk weaker than the session while its child starts (r7 #1); so are a
+ *    `create({ fork })` record (a /spec phase session, the continuation) and a `/chat load`
+ *    import opened as a fork with the fork still to be made, so a crash while the child starts
+ *    makes `chat --resume` fork the source again, not fall back on the journal (r8 #7). A
+ *    `/model` (set_model) to a model that has the session's effort level sends that level
+ *    (`/effort <level>`, silent; queued for the next prompt line like setEffort's while a turn
+ *    runs or a restored history is pending) when the running child does not have it: its launch
+ *    dropped `--effort` for a model without that level (a start or respawn on it, an `/agent
+ *    swap` to an agent pinning it). A child that got the level (`--effort`, a later `/effort`)
+ *    gets no extra line, also after a switch through a model without effort levels: Claude Code
+ *    keeps the level across set_model (VERIFIED 2.1.319), r8 #8.
  *  - A respawn that finishes after `close()` closes its new child and fails ("The session is
  *    closed"): no child outlives its session (ACP terminate during `session/set_mode`).
  *  - `KIRO_CLAUDE_FORCE_MODEL` also pins Claude subagents (`CLAUDE_CODE_SUBAGENT_MODEL[_FORCE]`);
@@ -913,6 +923,15 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
    * is written at once.
    */
   private pendingEffort: { rec: SessionRecord; level: string } | undefined;
+  /**
+   * The effort level the running child was given: its launch's `--effort` (spawn), or a later
+   * `/effort` line it accepted. Undefined when it runs at its model's own default: the launch
+   * dropped the record's level for a model without it. A set_model keeps it: Claude Code holds
+   * the level across model switches, unapplied on a model without effort levels and applied again
+   * on one that has it (VERIFIED 2.1.319, also for `--effort` given on a model without levels).
+   * setModel sends the session's level only when this differs (r8 #8).
+   */
+  private childEffort: string | undefined;
 
   private startPromise: Promise<void> | undefined;
   private closed = false;
@@ -1210,6 +1229,11 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         // leave `chat --resume` (it opens this newest record) without the plan mode (r7 #1)
         ...(parent ? { title: parent.title, contextRules: parent.contextRules, planMode: parent.planMode } : {}),
         ...(carried ?? {}),
+        // the fork still to be made, as on a tangent / rewind record (forkRecord): a crash while
+        // the child starts must not make `chat --resume` resume a Claude id that has no transcript
+        // (the journal fallback) instead of forking the source again (r8 #7); spawn sets or clears
+        // it once the child is up
+        pendingFork: { from: opts.fork.fromClaudeSessionId, ...(opts.fork.at ? { at: opts.fork.at } : {}) },
         // a carry merged into the parent is part of its history (01 §5.11, 06 §6.4) but not yet
         // of its Claude transcript: this fork (a spec phase / continuation, SpecSessionDriver)
         // gets its own copy, like a tangent (F9); the parent keeps its copy, delivered once (G1)
@@ -1654,6 +1678,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     }
     this.proc = proc;
     this.launch = launch;
+    this.childEffort = launch.effort;
     this.deferredMode = undefined;
     this.claudeNew = mode.kind === 'new';
     this.setPendingFork(mode.kind === 'fork' ? mode : undefined);
@@ -2505,7 +2530,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         this.pendingEffort = undefined;
         // only in the record it was set in (another one's child runs at its own saved level)
         if (effort.rec === this.rec) {
-          await this.runLocal(`/effort ${effort.level}`).catch((e: unknown) => this.uiNotice('warn', `Failed to set effort: ${errText(e)}`));
+          await this.effortLine(effort.level).catch((e: unknown) => this.uiNotice('warn', `Failed to set effort: ${errText(e)}`));
         }
       }
       await this.waitIdle();
@@ -2690,6 +2715,13 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       const r = await gen.next();
       if (r.done) return r.value;
     }
+  }
+
+  /** A silent `/effort <level>` line; the running child has the level once Claude accepts it (childEffort). */
+  private async effortLine(level: string): Promise<TurnResult> {
+    const r = await this.runLocal(`/effort ${level}`);
+    if (!r.isError) this.childEffort = level;
+    return r;
   }
 
   // ── turn composition ──
@@ -3077,9 +3109,12 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       save();
       return;
     }
+    let switched: ClaudeProcess | undefined;
     if (this.proc?.running) {
+      const proc = this.proc;
       try {
-        await this.proc.setModel(m.value ?? null);
+        await proc.setModel(m.value ?? null);
+        switched = proc;
       } catch (e) {
         // Claude refused the switch (an error answer, also one the REPL stopped waiting for, r5
         // S5): the model stays what it was, in memory as on disk (a turn may have saved the record
@@ -3112,6 +3147,35 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       }
     }
     save();
+    if (switched) await this.effortAfterSwitch(rec, kiroId, switched);
+  }
+
+  /**
+   * After set_model switched `proc` to `kiroId` (r8 #8): the session's effort is session state,
+   * so Claude Code must run the new model at `rec.effort`, not at that model's own default. The
+   * level is sent (as setEffort sends it) only when the child does not have it (childEffort: its
+   * launch dropped `--effort` for a model without that level) and the new model may have it
+   * (setEffort's rule: not listed without it). A switch to a model without the level sends
+   * nothing and leaves childEffort as it is: Claude Code keeps the level as its own setting across
+   * set_model and applies it again on a model that has it (VERIFIED 2.1.319, r8 #8 verifier).
+   */
+  private async effortAfterSwitch(rec: SessionRecord, kiroId: string, proc: ClaudeProcess): Promise<void> {
+    const level = rec.effort;
+    if (!level) return;
+    const levels = findModelEntry(await this.listModels(), kiroId)?.supportedEffortLevels;
+    if (this.proc !== proc || this.rec !== rec || this.closed || rec.effort !== level) return;
+    if (levels === null || (Array.isArray(levels) && !levels.includes(level))) return;
+    // (a child that died meanwhile: its respawn starts with `--effort`)
+    if (this.childEffort === level || !proc.running) return;
+    // queued for the next prompt line while a turn runs or a restored history is pending (Claude
+    // writes a fresh session's transcript for a local command line: the history's own line stays
+    // the conversation's first, R4 #1), as setEffort does
+    if (this.turnBusy || rec.pendingHistory !== undefined) {
+      this.pendingEffort = { rec, level };
+      return;
+    }
+    const r = await this.effortLine(level).catch((e: unknown) => ({ isError: true, error: errText(e) }) as Pick<TurnResult, 'isError' | 'error'>);
+    if (r.isError) this.uiNotice('warn', `Failed to set effort to ${level}: ${r.error ?? 'Claude Code refused it'}`);
   }
 
   async setEffort(level: string): Promise<void> {
@@ -3144,7 +3208,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       this.pendingEffort = { rec: this.rec, level: l };
       return;
     }
-    const r = await this.runLocal(`/effort ${l}`);
+    const r = await this.effortLine(l);
     if (r.isError) throw new Error(r.error ?? `Failed to set effort to ${l}`);
   }
 
@@ -4003,6 +4067,10 @@ export async function importSessionExport(p: string, opts: Omit<KiroSessionOptio
       // the transcript nor the journal; in mode 'new' it follows the restored-history block
       ...(exported.pendingContext?.length ? { pendingContext: exported.pendingContext } : {}),
       ...(pendingHistory !== undefined ? { pendingHistory } : {}),
+      // the fork still to be made, on disk from the first write (its own Claude id has no
+      // transcript until the fork's first message): a crash while the child starts must not make
+      // `chat --resume` resume that id (the journal fallback) instead of forking again (r8 #7)
+      ...(mode.kind === 'fork' ? { pendingFork: { from: mode.from, ...(mode.at ? { at: mode.at } : {}) } } : {}),
     });
   } catch (e) {
     cleanup();

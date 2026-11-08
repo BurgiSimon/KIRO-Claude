@@ -14,19 +14,21 @@
  *    the command, F0): Ctrl+C reaches it only through the command signal, which kills it. A
  *    cancelled run prints `Export via <script> was cancelled.` / `Import via <script> was
  *    cancelled.`, neither success nor failure, and loads nothing of what it printed (R1).
- *  - `new` / `resume` create a fresh / resumed KiroSession with the current agent, model and
- *    effort and close the old one.
- *  - `new`, `resume` and `load` keep the chat's current trust (`/tools untrust`, `/tools reset`,
- *    `t` answers; never the launch `--trust-tools` / `--trust-all-tools` again: Q keeps trust per
- *    process, its Load swaps the current agents into the loaded state) and plan mode; a record or
- *    export saved in plan mode comes back in it too (ReplContext.baseSessionOptions, activate).
- *  - Ctrl+C while `new` / `resume` / `load` run the next session's agentSpawn hooks (they can
- *    take long: V2 30 s, V3 60 s, 0 = never) cancels the command (K3): the command signal is the
- *    session's start signal (session/startSignal.ts), so its hooks are killed, nothing of it stays
- *    and the current session stays active (`Starting a new chat session was cancelled.`,
- *    `Resuming the chat session was cancelled.`, `Import from <path> was cancelled.`). A press
- *    while Claude Code then starts changes nothing. The current session is idle meanwhile, so no
- *    press force-stops it (F0).
+ *  - `new` creates a fresh KiroSession with the chat's current agent, model and effort; `resume`
+ *    resumes the picked record on its own agent, model and effort (the chat's effort when the
+ *    record has none); both close the old one.
+ *  - `new`, `resume`, `load` and `load-via-script` keep the chat's current trust
+ *    (`/tools untrust`, `/tools reset`, `t` answers; never the launch `--trust-tools` /
+ *    `--trust-all-tools` again: Q keeps trust per process, its Load swaps the current agents into
+ *    the loaded state) and plan mode; a record or export saved in plan mode comes back in it too
+ *    (ReplContext.baseSessionOptions, activate).
+ *  - Ctrl+C while `new` / `resume` / `load` / `load-via-script` run the next session's
+ *    agentSpawn hooks (they can take long: V2 30 s, V3 60 s, 0 = never) cancels the command (K3):
+ *    the command signal is the session's start signal (session/startSignal.ts), so its hooks are
+ *    killed, nothing of it stays and the current session stays active (`Starting a new chat
+ *    session was cancelled.`, `Resuming the chat session was cancelled.`, `Import from <path> was
+ *    cancelled.`, `Import via <script> was cancelled.`). A press while Claude Code then starts
+ *    changes nothing. The current session is idle meanwhile, so no press force-stops it (F0).
  */
 
 import * as fs from 'node:fs';

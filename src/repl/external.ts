@@ -75,10 +75,10 @@ export function editorCommand(env: NodeJS.ProcessEnv): string[] {
 }
 
 /**
- * Open `$EDITOR` on `opts.file` (edited in place) or on a temp file prefilled with `initial`;
- * resolves with the file's content afterwards.
+ * Open `$EDITOR` (or `opts.command`, the editor's program and arguments) on `opts.file` (edited in
+ * place) or on a temp file prefilled with `initial`; resolves with the file's content afterwards.
  */
-export async function openEditor(initial: string, io: ChildIo, opts: { suffix?: string; file?: string } = {}): Promise<EditorResult> {
+export async function openEditor(initial: string, io: ChildIo, opts: { suffix?: string; file?: string; command?: readonly string[] } = {}): Promise<EditorResult> {
   let file = opts.file;
   let tmpDir: string | undefined;
   try {
@@ -87,7 +87,7 @@ export async function openEditor(initial: string, io: ChildIo, opts: { suffix?: 
       file = path.join(tmpDir, `prompt${opts.suffix ?? '.md'}`);
       fs.writeFileSync(file, initial, { mode: 0o600 });
     }
-    const [prog, ...args] = editorCommand(io.env);
+    const [prog, ...args] = opts.command && opts.command.length > 0 ? opts.command : editorCommand(io.env);
     const r = await runChild(prog!, [...args, file], io);
     if (r.error) return { ok: false, error: r.error };
     if (r.code !== 0) return { ok: false, error: `${prog} exited with ${r.signal ? `signal ${r.signal}` : `status ${r.code}`}` };

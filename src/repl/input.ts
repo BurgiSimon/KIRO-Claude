@@ -9,7 +9,10 @@
  *    compatibility):
  *      - `Ctrl+J` (LF) and `Alt+Enter` insert a newline: the current physical line is accepted
  *        as a non-final line of a multi-line input (01 §4.5 P1);
- *      - bracketed paste (`ESC[200~ … ESC[201~`) keeps pasted newlines inside one input;
+ *      - bracketed paste (`ESC[200~ … ESC[201~`) keeps pasted newlines inside one input; it is
+ *        turned on again whenever the terminal is taken back: after a stop, and after a child
+ *        (`!cmd`, `$EDITOR`), which may have turned it off (vim at exit; bash before `fg`
+ *        continues a job stopped while the child owned the terminal; r8 #2);
  *      - `Ctrl+C` ⇒ `interrupt` (resolves the active read, or emits `'interrupt'` while no
  *        read is active, i.e. while a turn runs); ignored while a child owns the terminal
  *        (suspended: the SIGINT is the child's);
@@ -24,12 +27,16 @@
  *        its half-typed line. readline's own suspend is never used: it left the input paused
  *        after SIGCONT, and raw mode off when the stop was discarded (r7 #2). While no read is
  *        active (a turn runs) Ctrl+Z is kept as type-ahead: the stop happens at the next prompt,
- *        once it is drawn, and an approval prompt drops it with the rest (DECISION: Q, whose
- *        terminal is in cooked mode then, stops at once; but hook commands run in process groups
- *        of their own and go on while kiro-claude is stopped, its timers do not wait, and a stop
- *        that outlasted a running preToolUse hook's timeout made that hook "timed out", which
- *        never blocks, even when it had blocked the tool). A Ctrl+Z inside a paste, read while a
- *        child owns the terminal, or while muted is dropped. After a stop from elsewhere
+ *        once it is drawn, and an approval prompt drops it with the rest; presses typed ahead
+ *        stop the chat once (one Ctrl+Z is kept, and one replayed drops any other: r8 #4)
+ *        (DECISION: Q, whose terminal is in cooked mode then, stops at once; kiro-claude stops
+ *        between turns, when nothing of the turn runs on: Claude Code and hook commands run in
+ *        process groups of their own and go on while it is stopped). However kiro-claude is
+ *        stopped (here, at an approval prompt while other calls' hooks run, or from elsewhere),
+ *        the stop does not count against a hook command's timeout or a control request's, and a
+ *        hook that exited meanwhile keeps its exit status, a block included (util/process.ts
+ *        runningTimeout, r8 #0/#1). A Ctrl+Z inside a paste, read while a child owns the
+ *        terminal, or while muted is dropped. After a stop from elsewhere
  *        (`kill -TSTP` / `kill -STOP`, then `fg`: the shell left the terminal in cooked mode) the
  *        terminal is taken back the same way at SIGCONT, the prompt drawn on a fresh line;
  *      - while no read is active, other keys are kept as type-ahead and replayed into the next
@@ -167,6 +174,9 @@ const STOP_SEEN_MS = 50;
  * the event loop after the stop was handled synchronously): nothing more to do.
  */
 const OWN_CONT_MS = 250;
+
+/** Ctrl+Z (readline's key for \x1a). */
+const isCtrlZ = (k: Key): boolean => k.ctrl === true && !k.shift && k.name === 'z';
 
 /** See module doc. Events: `'interrupt'` (Ctrl+C with no active read), `'shift-tab'`. */
 export class LineReader extends EventEmitter {
@@ -555,17 +565,19 @@ export class LineReader extends EventEmitter {
     }
     if (k.name === 'paste-start') this.inPaste = true;
     else if (k.name === 'paste-end') this.inPaste = false;
-    if (k.ctrl && !k.shift && k.name === 'z' && (this.inPaste || this.suspended || this.top())) {
+    if (isCtrlZ(k) && (this.inPaste || this.suspended || this.top())) {
       // a read is active: stop now; in a paste or while a child owns the terminal: dropped.
       // While no read is active (a turn runs) it is kept as type-ahead below: the stop waits
-      // for the next prompt, never under a running hook (see module doc).
+      // for the next prompt (see module doc).
       this.lastReturnAt = 0;
       if (!this.inPaste && !this.suspended) this.jobStop();
       return true;
     }
     const t = this.top();
     if (!t || this.suspended) {
-      // no read active: keep as type-ahead (bounded)
+      // no read active: keep as type-ahead (bounded); one Ctrl+Z at most, as in a cooked-mode
+      // program, where the first press stops the job and the next ones go to the shell (r8 #4)
+      if (isCtrlZ(k) && this.typeahead.some(([, q]) => isCtrlZ(q))) return true;
       if (this.typeahead.length < 4096) this.typeahead.push([s, { ...k }]);
       return true;
     }
@@ -630,10 +642,14 @@ export class LineReader extends EventEmitter {
   /**
    * Ctrl+Z at an active read (terminal mode, see module doc): stop kiro-claude's process group
    * the way the terminal's own Ctrl+Z would, then take the terminal back. Nothing on Windows (no
-   * job control, as readline), without an active read (a turn runs: never under its hooks),
-   * after the input's end, while a child owns the terminal (its own job control applies) or
-   * while muted (a fatal signal: keys are dropped). `hungUp` is not touched: only a failing input
-   * (the terminal went away meanwhile) ends it.
+   * job control, as readline), without an active read (a turn runs: the Ctrl+Z waits as
+   * type-ahead), after the input's end, while a child owns the terminal (its own job control
+   * applies) or while muted (a fatal signal: keys are dropped). An active read can be an approval
+   * prompt in the middle of a turn, with other calls' hook commands still running: they go on
+   * while kiro-claude is stopped, and the stop does not count against their timeouts
+   * (util/process.ts runningTimeout; one that exited meanwhile keeps its exit status, r8 #0/#1).
+   * Any other Ctrl+Z still typed ahead is dropped (one press, one stop: r8 #4). `hungUp` is not
+   * touched: only a failing input (the terminal went away meanwhile) ends it.
    */
   private jobStop(): void {
     if (process.platform === 'win32' || this.closed || this.ended || this.suspended || this.muted()) return;
@@ -656,6 +672,8 @@ export class LineReader extends EventEmitter {
     } catch {
       // ignore
     }
+    // a Ctrl+Z still typed ahead from before this one (being replayed) stops nothing more (r8 #4)
+    this.typeahead = this.typeahead.filter(([, q]) => !isCtrlZ(q));
     // after a real stop the shell's lines are below the input and the cursor is on a fresh line:
     // the prompt is drawn there; after a discarded one the input is redrawn in place
     this.retake(t, performance.now() - t0 >= STOP_SEEN_MS);
@@ -767,6 +785,12 @@ export class LineReader extends EventEmitter {
     }
   }
 
+  /**
+   * Take the terminal back from the child: raw mode, the input resumed, and bracketed paste on
+   * again, as after a stop ({@link retake}): the child may have turned it off (vim at exit; bash
+   * before it continues a job stopped with Ctrl+Z while the child owned the terminal, whose
+   * SIGCONT {@link continued} leaves to the child), and a paste would then submit line by line (r8 #2).
+   */
   resume(): void {
     if (!this.suspended) return;
     this.suspended = false;
@@ -778,6 +802,7 @@ export class LineReader extends EventEmitter {
       // ignore
     }
     this.rl.resume();
+    if (!this.closed && !this.ended && !this.muted()) this.output.write('\u001b[?2004h');
   }
 
   private onClose(): void {

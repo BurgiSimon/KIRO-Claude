@@ -13,7 +13,10 @@
  * - The `initialize` control_request is the FIRST line written; {@link ClaudeProcess.start}
  *   resolves when its control_response arrives (it precedes any `system/init`) and rejects with
  *   {@link ClaudeProcessError} (including the stderr tail) when the child exits first, the
- *   response is an error, or `initializeTimeoutMs` (default 60 s) elapses.
+ *   response is an error, or `initializeTimeoutMs` (default 60 s) elapses. That timeout and
+ *   {@link ClaudeProcess.request}'s count only the time kiro-claude was running
+ *   (util/process.ts `runningTimeout`, r8): Claude Code runs on while kiro-claude is stopped, and
+ *   an answer it wrote meanwhile settles the request after SIGCONT, never a timeout.
  * - stdout is split on `\n` (CR stripped, partial lines buffered, UTF-8 safe). Non-JSON lines
  *   and JSON values without a string `type` are reported through `'protocolError'` and skipped.
  * - CLI → host `control_request`s are answered exactly once: `hook_callback` →
@@ -83,6 +86,7 @@ import { StringDecoder } from 'node:string_decoder';
 
 import { resolveSpawn, type ClaudeBinary } from './binary.js';
 import { PROCESS_GROUPS, dyingSignal, groupSpawnOptions, membersSettled, signalChild, trackChild } from './lifecycle.js';
+import { runningTimeout, type RunningTimer } from '../util/process.js';
 import type {
   CancelAsyncMessageResponse,
   CanUseToolRequest,
@@ -347,7 +351,8 @@ interface PendingHostRequest {
   subtype: string;
   resolve(value: unknown): void;
   reject(err: Error): void;
-  timer?: NodeJS.Timeout;
+  /** The request's timeout: running time only (a stop of kiro-claude is not counted). */
+  timer?: RunningTimer;
 }
 
 interface CliRequestEntry {
@@ -729,18 +734,19 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
     return new Promise<T>((resolve, reject) => {
       const entry: PendingHostRequest = { subtype, resolve: resolve as (v: unknown) => void, reject };
       if (timeoutMs > 0) {
-        entry.timer = setTimeout(() => {
+        // decided one turn after it fires: an answer that arrived while kiro-claude was stopped wins
+        entry.timer = runningTimeout(timeoutMs, () => {
           if (this.pendingHost.get(id) !== entry) return;
           this.pendingHost.delete(id);
           reject(new ClaudeControlError(`Control request '${subtype}' timed out after ${timeoutMs} ms`, subtype, true));
-        }, timeoutMs);
+        });
       }
       this.pendingHost.set(id, entry);
       try {
         this.writeLine({ type: 'control_request', request_id: id, request: { ...payload, subtype } });
       } catch (e) {
         this.pendingHost.delete(id);
-        if (entry.timer) clearTimeout(entry.timer);
+        entry.timer?.clear();
         reject(e as Error);
       }
     });
@@ -917,7 +923,7 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
       return;
     }
     this.pendingHost.delete(r.request_id);
-    if (entry.timer) clearTimeout(entry.timer);
+    entry.timer?.clear();
     if (r.subtype === 'error') {
       entry.reject(new ClaudeControlError(typeof r.error === 'string' ? r.error : 'Control request failed', entry.subtype));
     } else {
@@ -1188,7 +1194,7 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
     const err = this.exitError(info);
     for (const [id, entry] of this.pendingHost) {
       this.pendingHost.delete(id);
-      if (entry.timer) clearTimeout(entry.timer);
+      entry.timer?.clear();
       entry.reject(err);
     }
     for (const [id, entry] of this.cliRequests) {

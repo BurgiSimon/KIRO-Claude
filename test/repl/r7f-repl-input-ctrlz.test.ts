@@ -114,8 +114,8 @@ test('r7f #2: Ctrl+Z at the prompt stops the process group, then raw mode, brack
 });
 
 test('r7f #2: Ctrl+Z while a turn runs (no read active) draws nothing and stops once, at the next prompt', { skip }, async (t) => {
-  // r7 verification: never at once under a running turn (its hooks' timeouts would run out while
-  // stopped); see r7f-repl-input-verify.test.ts
+  // r7 verification: never at once under a running turn (the r7 DECISION; since r8 stopped time no
+  // longer counts against hook timeouts either); see r7f-repl-input-verify.test.ts
   const { r, input, log, since } = ttyReader(t);
   r.on('interrupt', () => undefined); // a turn is listening for Ctrl+C
   let p = r.readInput('> ');

@@ -262,7 +262,7 @@ test('r7f #2: Ctrl+Z at an approval prompt under bash, then fg: y still answers 
 });
 
 test('r7f #2: Ctrl+Z while an answer streams under bash stops at the prompt after it; after fg the chat reads again', { skip: skipBash, timeout: 90_000 }, async () => {
-  // r7 verification: never under a running turn (its hooks' timeouts would run out while stopped)
+  // r7 verification: never under a running turn (the r7 DECISION; see r8f-repl-input-pty for hooks)
   const t = open('bash');
   try {
     await startUnderBash(t);

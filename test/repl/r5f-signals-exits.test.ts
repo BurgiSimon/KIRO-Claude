@@ -6,8 +6,9 @@
  *    (r7g: bash closing the terminal of a stopped job); a later second signal still re-raises at
  *    once.
  *  - #6 ExitSignals.closing(): during the front end's final close a SIGINT closes first (bounded
- *    by the grace) and then re-raises; a second press re-raises at once; never re-armed after
- *    dispose().
+ *    by the grace) and then re-raises; a second press after the duplicate window re-raises at
+ *    once; never re-armed after dispose(). (A SIGINT after a SIGHUP / SIGTERM in the main phase:
+ *    r8f-signals-exits.test.ts.)
  *  - #1(a) LineReader: an 'error' on the input (a hung-up terminal: `setRawMode EIO` while
  *    readline closes on the input's end) is end of input, never an unhandled 'error' event.
  *  - g2 LineReader `muted`: no prompt and no echo while it says so.

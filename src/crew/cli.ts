@@ -64,6 +64,12 @@ Options:
       --allow-tmp             Allow a checkout under the system temp directory
       --kiro-bin <PATH>       Use another kiro-cli for Kiro Crew (test only)
   -y, --yes                   Do not ask for confirmation
+
+The checkout (--dir, KIRO_CLAUDE_CREW_DIR or the one an earlier setup used) must not be in a
+linked git worktree, nor under the system temp directory without --allow-tmp, nor in crew's
+build caches (cache/npm, cache/pip) or claude-agent-acp bridge (node/) in the crew state
+directory: the build and npm delete what is there. For the same reason setup
+does not build while those caches, or install the bridge while node/, hold a Kiro Crew checkout.
 `,
   doctor: `Check the Kiro Crew installation
 
@@ -133,8 +139,9 @@ Usage: kiro-claude crew uninstall [--purge]
 
   --purge  also remove the private claude-agent-acp bridge and the build caches, then the crew
            state directory itself when it is empty, and print what it removed and what it
-           kept. After an earlier plain uninstall, it removes just these leftovers (not while
-           a gateway may still be running)
+           kept. A cache or the bridge that holds a Kiro Crew checkout is kept. After an
+           earlier plain uninstall, it removes just these leftovers (not while a gateway may
+           still be running)
 `,
 });
 

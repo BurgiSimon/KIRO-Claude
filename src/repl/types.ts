@@ -66,8 +66,11 @@ export interface ReplContext extends ReplHost {
   commands(): readonly SlashCommand[];
   /** Process `text` exactly like a typed input line (prompt expansion, `!cmd`, turns). */
   submit(text: string): Promise<void | 'quit'>;
-  /** Open `$EDITOR` (fallback `vi`) on a temp file prefilled with `initial`. */
-  openEditor(initial: string, opts?: { suffix?: string; file?: string }): Promise<EditorResult>;
+  /**
+   * Open `$EDITOR` (fallback `vi`; `opts.command` names another editor command) on a temp file
+   * prefilled with `initial`, or on `opts.file`; the reader hands the terminal over meanwhile.
+   */
+  openEditor(initial: string, opts?: { suffix?: string; file?: string; command?: readonly string[] }): Promise<EditorResult>;
   /** Run `!cmd` semantics (01 §4.3 step 4). */
   runBang(command: string): Promise<void>;
   /** Options to create a sibling session (current agent/model/effort and trust, no resume/fork). */

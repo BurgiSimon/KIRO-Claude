@@ -8,10 +8,10 @@
  *    when bash exits), later than the kernel's to a session leader. kiro-claude must still die of
  *    SIGHUP, not exit 0. r5f-signals-pty.test.ts never looks at kiro-claude's own status under
  *    bash; here a wrapper that ignores SIGHUP records it.
- *  - After a fatal signal nothing more is printed, also when a process SIGINT (`kill -INT`) or a
- *    terminal resize comes during the grace, or keys are typed (at the prompt, at a command's
- *    question): the terminal reader used to move to a fresh line for the SIGINT, and readline
- *    redrew the prompt line at the resize.
+ *  - After a fatal signal nothing more is printed, also when a terminal resize comes during the
+ *    grace, or keys are typed (at the prompt, at a command's question): readline redrew the
+ *    prompt line at the resize. (A process SIGINT during the grace used to be checked here too;
+ *    since r8 #6 it is a second signal that ends kiro-claude at once, see r8f-signals-pty.)
  *  - Controls: a resize at the prompt still redraws the prompt line; one while an answer streams
  *    draws no stale prompt over it, and the answer is intact.
  *
@@ -222,7 +222,9 @@ test('r6f verify #3: started from an interactive bash, a forced stop, then the t
 });
 
 for (const where of ['prompt', 'question'] as const) {
-  test(`r6f verify: after a SIGTERM (chat ${where === 'prompt' ? 'at the prompt' : "at /clear's question"}), a SIGINT, a terminal resize and keys typed during the grace print nothing`, { skip, timeout: 60_000 }, async () => {
+  // r8 #6: a SIGINT after the SIGTERM is now a second signal and ends kiro-claude at once (covered
+  // by r8f-signals-pty); here the grace runs to its end under a resize and typed keys
+  test(`r6f verify: after a SIGTERM (chat ${where === 'prompt' ? 'at the prompt' : "at /clear's question"}), a terminal resize and keys typed during the grace print nothing`, { skip, timeout: 60_000 }, async () => {
     const r = mkRoot({ turns: [{ repeat: true, steps: [{ text: 'ANSWER to {{userText}}' }] }] });
     const endFile = path.join(r.root, 'ended.txt');
     const errFile = path.join(r.root, 'kc-stderr.txt');
@@ -243,9 +245,7 @@ for (const where of ['prompt', 'question'] as const) {
       await sleep(300);
       const at = p.raw().length;
       process.kill(pid, 'SIGTERM');
-      await sleep(150);
-      process.kill(pid, 'SIGINT');
-      await sleep(100);
+      await sleep(250);
       p.signal('SIGUSR2'); // the window is resized
       await sleep(100);
       p.write(' and more\ry\r');

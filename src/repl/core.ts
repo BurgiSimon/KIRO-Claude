@@ -566,7 +566,7 @@ export class Repl implements ReplContext {
     };
   }
 
-  async openEditor(initial: string, opts: { suffix?: string; file?: string } = {}): Promise<EditorResult> {
+  async openEditor(initial: string, opts: { suffix?: string; file?: string; command?: readonly string[] } = {}): Promise<EditorResult> {
     const io = this.childIo();
     if (io.inherit) this.reader.suspend();
     try {

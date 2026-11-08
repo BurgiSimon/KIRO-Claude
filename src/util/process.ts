@@ -29,6 +29,10 @@
  *    and `error` set.
  *  - `timeoutMs` / `closeGraceMs` above 2^31-1 ms are clamped ({@link clampTimerMs}); Node
  *    would otherwise fire such timers after 1 ms and print a warning on stderr.
+ *  - `timeoutMs` counts only the time kiro-claude was running ({@link runningTimeout}, r8 #0/#1):
+ *    the child goes on while kiro-claude is stopped (its own Ctrl+Z, `kill -TSTP`, `kill -STOP`),
+ *    but the stop is not counted against its timeout, and a child that exited meanwhile is
+ *    reported with its exit status (a hook's block stays a block), never as timed out.
  *  - While kiro-claude dies of a fatal signal that claude/lifecycle.ts forwards (`dyingSignal()`,
  *    review r5 H2) no command is started (`aborted`, `error` "kiro-claude is shutting down"),
  *    and a run that a signal ended meanwhile is `aborted` too, not a failure: the hook runner
@@ -215,6 +219,153 @@ function hrMs(start: bigint): number {
   return Number(process.hrtime.bigint() - start) / 1e6;
 }
 
+// ───────────────────────── running time: stops are not counted (r8 #0/#1) ─────────────────────────
+
+/** Heartbeat of the stop clock while a {@link runningTimeout} is armed. */
+const BEAT_MS = 100;
+/** A beat this much later than the one before saw a gap: a stop (if a SIGCONT confirms it) or a blocked loop. */
+const GAP_MS = 2 * BEAT_MS;
+
+const nowMs = (): number => Number(process.hrtime.bigint()) / 1e6;
+
+/**
+ * The stop clock: how much time kiro-claude has spent stopped (SIGSTOP / SIGTSTP until SIGCONT),
+ * while at least one {@link runningTimeout} is armed. Nothing can see a stop begin (SIGSTOP cannot
+ * be caught, and SIGTSTP is the terminal's), so an unref'd heartbeat records when the event loop
+ * last ran; a SIGCONT then confirms the gap since then as a stop. Credited is the gap less one
+ * heartbeat interval: never more than the stop (the stop began at most one interval after the
+ * last beat, unless the loop was blocked right before it). A gap without a SIGCONT (a blocked
+ * event loop, a slow machine) is never credited, nor one the loop ran on after before a SIGCONT
+ * came (a blocked loop, then a short or stray stop: only the stop counts).
+ */
+const stopClock = {
+  /** The stops credited while the clock runs (process.hrtime ms; `from` = `to` less the credit). */
+  stops: [] as { from: number; to: number }[],
+  /** When the event loop was last seen running (a beat, a SIGCONT, the clock's start). */
+  aliveAt: 0,
+  /**
+   * The gap the latest beat saw, if it saw one (it may be the stop that the SIGCONT handled next
+   * ends). Every beat replaces it: once the loop has run on after a gap, that gap was a blocked
+   * loop, never the stop a later SIGCONT ends (r8 verification).
+   */
+  gap: undefined as { from: number; to: number } | undefined,
+  users: 0,
+  beat: undefined as NodeJS.Timeout | undefined,
+};
+
+function onBeat(): void {
+  const now = nowMs();
+  stopClock.gap = now - stopClock.aliveAt > GAP_MS ? { from: stopClock.aliveAt, to: now } : undefined;
+  stopClock.aliveAt = now;
+}
+
+/**
+ * SIGCONT: kiro-claude continues. Its handler runs in the poll phase, after the timers phase
+ * that may already have run a beat (which saw the gap and moved `aliveAt`): the longer of that
+ * gap (only the latest beat's: no beat ran since it) and the one since `aliveAt` is the stop.
+ */
+function onSigcont(): void {
+  const now = nowMs();
+  let span = now - stopClock.aliveAt;
+  let to = now;
+  const g = stopClock.gap;
+  if (g && g.to === stopClock.aliveAt && g.to - g.from > span) {
+    span = g.to - g.from;
+    to = g.to;
+  }
+  stopClock.gap = undefined;
+  stopClock.aliveAt = now;
+  const credit = span - BEAT_MS;
+  if (credit > 0) stopClock.stops.push({ from: to - credit, to });
+}
+
+/** Stopped time credited after `since` (a stop that began before it counts from `since` on). */
+function stoppedSince(since: number): number {
+  let ms = 0;
+  for (const s of stopClock.stops) if (s.to > since) ms += s.to - Math.max(s.from, since);
+  return ms;
+}
+
+function joinStopClock(): void {
+  if (stopClock.users++ > 0) return;
+  stopClock.aliveAt = nowMs();
+  stopClock.gap = undefined;
+  stopClock.beat = setInterval(onBeat, BEAT_MS);
+  stopClock.beat.unref();
+  // no job control on Windows: nothing stops kiro-claude there
+  if (!isWin) process.on('SIGCONT', onSigcont);
+}
+
+function leaveStopClock(): void {
+  if (--stopClock.users > 0) return;
+  stopClock.users = 0;
+  stopClock.stops = [];
+  if (stopClock.beat) clearInterval(stopClock.beat);
+  stopClock.beat = undefined;
+  if (!isWin) process.removeListener('SIGCONT', onSigcont);
+}
+
+/** A {@link runningTimeout}; `clear()` cancels it (idempotent). */
+export interface RunningTimer {
+  clear(): void;
+}
+
+/**
+ * Like `setTimeout(onExpire, ms)`, for deadlines that must count only the time kiro-claude was
+ * running (r8 #0/#1): hook command timeouts (runShell) and Claude Code's control requests
+ * (claude/process.ts). Children and Claude Code run in process groups of their own and go on while
+ * kiro-claude is stopped (its own Ctrl+Z, `kill -TSTP`, `kill -STOP`), but the monotonic clock of
+ * `setTimeout` counts the stop, and at SIGCONT libuv runs expired timers before the poll phase
+ * that delivers what happened meanwhile (a child's exit, an answer in a pipe). So:
+ *  - the expiry is decided one event-loop turn after the timer fired (`setImmediate`): what
+ *    arrived during a stop is handled first, and `onExpire` re-checks its own state;
+ *  - stopped time ({@link stopClock}) is not counted: when a stop was credited since the timer
+ *    was armed, it is re-armed for the running time left, so a genuinely hung child still expires
+ *    after `ms` of running time. Without a stop the expiry is the plain timer's (one turn later).
+ * `onExpire` gets the time (process.hrtime, ms) at which the timer fired, so a caller can tell
+ * what arrived in that last turn. `ms` is clamped ({@link clampTimerMs}).
+ */
+export function runningTimeout(ms: number, onExpire: (firedAt: number) => void): RunningTimer {
+  const total = clampTimerMs(ms);
+  const start = nowMs();
+  joinStopClock();
+  let timer: NodeJS.Timeout | undefined;
+  let immediate: NodeJS.Immediate | undefined;
+  let done = false;
+  const end = (): void => {
+    if (done) return;
+    done = true;
+    leaveStopClock();
+  };
+  const arm = (delay: number): void => {
+    timer = setTimeout(() => {
+      timer = undefined;
+      const firedAt = nowMs();
+      immediate = setImmediate(() => {
+        immediate = undefined;
+        if (done) return;
+        const stopped = stoppedSince(start);
+        if (stopped > 0) {
+          const left = total - (nowMs() - start - stopped);
+          if (left >= 1) return arm(left);
+        }
+        end();
+        onExpire(firedAt);
+      });
+    }, clampTimerMs(delay));
+  };
+  arm(total);
+  return {
+    clear() {
+      if (timer) clearTimeout(timer);
+      if (immediate) clearImmediate(immediate);
+      timer = undefined;
+      immediate = undefined;
+      end();
+    },
+  };
+}
+
 /** Run `command` through the platform shell (see module doc). Never rejects. */
 export function runShell(command: string, opts: RunShellOptions): Promise<ShellResult> {
   const start = process.hrtime.bigint();
@@ -227,14 +378,14 @@ export function runShell(command: string, opts: RunShellOptions): Promise<ShellR
     let settled = false;
     let timedOut = false;
     let aborted = false;
-    let timer: NodeJS.Timeout | undefined;
+    let timer: RunningTimer | undefined;
     let graceTimer: NodeJS.Timeout | undefined;
     let child: ChildProcess;
 
     const finish = (exitCode: number | null, signal: NodeJS.Signals | null, error?: string): void => {
       if (settled) return;
       settled = true;
-      if (timer) clearTimeout(timer);
+      timer?.clear();
       if (graceTimer) clearTimeout(graceTimer);
       opts.signal?.removeEventListener('abort', onAbort);
       const res: ShellResult = {
@@ -300,9 +451,12 @@ export function runShell(command: string, opts: RunShellOptions): Promise<ShellR
 
     let exitCode: number | null = null;
     let exitSignal: NodeJS.Signals | null = null;
+    /** When the shell's exit was seen (process.hrtime ms), for the timeout below. */
+    let exitSeenAt: number | undefined;
     child.on('exit', (code, sig) => {
       exitCode = code;
       exitSignal = sig;
+      exitSeenAt = nowMs();
       // Background grandchildren may keep our pipes open: don't wait for them forever.
       graceTimer = setTimeout(() => {
         child.stdout?.destroy();
@@ -323,12 +477,16 @@ export function runShell(command: string, opts: RunShellOptions): Promise<ShellR
     }
 
     if (opts.timeoutMs && opts.timeoutMs > 0) {
-      // Values beyond ~24.8 days are clamped (Node would otherwise fire after 1 ms).
-      timer = setTimeout(() => {
+      // Running time only (r8 #0/#1): a stop of kiro-claude is not counted, and an exit seen in the
+      // turn after the timer fired (the shell exited while kiro-claude was stopped) keeps its
+      // status. An exit seen before (the pipe grace) still lets the timeout kill the group's
+      // members that hold the pipes (L1). Values beyond ~24.8 days are clamped.
+      timer = runningTimeout(opts.timeoutMs, (firedAt) => {
         if (settled) return;
+        if (exitSeenAt !== undefined && exitSeenAt >= firedAt) return;
         timedOut = true;
         killProcessTree(child, 'SIGKILL');
-      }, clampTimerMs(opts.timeoutMs));
+      });
     }
     opts.signal?.addEventListener('abort', onAbort, { once: true });
   });

@@ -9,7 +9,7 @@
  *  - §1.3 `.config.kiro`: single-line JSON with `", "` separators and no trailing newline
  *    (`{"specId": "<uuid>", "workflowType": "requirements-first", "specType": "feature"}`); legacy
  *    `{"generationMode": …}` is read as `workflowType`; missing/garbled ⇒ null and `specType`
- *    inferred from `bugfix.md`. Never add keys. Quick specs write `"feature"` and design-first
+ *    inferred from `bugfix.md` (one that exists but is not read counts, r8 #9). Never add keys. Quick specs write `"feature"` and design-first
  *    writes `"design-first"` (both UNVERIFIED, 03 §7.2 — DECISION per 03 §1.3).
  *  - §1.5.2 a non-empty `bugfix.md` is the phase-1 document; an empty `requirements.md` next to it
  *    (KI:#9963) is ignored.
@@ -22,8 +22,9 @@
  * symbolic link (or not a regular file, or behind a link that resolves to nothing or whose target
  * cannot be accessed, or outside the workspace, or that the user cannot read, whatever its size)
  * is never read; its {@link SpecDocInfo.refused} and the spec's {@link SpecSummary.refused} say
- * why. Such a document counts as present when the phase is
- * derived (it is never offered for drafting as if it were missing), has no known content
+ * why. Such a document counts as present when the type (an existing refused `bugfix.md` makes a
+ * spec without a usable `specType` a bugfix spec, r8 #9) and the phase are derived (it is never
+ * offered for drafting as if it were missing), has no known content
  * (`nonEmpty` false) and is left out of the loaded texts and the context block. A spec folder
  * linked out of the workspace (or dangling, or to a target kiro-claude cannot access: a folder on
  * the way the user cannot enter), or that the user cannot enter itself (also through a link that
@@ -93,7 +94,7 @@ export interface SpecSummary {
   dir: string;
   /** Parsed `.config.kiro` (null when absent/invalid). */
   config: SpecConfig | null;
-  /** Effective type (config, else inferred from bugfix.md). */
+  /** Effective type (config, else inferred from bugfix.md: one that exists but is refused counts). */
   specType: SpecType;
   workflowType: WorkflowType;
   docs: Record<SpecDocKind, SpecDocInfo>;
@@ -209,9 +210,10 @@ export function readSpecConfig(dir: string): SpecConfig | null {
   const wf = o.workflowType ?? o.generationMode;
   const workflowType: WorkflowType = wf === 'design-first' ? 'design-first' : 'requirements-first';
   if (wf === undefined && o.specType === undefined && o.specId === undefined) return null;
-  // No usable specType (legacy `{"generationMode": …}` files): infer it from bugfix.md (03 §1.3).
+  // No usable specType (legacy `{"generationMode": …}` files): infer it from bugfix.md (03 §1.3),
+  // an existing one kiro-claude does not read included ({@link inferSpecType}, r8 #9).
   const specType: SpecType =
-    o.specType === 'bugfix' ? 'bugfix' : o.specType === 'feature' ? 'feature' : hasText(path.join(dir, SPEC_DOC_FILES.bugfix)) ? 'bugfix' : 'feature';
+    o.specType === 'bugfix' ? 'bugfix' : o.specType === 'feature' ? 'feature' : inferSpecType(docInfo(path.join(dir, SPEC_DOC_FILES.bugfix)));
   return { specId: typeof o.specId === 'string' ? o.specId : '', workflowType, specType };
 }
 
@@ -278,8 +280,15 @@ function docInfo(p: string): SpecDocInfo {
   return info;
 }
 
-function hasText(p: string): boolean {
-  return docInfo(p).nonEmpty;
+/**
+ * The type of a spec without a usable `specType`, from its bugfix.md `d` (03 §1.3): `bugfix` when
+ * it has content, or exists but is refused (docfs: a symbolic link, one the user cannot read, …),
+ * the way {@link present} counts it for the phase (r8 #9: an unreadable bugfix.md is never taken
+ * for a missing one, which made the spec a requirements-first feature spec); else `feature`
+ * (missing, or empty: an empty bugfix.md is no bug analysis).
+ */
+function inferSpecType(d: SpecDocInfo): SpecType {
+  return present(d) ? 'bugfix' : 'feature';
 }
 
 /**
@@ -308,7 +317,7 @@ export function specRefusals(s: Pick<SpecSummary, 'refused' | 'docs'>): string[]
   return [...new Set([s.refused, ...(Object.keys(SPEC_DOC_FILES) as SpecDocKind[]).map((k) => s.docs[k].refused)].filter((r): r is string => !!r))];
 }
 
-/** A refused document that exists counts as present for the phase (never drafted over as missing). */
+/** A refused document that exists counts as present for the phase and the type (never drafted over as missing). */
 function present(d: SpecDocInfo): boolean {
   return d.nonEmpty || (d.refused !== undefined && d.exists);
 }
@@ -325,7 +334,7 @@ export function summarizeSpecDir(dir: string): SpecSummary {
     const p = path.join(dir, SPEC_DOC_FILES[k]);
     docs[k] = folderWhy ? { path: p, exists: fs.existsSync(p), nonEmpty: false, bytes: 0, mtimeMs: 0, refused: folderWhy } : docInfo(p);
   }
-  const specType: SpecType = config?.specType ?? (docs.bugfix.nonEmpty ? 'bugfix' : 'feature');
+  const specType: SpecType = config?.specType ?? inferSpecType(docs.bugfix);
   const workflowType: WorkflowType = config?.workflowType ?? 'requirements-first';
   const order = docOrder(specType, workflowType);
   const s: SpecSummary = { name: path.basename(dir), dir, config, specType, workflowType, docs, order, phase: order[0]! };

@@ -70,9 +70,12 @@
  *    workflow itself (the tasks.md repair, box updates,
  *    re-lint, sync diff, task context). Such a "refused" document is never drafted (`✗ Cannot
  *    draft …`); its checkpoint names the reason and offers no Approve (headless: the flow ends with
- *    an error); a revision turn still runs (the gate denies its write through the link, with the
- *    reason). The same holds for every phase of a spec with ANY refused file (an input document
- *    such as requirements.md, or `.config.kiro`, whose type and workflow kiro-claude then does
+ *    an error); a revision turn still runs and its write of the document is denied: the gate
+ *    refuses it through the link, with the reason, and a document that is not a regular file or
+ *    that the user cannot read (which the gate would allow) is left out of the turn's write
+ *    allowance ({@link restrictionFor}, r8 #9 verifier). The same holds for every phase of a spec
+ *    with ANY refused file (an input document such as requirements.md, or `.config.kiro`, whose
+ *    type and workflow kiro-claude then does
  *    not know): no phase is drafted from it, every checkpoint names each reason and offers no
  *    Approve, and `approve` refuses. `analyze` with a refused phase-1 document (the one file it
  *    reads), and `sync` (it builds on requirements and design too) and `run` of a spec with any
@@ -87,7 +90,11 @@
  *    (store.specsDirRefused) gets that refusal, never "not found … Create it with … new" (r7 #7).
  *  - Resume hints (the checkpoint's Stop label and stop hint, `new` on an existing spec, `run` and
  *    `analyze` without their document) come from {@link SpecRuntime.resumeHint}: `/spec <name>` in
- *    the REPL, commands it accepts in the spec CLI (r7 #8).
+ *    the REPL, commands it accepts in the spec CLI (r7 #8). The Stop label and the stop hint pass
+ *    the document under review, so the CLI resumes that review at every checkpoint (`approve` /
+ *    `revise`), the tasks.md one included, never `run <name> --next` (r8 #10); at the checkpoint
+ *    of a document the turn did not write the hint is the one outside a checkpoint (the first
+ *    document: `/spec <name>` in chat, r7 #8).
  *
  * The workflow talks to its host only through {@link SpecRuntime}; {@link createReplRuntime}
  * adapts a ReplHost (slash commands) and spec/cli.ts builds a headless one.
@@ -114,7 +121,7 @@ import { journalPath } from '../session/kiroFiles.js';
 import { isSessionStartCancelled, withStartSignal } from '../session/startSignal.js';
 import { SessionStore, sessionsDir } from '../session/store.js';
 import { shlexSplit } from '../util/shlex.js';
-import { SpecFileRefusedError, readSpecFile, specRefusalText, writeSpecFile } from './docfs.js';
+import { SpecFileRefusedError, readSpecFile, specFileRefused, specFolderRefused, specRefusalText, writeSpecFile } from './docfs.js';
 import {
   SPEC_DOC_FILES,
   formatTaskLine,
@@ -261,10 +268,14 @@ export interface SpecRuntime {
   /**
    * The command(s) that resume spec `name` from where it stands, for the checkpoint's Stop label
    * and stop hint, `new` on an existing spec, `run` and `analyze` without the document they need
-   * (r7 #8). Default `${commandPrefix} <name>` (the REPL's `/spec <name>`); the spec CLI, which has
-   * no such form, names commands it accepts (spec/cli.ts).
+   * (r7 #8). `awaiting`: the document whose checkpoint the user stops at (the Stop label and the
+   * stop hint pass it, r8 #10): the hint resumes that review, never what the files alone suggest
+   * (a tasks.md under review already has tasks, so it derives as `execution`), when the files hold
+   * that review (a document the turn did not write has none: the hint is the one without). Default
+   * `${commandPrefix} <name>` (the REPL's `/spec <name>`); the spec CLI, which has no such form,
+   * names commands it accepts (spec/cli.ts).
    */
-  resumeHint?(name: string): string;
+  resumeHint?(name: string, awaiting?: SpecDocKind): string;
   /** End of a flow: release/settle phase sessions. */
   finish(): Promise<void>;
 }
@@ -735,8 +746,29 @@ function nextDoc(order: readonly SpecDocKind[], doc: SpecDocKind): SpecDocKind |
   return i >= 0 ? order[i + 1] : undefined;
 }
 
+/**
+ * The write allowance of the phase turn for `doc`: its documents (prompts.phaseWritableDocs),
+ * without one kiro-claude refuses for a reason the gate does not check itself (r8 #9 verifier):
+ * the gate (policy/specwrite.checkSpecWrite) refuses a link at the document or a path that leaves
+ * the workspace, with the reason, but would allow, without asking, the write of a document that is
+ * not a regular file (a directory: its subtree) or that the user cannot read. Such a document is
+ * never written, as never read, so its write is denied ("only (nothing) may be written now").
+ */
 function restrictionFor(c: Pick<FlowCtx, 'dir' | 'prompt'>, doc: SpecDocKind): SpecPhaseRestriction {
-  return { name: doc, allowedWritePaths: phaseWritableDocs(doc, c.prompt).map((k) => specDocPath(c.dir, k)) };
+  const folderRefused = specFolderRefused(c.dir) !== undefined;
+  const paths = phaseWritableDocs(doc, c.prompt).map((k) => specDocPath(c.dir, k));
+  return { name: doc, allowedWritePaths: folderRefused ? paths : paths.filter((p) => !refusedInPlace(p)) };
+}
+
+/** `p` exists, is no symbolic link (the gate refuses one itself) and kiro-claude refuses it (docfs: not a regular file, unreadable). */
+function refusedInPlace(p: string): boolean {
+  let st: fs.Stats;
+  try {
+    st = fs.lstatSync(p);
+  } catch {
+    return false; // missing: it may be created
+  }
+  return !st.isSymbolicLink() && specFileRefused(p) !== undefined;
 }
 
 function baseBlock(c: Pick<FlowCtx, 'name' | 'dir' | 'kindLabel' | 'rt'>): string {
@@ -868,7 +900,7 @@ async function checkpoint(c: FlowCtx, doc: SpecDocKind, next: SpecDocKind | unde
   options.push({ label: 'Request changes…', d: 'revise' });
   if (exists && (doc === 'requirements' || doc === 'bugfix')) options.push({ label: 'Analyze requirements', d: 'analyze' });
   if (exists && c.rt.openEditor) options.push({ label: 'Open in $EDITOR', d: 'editor' });
-  options.push({ label: `Stop here (resume later with ${resumeHint(c.rt, c.name)})`, d: 'stop' });
+  options.push({ label: `Stop here (resume later with ${resumeHint(c.rt, c.name, doc)})`, d: 'stop' });
   for (;;) {
     const i = await c.rt.choose(checkpointQuestion(doc, next), options.map((o) => o.label));
     const pick = i === undefined ? undefined : options[i];
@@ -882,9 +914,9 @@ async function checkpoint(c: FlowCtx, doc: SpecDocKind, next: SpecDocKind | unde
   }
 }
 
-/** {@link SpecRuntime.resumeHint}, else `${commandPrefix} <name>`. */
-function resumeHint(rt: SpecRuntime, name: string): string {
-  return rt.resumeHint ? rt.resumeHint(name) : `${rt.commandPrefix} ${name}`;
+/** {@link SpecRuntime.resumeHint} (`awaiting`: the document whose checkpoint is stopped at), else `${commandPrefix} <name>`. */
+function resumeHint(rt: SpecRuntime, name: string, awaiting?: SpecDocKind): string {
+  return rt.resumeHint ? rt.resumeHint(name, awaiting) : `${rt.commandPrefix} ${name}`;
 }
 
 function readyHint(c: FlowCtx): string {
@@ -988,7 +1020,7 @@ async function phaseLoop(c: FlowCtx, start: SpecDocKind, draft: boolean): Promis
       case 'stop': {
         c.trace.push({ state: 'stopped', doc });
         const hint = c.rt.interactive
-          ? `Stopped at the ${SPEC_DOC_FILES[doc]} checkpoint. Resume later with ${resumeHint(c.rt, c.name)}.`
+          ? `Stopped at the ${SPEC_DOC_FILES[doc]} checkpoint. Resume later with ${resumeHint(c.rt, c.name, doc)}.`
           : `${SPEC_DOC_FILES[doc]} is waiting for review. Approve with: ${c.rt.commandPrefix} approve ${c.name} · Request changes: ${c.rt.commandPrefix} revise ${c.name} <feedback>`;
         c.rt.print(hint);
         return result(c, 'stopped', { awaiting: doc });
@@ -1729,18 +1761,42 @@ export async function runSpecTasks(rt: SpecRuntime, name: string, sel: TaskSelec
 export interface ReplRuntimeDeps {
   /** Build the task-hook runner from the session's hooks (default hooks/runner HookRunner). */
   hookRunnerFactory?: (hooks: readonly KiroHook[]) => HookRunnerLike;
-  /** Override "Open in $EDITOR" (default: $VISUAL/$EDITOR with inherited stdio, if set). */
+  /**
+   * Override "Open in $EDITOR" (default, when $VISUAL or $EDITOR is set: the host's openEditor,
+   * which hands the terminal over, or inherited stdio for a host without one).
+   */
   openEditor?: ((file: string) => Promise<void>) | null;
 }
 
-/** Open a file in $VISUAL / $EDITOR (inherited stdio). undefined when no editor is configured. */
-export function editorOpener(env: NodeJS.ProcessEnv): ((file: string) => Promise<void>) | undefined {
+/** The REPL's ReplContext.openEditor (repl/types.ts), which hands the terminal to the editor. */
+type HostEditor = (initial: string, opts: { file: string; command: readonly string[] }) => Promise<{ ok: true; text: string } | { ok: false; error: string }>;
+
+/**
+ * Open a file in $VISUAL / $EDITOR. undefined when no editor is configured. With `viaHost` (the
+ * REPL's openEditor) the REPL hands the terminal over: its reader is suspended meanwhile and takes
+ * the terminal back afterwards (raw mode, and bracketed paste, which vim turns off at exit; r8 #2),
+ * and a Ctrl+Z in the editor stops it and the chat as one job. Without one, inherited stdio
+ * (spawnSync); `report` gets an editor's failure.
+ */
+export function editorOpener(env: NodeJS.ProcessEnv, viaHost?: HostEditor, report?: (text: string) => void): ((file: string) => Promise<void>) | undefined {
   const editor = (env.VISUAL || env.EDITOR || '').trim();
   if (!editor) return undefined;
   return async (file: string) => {
     const argv = shlexSplit(editor) ?? [editor];
+    if (argv.length === 0) return;
+    if (viaHost) {
+      const r = await viaHost('', { file, command: argv });
+      if (!r.ok) report?.(`✗ ${r.error}`);
+      return;
+    }
     spawnSync(argv[0]!, [...argv.slice(1), file], { stdio: 'inherit', env });
   };
+}
+
+/** The host's ReplContext.openEditor, read duck-typed like {@link commandSignalOf}; undefined for other hosts. */
+function hostEditorOf(host: ReplHost): HostEditor | undefined {
+  const f = (host as { openEditor?: unknown }).openEditor;
+  return typeof f === 'function' ? (initial, opts) => (f as HostEditor).call(host, initial, opts) : undefined;
 }
 
 /**
@@ -1802,7 +1858,7 @@ export function createReplRuntime(host: ReplHost, deps: ReplRuntimeDeps = {}): S
   };
   const driver = new SpecSessionDriver(port, { phaseOptions: { origin: 'spec' }, finalOptions: {} });
   const factory = deps.hookRunnerFactory ?? ((hooks: readonly KiroHook[]) => new HookRunner([...hooks]));
-  const editor = deps.openEditor === null ? undefined : deps.openEditor ?? editorOpener(host.ws.env);
+  const editor = deps.openEditor === null ? undefined : deps.openEditor ?? editorOpener(host.ws.env, hostEditorOf(host), (t) => host.print(t));
   const rt: SpecRuntime & { readonly driver: SpecSessionDriver } = {
     driver,
     ws: host.ws,
