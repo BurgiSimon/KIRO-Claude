@@ -40,7 +40,13 @@
  * (`session/set_mode`, `set_config_option` `mode`) is cancelled only by its own
  * `$/cancel_request` (`session/cancel` leaves it alone, 05 §4.6): queued, it never runs; during
  * the target agent's agentSpawn hooks they are killed (K3) and it answers `-32800`, the agent
- * unchanged; past them it finishes and answers what it did. Every session start
+ * unchanged; past them it finishes and answers what it did. A setter's answer agrees with what
+ * the session reports afterwards (r10 #4, {@link AcpServer.applyModel}): a model, effort or agent
+ * change the session took is answered as applied, with its `config_option_update` /
+ * `current_mode_update`, also when Claude Code did not confirm it (a set_model never answered:
+ * the 60 s control-request timeout, a child that died; a restart that failed), since the
+ * session's next child starts with it; `Invalid model ID` (-32602) is only for an id we do not
+ * advertise and a switch Claude Code refused, which changes nothing. Every session start
  * (`session/new|load`, the stuck-cancel restart) runs under a start signal
  * (session/startSignal.ts) that shutdown (stdin EOF, a signal) and the request's own cancel
  * abort: a start still running its agentSpawn hooks is cancelled, its hooks killed, and no record
@@ -134,6 +140,7 @@ import { toKiroCall } from '../policy/toolmap.js';
 import { findClaudeBinary } from '../claude/binary.js';
 import { runAuthCommand } from '../claude/auth.js';
 import { buildChildEnv } from '../claude/env.js';
+import { ClaudeControlError } from '../claude/process.js';
 import { createLogger, levelFromVerbosity, parseLogLevel, type Logger } from '../util/log.js';
 import { ErrorCodes, JsonRpcConnection, RpcError, internalError, invalidParams, methodNotFound, respondThen, type RequestContext } from './jsonrpc.js';
 import {
@@ -1315,7 +1322,13 @@ export class AcpServer {
       try {
         await st.session.swapAgent(modeId);
       } catch (e) {
-        throw internalError(`Failed to switch to agent '${modeId}': ${errMessage(e)}`);
+        // the swap did not happen (its agentSpawn hooks were cancelled, a turn ran): an error,
+        // nothing changed
+        if (st.session.agent.name !== modeId) throw internalError(`Failed to switch to agent '${modeId}': ${errMessage(e)}`);
+        // the session switched (agent, trust, hooks; Claude Code's restart with it failed): the
+        // answer reports the switch like any other, since later prompts run on that agent and
+        // the next one starts Claude Code with it (r10 #4: the answer agrees with the session)
+        this.log.warn(`acp[${st.id}]: switched to agent ${modeId}, but Claude Code did not restart with it (${errMessage(e)}); the next prompt starts it`);
       }
       st.mcpReported.clear();
     }
@@ -1370,20 +1383,54 @@ export class AcpServer {
     });
   }
 
+  /**
+   * A model change (`session/set_model`, `set_config_option` `model`, `/model x`). Its answer
+   * agrees with the configOptions the session reports afterwards (r10 #4): `Invalid model ID`
+   * (-32602) for an id we do not advertise and for a switch Claude Code refused (the session
+   * keeps the model it had); a set_model Claude Code never answered (the bounded control-request
+   * timeout, a child that died or was restarted) refused nothing: the session kept the new model,
+   * saved it and starts its next child with it, so the change is answered as applied, with its
+   * `config_option_update` (a warning goes to the log), and so is such a request for the model the
+   * session already has. Any other failure that left the model as it was is `-32603` with the
+   * reason.
+   */
   private async applyModel(st: AcpSessionState, modelId: string): Promise<void> {
     const entries = await this.listModels(st);
     const id = resolveModelId(entries, modelId);
     if (!id) throw invalidModelError(modelId);
+    const before = st.session.model;
     try {
       await st.session.setModel(id);
     } catch (e) {
-      throw new RpcError(-32602, `Invalid model ID: ${modelId}`, errMessage(e));
+      const refused = (e instanceof ClaudeControlError && !e.timedOut) || (e instanceof Error && e.name === 'ModelNotFoundError');
+      // kept: the session took the new model, or it already had the one asked for and Claude Code
+      // refused nothing (KiroCrew sends its pin at a session's start and a pool claim whatever the
+      // session reports: an error there reads as a refused pin while the session runs it, r10 #4
+      // verify)
+      if (st.session.model === before && (refused || st.session.model !== id)) {
+        if (refused) throw new RpcError(ErrorCodes.INVALID_PARAMS, `Invalid model ID: ${modelId}`, errMessage(e));
+        throw internalError(`Failed to set model ${modelId}: ${errMessage(e)}`);
+      }
+      this.log.warn(`acp[${st.id}]: set_model ${st.session.model} not confirmed by Claude Code (${errMessage(e)}); kept, Claude Code starts with it at the latest with its next child`);
     }
     this.update(st.id, { sessionUpdate: 'config_option_update', configOptions: configOptions(entries, st.session.model, st.session.effort) });
   }
 
+  /**
+   * An effort change (`set_config_option` effort, `/effort x`), answered like {@link applyModel}:
+   * a level the session refused (invalid, not offered by the model) is an error and changes
+   * nothing; a level the session took and saved whose `/effort` line then failed (the child died)
+   * is answered as applied, with its `config_option_update`: the next child starts with it
+   * (`--effort`).
+   */
   private async applyEffort(st: AcpSessionState, level: string): Promise<void> {
-    await st.session.setEffort(level);
+    const before = st.session.effort;
+    try {
+      await st.session.setEffort(level);
+    } catch (e) {
+      if (st.session.effort === before) throw e;
+      this.log.warn(`acp[${st.id}]: effort ${st.session.effort} not confirmed by Claude Code (${errMessage(e)}); kept, Claude Code starts with it at the latest with its next child`);
+    }
     const entries = await this.listModels(st);
     this.update(st.id, { sessionUpdate: 'config_option_update', configOptions: configOptions(entries, st.session.model, st.session.effort ?? level) });
   }
@@ -1551,7 +1598,9 @@ export class AcpServer {
         try {
           await this.applyModel(st, id);
         } catch (e) {
-          return { success: false, message: e instanceof RpcError ? e.message : errMessage(e) };
+          // `Invalid model ID: x` (its message), or an internal error's reason (its data)
+          const why = e instanceof RpcError ? (e.code === ErrorCodes.INTERNAL_ERROR && typeof e.data === 'string' ? e.data : e.message) : errMessage(e);
+          return { success: false, message: why };
         }
         return { success: true, message: `Model set to ${st.session.model}`, data: { model: { id: st.session.model } } };
       }

@@ -51,12 +51,25 @@
  *        muted, with the terminal left as the shell has it; and continued in the background
  *        (`bg`, `kill -CONT` while a shell holds the terminal) the chat runs on (a turn's output
  *        still appears) but stays off the terminal (no prompt, no mode change, no read) until
- *        `fg`: its SIGCONT, or the next look at the foreground (every 250 ms while away: bash's
- *        `fg` of a job it knows to be running sends none). The foreground test is Linux's
+ *        `fg`: its SIGCONT, or the next look at the foreground ({@link FOREGROUND_POLL_MS}, 20 ms,
+ *        while away in the background only: bash's `fg` of a job it knows to be running sends
+ *        none). The foreground test is Linux's
  *        /proc/self/stat ({@link terminalInForeground}); elsewhere (DECISION, no portable
  *        tcgetpgrp without a native module) it takes the foreground: after `bg` the chat stops
  *        again (SIGTTOU) at the retake until `fg`, as before, while the deferral still lets a
- *        fatal signal win;
+ *        fatal signal win. {@link LineReader.close} in the background (away, or not in the
+ *        foreground) changes no mode and writes nothing either (r10 #3: readline's close() turned
+ *        raw mode off from there, and SIGTTOU stopped kiro-claude until `fg`);
+ *      - keys queued in the shell's cooked mode: when the reader takes the terminal back after a
+ *        stop (typed after `fg` before the retake), after a child that ended while kiro-claude was
+ *        in the background ({@link LineReader.resume} `cooked`) and when it is created after the
+ *        chat waited in the background (LineReaderOptions.cooked), what the terminal had queued is
+ *        read as typed there (r10 #2, {@link cookedKeys}): its Return (a newline after ICRNL, else
+ *        Ctrl+J, a soft newline) submits, and its Ctrl+D (canonical mode's NUL placeholder, else
+ *        dropped) is Ctrl+D. That is what is read before the second check phase after the switch;
+ *        later keys are raw. Not for an approval prompt (its answer is typed at its question), and
+ *        not after a child that ended in the foreground or for a chat that started there: a
+ *        newline typed meanwhile stays a soft newline, as in Q (a paste stays one input);
  *      - while no read is active, other keys are kept as type-ahead and replayed into the next
  *        read (rustyline left them in the TTY buffer, so Classic behaves the same); reads with
  *        `discardTypeahead` (approval prompts) drop them, so text typed while a response
@@ -149,12 +162,25 @@ export interface LineReaderOptions {
    * the input; tests pass their own.
    */
   foreground?: () => boolean;
+  /**
+   * Terminal mode: kiro-claude waited off the terminal in the background before this reader takes
+   * it (repl/core.ts run: `kiro-claude chat &`, a stop while it started and `bg`; r10 #1), so the
+   * keys the terminal queued in its cooked mode (typed after `fg` before the chat noticed it) are
+   * read as typed there ({@link cookedKeys}). Without it, a newline typed while the chat started
+   * stays Ctrl+J, a soft newline, as in Q (a paste stays one input).
+   */
+  cooked?: boolean;
 }
 
 interface PendingRead {
   prompt: string;
   resolve: (r: ReadResult) => void;
   done: boolean;
+  /**
+   * Keys typed before this read started are dropped (`discardTypeahead`: approval prompts), and
+   * keys the terminal queued in a cooked mode are never read as typed for it ({@link takeCooked}).
+   */
+  discard: boolean;
   /** Logical input (backslash / fence continuation) vs a single answer line. */
   logical: boolean;
   contPrompt: string;
@@ -200,13 +226,51 @@ const STOP_SEEN_MS = 50;
  */
 const OWN_CONT_MS = 250;
 /**
- * Continued in the background after a stop, the reader asks this often whether kiro-claude is in
- * the foreground again ({@link LineReader.retakeNow}: `fg` of a running job sends no SIGCONT).
+ * Off the terminal in the background (the reader after a stop, {@link LineReader.retakeNow}; the
+ * REPL after a child and before its first prompt, repl/core.ts), kiro-claude asks this often
+ * whether it is in the foreground again: `fg` of a job bash knows to be running sends no SIGCONT,
+ * and until the terminal is taken back it stays in the shell's cooked mode, where keys are echoed
+ * by the terminal and Return arrives as a newline (r10 #2: at 250 ms a line typed right after `fg`
+ * was not submitted). A /proc/self/stat read; only while in the background.
  */
-const AWAY_POLL_MS = 250;
+export const FOREGROUND_POLL_MS = 20;
 
 /** Ctrl+Z (readline's key for \x1a). */
 const isCtrlZ = (k: Key): boolean => k.ctrl === true && !k.shift && k.name === 'z';
+
+/** ESC[200~, the start of a bracketed paste. */
+const PASTE_START = Buffer.from('\u001b[200~');
+
+/**
+ * Keys the terminal queued while it was in a cooked mode (a shell's after a stop, a child's, the
+ * one kiro-claude started in), changed in place into the raw keys they were typed as (r10 #2).
+ * The line discipline handled them as they arrived: ICRNL made Return a newline (LF), which raw
+ * mode reads as Ctrl+J, a soft newline here, and canonical mode keeps an end of file (Ctrl+D) as a
+ * NUL placeholder, which a raw read returns and readline drops. So LF becomes Return (CR: in
+ * cooked mode Ctrl+J ends a line too) and a NUL at a line start becomes Ctrl+D; a NUL elsewhere
+ * (an end of file that ended a half-typed line) is left, which readline ignores. Nothing from a
+ * bracketed-paste start (ESC[200~) on: the terminal brackets a paste only once the reader turned
+ * bracketed paste on again, after raw mode, so those bytes are raw. `lineStart`: whether `chunk`
+ * starts at a line start. Returns whether it ends at one, and whether a paste start was met
+ * (`raw`: nothing after it is cooked).
+ */
+export function cookedKeys(chunk: Uint8Array, lineStart = true): { lineStart: boolean; raw: boolean } {
+  const paste = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength).indexOf(PASTE_START);
+  const end = paste < 0 ? chunk.length : paste;
+  let start = lineStart;
+  for (let i = 0; i < end; i++) {
+    const b = chunk[i];
+    if (b === 0x0a) {
+      chunk[i] = 0x0d;
+      start = true;
+    } else if (b === 0x00) {
+      // canonical mode's end of file: a line end of its own
+      if (start) chunk[i] = 0x04;
+      start = true;
+    } else start = false;
+  }
+  return { lineStart: start, raw: paste >= 0 };
+}
 
 /** Linux's `/dev/tty` (character device 5:0, as fstat's `rdev` gives it): the controlling terminal. */
 const DEV_TTY_RDEV = 5 << 8;
@@ -296,6 +360,8 @@ export class LineReader extends EventEmitter {
   private readonly fallbackHistory: string[] = [];
   /** Terminal mode: removes the guarded stand-ins of readline's 'resize' listeners ({@link guardResize}). */
   private unguardResize: (() => void) | undefined;
+  /** Ends the reading of the keys queued in a cooked mode as such ({@link takeCooked}). */
+  private cookedOff: (() => void) | undefined;
 
   constructor(opts: LineReaderOptions) {
     super();
@@ -348,6 +414,8 @@ export class LineReader extends EventEmitter {
       });
       // Bracketed paste keeps pasted newlines inside one input.
       this.output.write('\u001b[?2004h');
+      // keys typed after `fg` while the chat waited off the terminal were queued in its cooked mode
+      if (opts.cooked) this.takeCooked();
     } else {
       this.rl = readline.createInterface({ input: opts.input, terminal: false, crlfDelay: Infinity });
       this.rl.on('line', (line: string) => this.onPipeLine(line));
@@ -402,6 +470,7 @@ export class LineReader extends EventEmitter {
         prompt,
         resolve: () => undefined,
         done: false,
+        discard: opts.discardTypeahead === true,
         logical: opts.logical,
         contPrompt: opts.contPrompt ?? '',
         history: opts.history === true,
@@ -831,7 +900,7 @@ export class LineReader extends EventEmitter {
    * The scheduled retake: nothing while muted (a fatal signal's close runs; the terminal stays as
    * the shell left it, nothing is drawn: r9 #1) nor in the background (`bg`, `kill -CONT` while a
    * shell holds the terminal: the chat runs on, off the terminal); else {@link retake}. In the
-   * background the foreground is asked again every {@link AWAY_POLL_MS}: `fg` of a job a shell
+   * background the foreground is asked again every {@link FOREGROUND_POLL_MS}: `fg` of a job a shell
    * knows to be running (bash, after `bg` or a `kill -CONT` it saw) gives it the terminal without
    * a SIGCONT. A SIGCONT comes back here at once ({@link continued}).
    */
@@ -850,7 +919,7 @@ export class LineReader extends EventEmitter {
     this.awayPoll = setTimeout(() => {
       this.awayPoll = undefined;
       this.scheduleRetake(true);
-    }, AWAY_POLL_MS);
+    }, FOREGROUND_POLL_MS);
   }
 
   private stopAwayPoll(): void {
@@ -859,10 +928,53 @@ export class LineReader extends EventEmitter {
   }
 
   /**
+   * Raw mode was just turned on after the shell had the terminal in its cooked mode ({@link
+   * retake} after a stop; {@link resume} after a child that ended while kiro-claude was in the
+   * background, and the constructor of a reader created after the chat waited in the background:
+   * LineReaderOptions.cooked; r10 #2): the keys the terminal queued meanwhile (typed after `fg`
+   * before the foreground poll noticed it) are read as typed in that mode ({@link cookedKeys}):
+   * their Return submits and a Ctrl+D is Ctrl+D. Those keys are what the
+   * input already holds now, so they are read at the next poll phase: what is read before the
+   * second check phase from now (whichever phase this runs in) counts as cooked, a key typed after
+   * that (a few milliseconds at most, before the prompt is even seen) is raw: a Ctrl+J stays a soft
+   * newline, and so does everything from a bracketed-paste start on. The bytes are changed in place
+   * by a 'data' listener ahead of readline's. Not for an approval prompt (a read that discards
+   * type-ahead): keys typed before its question was on the screen again (blind, during an
+   * approval-time `!cmd`; into the shell before `fg`) answer nothing without an Enter typed at it
+   * (r10 verification). Not after a child that ended in the foreground, nor for a chat that
+   * started there either: a newline typed meanwhile stays a soft newline, as in Q, so a paste
+   * (unbracketed in a cooked terminal) stays one input and none of its lines runs on its own.
+   */
+  private takeCooked(): void {
+    this.cookedOff?.();
+    if (this.closed || this.ended) return;
+    const inp = this.input as unknown as Partial<EventEmitter>;
+    if (typeof inp.prependListener !== 'function' || typeof inp.removeListener !== 'function') return;
+    let lineStart = true;
+    const onData = (chunk: unknown): void => {
+      if (!(chunk instanceof Uint8Array)) return;
+      // an approval prompt: its answer is typed at its question
+      if (this.top()?.discard) return;
+      const r = cookedKeys(chunk, lineStart);
+      lineStart = r.lineStart;
+      if (r.raw) off();
+    };
+    const off = (): void => {
+      if (this.cookedOff !== off) return;
+      this.cookedOff = undefined;
+      inp.removeListener?.('data', onData);
+    };
+    inp.prependListener('data', onData);
+    this.cookedOff = off;
+    setImmediate(() => setImmediate(off));
+  }
+
+  /**
    * After a stop, in the foreground: raw mode back on, the input resumed, bracketed paste on again
    * (a shell turns it off before it continues a job, bash does), the active read `t` drawn again,
    * on a fresh line (`freshLine`: the shell printed below the input) or in place, and the keys
-   * still typed ahead after a replayed Ctrl+Z replayed into it.
+   * still typed ahead after a replayed Ctrl+Z replayed into it. The keys the terminal queued in
+   * the shell's cooked mode meanwhile are read as typed there ({@link takeCooked}, r10 #2).
    */
   private retake(t: PendingRead | undefined, freshLine: boolean): void {
     const inp = this.input as NodeJS.ReadStream;
@@ -885,6 +997,7 @@ export class LineReader extends EventEmitter {
     this.away = false;
     if (this.closed || this.ended) return;
     this.rl.resume();
+    this.takeCooked();
     if (this.muted()) return;
     this.output.write('\u001b[?2004h');
     if (t && !t.done) {
@@ -949,6 +1062,10 @@ export class LineReader extends EventEmitter {
    * cooked-mode program such as `cat` or `read` takes as input; Q's rustyline and bash turn it off
    * too whenever they leave raw mode) and raw mode off. The bracketed-paste switch goes where the
    * reader turned it on, its own output (terminal mode only), and not while muted or closed.
+   * Until {@link resume} the reader changes no terminal mode: the REPL catches SIGTTOU meanwhile
+   * (repl/core.ts guardChild, r10 #0), and with it caught a mode change from the background would
+   * restart forever; for the same reason the REPL holds what is written to its output then (a
+   * {@link printAbove} included) until the child is done.
    */
   suspend(): void {
     if (this.suspended) return;
@@ -969,9 +1086,13 @@ export class LineReader extends EventEmitter {
    * again, as after a stop ({@link retake}): {@link suspend} turned it off for the child, which
    * may also have toggled it itself (vim at exit; bash before it continues a job stopped with
    * Ctrl+Z while the child owned the terminal, whose SIGCONT {@link continued} leaves to the
-   * child), and a paste would then submit line by line (r8 #2).
+   * child), and a paste would then submit line by line (r8 #2). `cooked`: the child ended while
+   * kiro-claude was in the background and the REPL waited for `fg` (repl/core.ts handBack), so the
+   * keys the terminal queued meanwhile (typed after `fg` before the REPL noticed it, and those the
+   * child left unread) are read as typed in its cooked mode ({@link takeCooked}, r10 #2). Without
+   * it a newline typed during the child stays a soft newline, as in Q.
    */
-  resume(): void {
+  resume(cooked = false): void {
     if (!this.suspended) return;
     this.suspended = false;
     if (!this.terminal) return;
@@ -982,6 +1103,7 @@ export class LineReader extends EventEmitter {
       // ignore
     }
     this.rl.resume();
+    if (cooked) this.takeCooked();
     if (!this.closed && !this.ended && !this.muted()) this.output.write('\u001b[?2004h');
   }
 
@@ -992,12 +1114,36 @@ export class LineReader extends EventEmitter {
     for (const p of [...this.stack].reverse()) this.finish(p, { kind: 'eof' });
   }
 
+  /**
+   * End the reader: its reads get `eof`. In terminal mode raw mode and bracketed paste are turned
+   * off, unless kiro-claude is not in the terminal's foreground (away after a stop, or {@link
+   * foreground} says so): from the background readline's close() (raw mode off: a tcsetattr) and
+   * the switch (a write, with `stty tostop`) stopped kiro-claude with SIGTTOU until `fg` (r10 #3).
+   * There the input is paused and readline closed without the mode change; the terminal stays as
+   * the shell has it (Node's own exit restores the mode kiro-claude started with).
+   */
   close(): void {
     if (this.closed) return;
     this.closed = true;
     this.stopAwayPoll();
-    if (this.terminal) this.output.write('\u001b[?2004l');
-    this.rl.close();
+    this.cookedOff?.();
+    const away = this.terminal && (this.away || !this.foreground());
+    if (this.terminal && !away) this.output.write('\u001b[?2004l');
+    if (!away) {
+      this.rl.close();
+      return;
+    }
+    // readline's close() calls the input's setRawMode(false): a no-op stands in while it runs
+    const inp = this.input as unknown as { setRawMode?: unknown };
+    const own = Object.prototype.hasOwnProperty.call(inp, 'setRawMode');
+    const setRawMode = inp.setRawMode;
+    if (typeof setRawMode === 'function') inp.setRawMode = () => inp;
+    try {
+      this.rl.close();
+    } finally {
+      if (own) inp.setRawMode = setRawMode;
+      else delete inp.setRawMode;
+    }
   }
 }
 

@@ -17,7 +17,10 @@
  * under Q. An output stream that is not the process's own (an embedder's) gets the child's
  * output copied instead (`inheritStdout` / `inheritStderr`). Nothing is watched while the child
  * runs: one given the terminal gets Ctrl+C from the terminal itself (cooked mode, kiro-claude's
- * foreground process group). Otherwise (piped input, tests) the child's stdin is closed (it
+ * foreground process group; it is spawned in that group, not `detached`, so the terminal's Ctrl+C
+ * and Ctrl+Z reach it, as in Q). Because the group is shared, a terminal mode change the child
+ * makes from the background sends SIGTTOU to kiro-claude too: the caller catches it meanwhile
+ * (repl/core.ts guardChild, r10 #0). Otherwise (piped input, tests) the child's stdin is closed (it
  * never takes the REPL's next input line) and its output is copied to the REPL's output streams.
  */
 

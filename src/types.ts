@@ -741,7 +741,18 @@ export interface KiroSession extends EventEmitter {
   interrupt(): Promise<void>;
 
   swapAgent(name: string): Promise<void>;
+  /**
+   * Switch the model. A rejection does not always mean nothing changed: an unknown id and a
+   * switch Claude Code refused leave `model` as it was, but a `set_model` Claude Code never
+   * answered (timeout, the child died or was restarted) keeps and saves the new model, which the
+   * next child starts with. Read `model` afterwards to report the outcome.
+   */
   setModel(kiroModelId: string): Promise<void>;
+  /**
+   * Set the effort level. An invalid level, or one the model does not offer, rejects with
+   * `effort` unchanged; a valid level is kept and saved even when its `/effort` line then fails
+   * (the next child starts with it). Read `effort` afterwards to report the outcome.
+   */
   setEffort(level: string): Promise<void>;
   listModels(): Promise<ModelEntry[]>;
 

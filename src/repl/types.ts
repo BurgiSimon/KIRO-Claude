@@ -36,7 +36,11 @@ export interface ReplDeps {
   importSessionExport?(path: string, opts: Omit<KiroSessionOptions, 'resume' | 'fork'>): Promise<KiroSession>;
   /** Commands contributed by other modules (spec/slash.ts `specSlashCommands`). */
   extraCommands?: readonly SlashCommand[];
-  /** Install a process SIGINT handler (only the real terminal entry point does). */
+  /**
+   * Install process signal handlers (only the real terminal entry point does): SIGINT, the
+   * fatal-signal close (repl/exitSignals.ts: SIGHUP, SIGTERM), and SIGTTOU while a child owns the
+   * terminal ({@link ReplContext.openEditor}, `!cmd`; r10 #0).
+   */
   installSignalHandlers?: boolean;
   /** Random source for the greeting tip (tests pin it). */
   random?: () => number;
@@ -70,6 +74,10 @@ export interface ReplContext extends ReplHost {
    * Open `$EDITOR` (fallback `vi`; `opts.command` names another editor command) on a temp file
    * prefilled with `initial`, or on `opts.file`; the reader hands the terminal over meanwhile
    * whenever it reads the keyboard, also when stdout is piped (`kiro-claude chat | tee log`).
+   * Meanwhile what the chat writes to the terminal is held until the editor is done, and a
+   * SIGTTOU from the editor's terminal mode change does not stop a chat a fatal signal closes
+   * (r10 #0: Ctrl+Z in vim, then `kill %1`; not while the debug log is that terminal, repl/core.ts
+   * guardChild).
    */
   openEditor(initial: string, opts?: { suffix?: string; file?: string; command?: readonly string[] }): Promise<EditorResult>;
   /** Run `!cmd` semantics (01 §4.3 step 4). */

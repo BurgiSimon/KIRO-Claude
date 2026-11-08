@@ -126,7 +126,15 @@ In chat:
   finished meanwhile counts with its exit status (a blocking preToolUse hook still blocks).
   Continued in the background (`bg`, or `kill -CONT` while the shell has the terminal), the chat
   keeps running but stays off the terminal (no prompt, nothing read) until `fg` (on Linux;
-  elsewhere it stops again until `fg`).
+  elsewhere it stops again until `fg`). The same holds for a chat stopped
+  while it is still starting, and for `kiro-claude chat &`: it starts off the terminal and shows
+  its greeting and prompt (and what it had to say while starting) once you `fg` it; a first INPUT
+  waits for that too. What you type right after `fg`, before the chat has the terminal back,
+  counts as typed: Enter submits, Ctrl+D is Ctrl+D (also after a `!cmd` that ended in the
+  background meanwhile); an approval prompt takes its answer only from an Enter typed at its
+  question. Lines typed while the chat starts in the foreground, or while a `!cmd` runs that does
+  not read them, keep their Enter as a new line, as in Kiro CLI: a paste there stays one input and
+  none of its lines runs before you press Enter.
   When kiro-claude is the terminal's first program (`ssh -t host kiro-claude chat`,
   `docker run -it`, `tmux new 'kiro-claude chat'`) there is no shell to return to, and Ctrl+Z does
   nothing.
@@ -135,7 +143,9 @@ In chat:
   type, Ctrl+C and Ctrl+Z are theirs. As in Kiro CLI, their output goes where the chat's goes (into
   that log too). A Ctrl+C for a `!cmd` there also ends the `tee` (`tee -i` ignores it). One that
   ends after Ctrl+Z and `bg` leaves the chat running in the background, off the terminal, until
-  `fg` (a `kill %1` closes it).
+  `fg` (a `kill %1` closes it). After Ctrl+Z inside one of them, `kill %1` closes the chat too,
+  also when the program resets the terminal as it dies (vim does). What the chat itself would
+  print on the terminal while such a program has it waits until the program is done.
 
 `chat --no-interactive`: the first Ctrl+C interrupts the answer (exit status 130), a second one
 closes the session.
@@ -145,8 +155,14 @@ kiro-claude close every open session first, your chat first (a session still sta
 cancelled): SessionEnd hooks run, the conversation's record is saved and its lock released, so
 `kiro-claude chat --resume` continues that conversation. The close gets at most 2 s; then
 kiro-claude exits with the signal (a shell shows 128 + the signal number, e.g. 143 for SIGTERM)
-and ends any child process still running. A chat suspended with Ctrl+Z (or `kill -STOP`) closes
-the same way when you kill it, without `fg`: `kill %1` in its shell sends SIGTERM, then SIGCONT.
+and ends any Claude Code process or hook command still running (a `!cmd` or `$EDITOR` still running is not killed:
+it gets what the shell or the terminal sends the whole job, and one that ignores that goes on).
+A chat suspended with Ctrl+Z (or `kill -STOP`), also inside `$EDITOR` or a `!cmd` or while it is
+still starting, closes the same way without
+`fg` when the signal comes with a continue: `kill %1` in its shell sends SIGTERM, then SIGCONT;
+from elsewhere, follow `kill <pid>` with `kill -CONT <pid>`. A plain `kill <pid>` takes effect
+only once the chat is continued (until then it keeps its session lock). One running in the
+background (after `bg`, or `kiro-claude chat &`) closes at `kill %1` or `kill <pid>` alike.
 A second signal ends it at once, unless it comes
 within half a second of the first and is the same signal, or the other of SIGHUP and SIGTERM
 (closing a terminal tab can send SIGHUP twice; closing the terminal of a chat stopped with Ctrl+Z
@@ -280,6 +296,14 @@ sent as prompt text ends with `stopReason: "cancelled"`. A `$/cancel_request` fo
 or `session/load` cancels a start that is still running agentSpawn hooks, and nothing of that
 session stays. See
 [Cancelling commands and session starts](docs/ARCHITECTURE.md#cancelling-commands-and-session-starts-acp).
+
+A model, effort or mode change (`session/set_model`, `session/set_config_option`,
+`session/set_mode`) answers what the session then reports: a change the session kept is answered
+as applied, with its `config_option_update` or `current_mode_update`, even when Claude Code did not
+confirm it (a `set_model` it never answered, a child that died); the next Claude Code child starts
+with it. `Invalid model ID` is only for a model id that is not offered or that Claude Code refused,
+and then nothing changes. See
+[Model, effort and mode changes](docs/ARCHITECTURE.md#model-effort-and-mode-changes-acp).
 
 ## KiroCrew on Claude Code
 

@@ -42,6 +42,15 @@
  * inside it is the same press forwarded: an `npm` / `npx` wrapper), and so does a SIGHUP /
  * SIGTERM at any time.
  *
+ * While the chat has handed the terminal to a child program ({@link ExitSignals.childOwnsTerminal},
+ * r10 #0) SIGTTOU is caught too: a child in kiro-claude's process group that changes the terminal
+ * mode from the background (vim or a `stty` trap at the SIGTERM of `kill %1`, after Ctrl+Z) makes
+ * the kernel stop the whole group, kiro-claude included, before its close could run. After a fatal
+ * signal that stop is dropped; otherwise kiro-claude stops itself as before. Meanwhile kiro-claude
+ * changes no terminal mode and holds its own terminal output ({@link holdTerminalOutput}, which
+ * the REPL also uses while it starts in the background, r10 #1), because a caught SIGTTOU makes
+ * such a call of its own from the background restart forever.
+ *
  * A chat that never had a message and is left anyway (the grace ran out, a second signal, SIGKILL,
  * a crash) is dropped by the session index (store.ts `list`); any other record left stays listed,
  * and its stale lock is taken over when it is opened again. Not used on Windows (no POSIX
@@ -76,6 +85,81 @@ function sameEvent(b: NodeJS.Signals, a: NodeJS.Signals): boolean {
 
 /** After the re-raise: exit with the signal's status if the process is somehow still alive. */
 const SIGNAL_EXIT_FALLBACK_MS = 5000;
+/** At most this much output is held ({@link holdTerminalOutput}); more is dropped. */
+const HELD_OUTPUT_MAX = 1 << 20;
+
+/** The callback among a `write()` call's arguments (`write(chunk, cb)`, `write(chunk, encoding, cb)`). */
+function writeCallback(args: readonly unknown[]): (() => void) | undefined {
+  const cb = args.find((a, i) => i > 0 && typeof a === 'function');
+  return cb as (() => void) | undefined;
+}
+
+/**
+ * Hold what is written to those of `outputs` that are terminals (`isTTY`; a pipe is never held)
+ * until the returned `release`: `release(true)` writes it in order, `release(false)` drops it
+ * (write callbacks still called), and beyond {@link HELD_OUTPUT_MAX} writes are dropped. With
+ * `hold`, a write is held only while `hold(stream)` says so, and one that is not held first writes
+ * what was held, in order. The streams get their own `write` back at the release (an own property
+ * as such, a prototype one by removing the stand-in). Used while a child owns the terminal
+ * ({@link ExitSignals.childOwnsTerminal}, r10 #0: everything) and while the chat starts
+ * (repl/core.ts, r10 #1: what it would write from the background, where a write with `stty
+ * tostop` stopped it, SIGTTOU, and its SIGTERM listener then never ran).
+ */
+export function holdTerminalOutput(outputs: readonly unknown[], hold: (stream: unknown) => boolean = () => true): (flush: boolean) => void {
+  const held: { write: (...a: unknown[]) => unknown; args: unknown[] }[] = [];
+  let heldBytes = 0;
+  const flushHeld = (): void => {
+    heldBytes = 0;
+    for (const h of held.splice(0)) {
+      try {
+        h.write(...h.args);
+      } catch {
+        // a hung-up terminal: nothing more reaches it
+      }
+    }
+  };
+  const restores: (() => void)[] = [];
+  for (const o of new Set(outputs)) {
+    const s = o as { isTTY?: unknown; write?: unknown } | null | undefined;
+    if (!s || s.isTTY !== true || typeof s.write !== 'function') continue;
+    const own = Object.prototype.hasOwnProperty.call(s, 'write');
+    const write = s.write as (...a: unknown[]) => unknown;
+    s.write = (...args: unknown[]): unknown => {
+      if (!hold(s)) {
+        flushHeld();
+        return write.apply(s, args);
+      }
+      const chunk = args[0];
+      const n = typeof chunk === 'string' || chunk instanceof Uint8Array ? chunk.length : 0;
+      if (heldBytes + n <= HELD_OUTPUT_MAX) {
+        heldBytes += n;
+        held.push({ write: (...a) => write.apply(s, a), args });
+      } else {
+        const cb = writeCallback(args);
+        if (cb) process.nextTick(cb);
+      }
+      return true;
+    };
+    restores.push(() => {
+      if (own) s.write = write;
+      else delete s.write;
+    });
+  }
+  let live = true;
+  return (flush: boolean): void => {
+    if (!live) return;
+    live = false;
+    for (const r of restores) r();
+    if (flush) {
+      flushHeld();
+      return;
+    }
+    for (const h of held.splice(0)) {
+      const cb = writeCallback(h.args);
+      if (cb) process.nextTick(cb);
+    }
+  };
+}
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
   return new Promise<T | undefined>((resolve) => {
@@ -109,6 +193,8 @@ export class ExitSignals {
   private dying: Promise<never> | undefined;
   /** The {@link awaitSignal} calls still waiting. */
   private readonly waiters = new Set<() => void>();
+  /** Releases the guard while a child owns the terminal ({@link childOwnsTerminal}). */
+  private releaseChild: ((flush: boolean) => void) | undefined;
 
   constructor(
     /** Close everything the front end opened (a session still being created is its own business). */
@@ -159,8 +245,73 @@ export class ExitSignals {
     process.on('SIGINT', l);
   }
 
+  /**
+   * A child program gets the terminal (`$EDITOR`, `!cmd`: repl/core.ts openEditor / runBang, from
+   * the reader's suspend() until handBack, r10 #0). It runs in kiro-claude's process group, so a
+   * terminal mode change it makes from the background (`kill %1` of the job stopped with Ctrl+Z:
+   * vim's deadly-signal path, a trap running `stty`; vim after `bg`) makes the kernel send SIGTTOU
+   * to the whole group, and at its default action that stopped kiro-claude too, before (or during)
+   * the close of the SIGTERM that came with the continue: the chat stayed stopped with its lock
+   * until `fg`. Until the returned `release` (or {@link dispose}) SIGTTOU is caught here: once a
+   * fatal signal is in it is dropped, so the close runs and the signal is re-raised; otherwise
+   * kiro-claude stops itself two event-loop turns later (a fatal signal that came with the same
+   * continue is dispatched first) as the default action did, but with SIGTSTP, so the listener
+   * stays for the next continue (bash then reports 'Stopped' rather than 'Stopped (tty output)').
+   *
+   * A caught SIGTTOU is a hazard of its own: a terminal mode change (tcsetattr) or a write with
+   * `stty tostop` that kiro-claude itself makes from the background gets SIGTTOU, the handler runs,
+   * the call restarts (SA_RESTART) and gets it again, forever (100% CPU, no JS runs; r10 #0
+   * verification). So while the guard is up kiro-claude must make no mode change (the caller's
+   * reader is suspended and takes the terminal back only after `release`), and what is written to
+   * `outputs` that are terminals (stdout, stderr; console and Node's own warnings included) is held:
+   * `release(true)` (in the foreground) writes it in order, `release(false)` and {@link dispose}
+   * drop it (callbacks still called), and beyond {@link HELD_OUTPUT_MAX} writes are dropped
+   * ({@link holdTerminalOutput}). The listener
+   * is removed at the release, by {@link dispose} (the re-raise, before any exit: Node's exit
+   * restores the terminal mode through libuv's descriptor with SIGTTOU unblocked), and at an exit
+   * or an uncaught exception (whose report is written to stderr). One guard at a time; none once
+   * disposed (a no-op release is returned).
+   */
+  childOwnsTerminal(outputs: readonly unknown[]): (flush: boolean) => void {
+    if (this.disposed || this.reraised || this.releaseChild || process.platform === 'win32') return () => undefined;
+    const releaseOutput = holdTerminalOutput(outputs);
+    let live = true;
+    let deciding = false;
+    const onTtou = (): void => {
+      if (deciding) return;
+      deciding = true;
+      setImmediate(() =>
+        setImmediate(() => {
+          deciding = false;
+          if (!live || this.received) return;
+          try {
+            process.kill(process.pid, 'SIGTSTP');
+          } catch {
+            // ignore
+          }
+        }),
+      );
+    };
+    const release = (flush: boolean): void => {
+      if (!live) return;
+      live = false;
+      if (this.releaseChild === release) this.releaseChild = undefined;
+      process.removeListener('SIGTTOU', onTtou);
+      process.removeListener('exit', onEnd);
+      process.removeListener('uncaughtExceptionMonitor', onEnd);
+      releaseOutput(flush);
+    };
+    const onEnd = (): void => release(false);
+    process.on('SIGTTOU', onTtou);
+    process.on('exit', onEnd);
+    process.on('uncaughtExceptionMonitor', onEnd);
+    this.releaseChild = release;
+    return release;
+  }
+
   /** Remove the listeners (the run ended). */
   dispose(): void {
+    this.releaseChild?.(false);
     this.disposed = true;
     for (const sig of [...this.listeners.keys()]) this.off(sig);
     if (this.grace) clearTimeout(this.grace);

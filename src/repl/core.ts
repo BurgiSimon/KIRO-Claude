@@ -3,7 +3,11 @@
  * 06 §2 / §5 / §6, 00 §2.3–§2.5).
  *
  * Flow: create + start the KiroSession (`origin: 'repl'`, interactive, this REPL as its
- * SessionUI) → greeting → optional initial input → read/dispatch loop → on exit close the
+ * SessionUI) → in terminal mode, off the terminal until kiro-claude is in its foreground (stopped
+ * while it started and continued in the background, or `kiro-claude chat &`: the line reader's
+ * raw-mode switch from the background stopped it with SIGTTOU, and `kill %1` never closed it; what
+ * it writes to the terminal from the background meanwhile is held; r10 #1, {@link Repl.run}) →
+ * greeting → optional initial input → read/dispatch loop → on exit close the
  * session and print `To resume this session: <prog> chat --resume-id <id>` for the record the
  * close kept (`KiroSession.resumeId`; none for a chat that never had a message) (exit 0;
  * 1 when the session could not start or Claude reported an auth failure). SIGHUP / SIGTERM (a
@@ -19,10 +23,17 @@
  * is aborted; nothing more is printed (no prompt, no turn error, no notice, nothing a command
  * prints through ReplHost.print, no output of a `!cmd` still running, and a spinner animating at
  * the signal is cleared; only the resume hint of a `/quit` whose close the signal came
- * into), and input typed during the grace is neither sent nor run (r5 g2) nor answers a question
+ * into, unless kiro-claude is in the background then), and input typed during the grace is neither
+ * sent nor run (r5 g2) nor answers a question
  * already waiting (ask / confirm / choose get no answer, an approval prompt still open, a `/spec`
  * phase session's, is cancelled; r6 #2). The same silence holds
- * while kiro-claude dies of a signal the lifecycle forwarder owns (no REPL handlers, r5 g3).
+ * while kiro-claude dies of a signal the lifecycle forwarder owns (no REPL handlers, r5 g3). A
+ * signal that comes in during the final close after `/quit` ends the process once that close is
+ * done, without closing the line reader (its tcsetattr from the background stopped the chat
+ * again, SIGTTOU, r10 #3). While `$EDITOR` or a `!cmd` holds the terminal, a SIGTTOU its terminal
+ * mode change sends to kiro-claude's process group does not stop a chat the signal closes, and
+ * what the chat writes to the terminal meanwhile is held until the child is done
+ * ({@link Repl.guardChild}, r10 #0: `kill %1` of a chat stopped with Ctrl+Z inside vim).
  *
  * Input handling order (01 §4.3): empty ⇒ re-prompt; `/…` ⇒ built-in command, else a file
  * prompt (`/<prompt> args`, prompts take precedence, 00 §2.2), else a skill (inlined with
@@ -103,14 +114,15 @@ import type {
   WorkspaceContext,
 } from '../types.js';
 import { c, colorEnabled, setColorEnabled } from '../util/ansi.js';
+import { log } from '../util/log.js';
 import { shlexSplit } from '../util/shlex.js';
 import { classifyApprovalInput } from './approval.js';
 import { CANCELLED, untilCancelled } from './commands/cancellable.js';
 import { builtinCommands } from './commands/index.js';
 import { PLAN_EXECUTE_PROMPT, PLAN_EXECUTE_QUESTION, looksLikePlan } from './commands/plan.js';
-import { DUPLICATE_SIGNAL_WINDOW_MS, ExitSignals, anySignal } from './exitSignals.js';
+import { DUPLICATE_SIGNAL_WINDOW_MS, ExitSignals, anySignal, holdTerminalOutput } from './exitSignals.js';
 import { openEditor, runShellCommand } from './external.js';
-import { LineReader, appendHistoryFile, historyFilePath, loadHistoryFile, sanitizeUnicodeTags, terminalInForeground } from './input.js';
+import { FOREGROUND_POLL_MS, LineReader, appendHistoryFile, historyFilePath, loadHistoryFile, sanitizeUnicodeTags, terminalInForeground } from './input.js';
 import { BUSY_MESSAGE, TIPS, approvalQuestion, colorPrompt, exitHint, formatGreeting, resumeHint } from './prompt.js';
 import { CommandRegistry, formatCommandHelp } from './registry.js';
 import { Spinner, TurnRenderer } from './render.js';
@@ -131,6 +143,29 @@ const NOTIFY_TERMS = [
 
 function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/** Linux's `/dev/tty` (character device 5:0): the controlling terminal. */
+const DEV_TTY_RDEV = 5 << 8;
+
+/**
+ * Whether the debug log's file (util/log.ts `log.file`, `$KIRO_CHAT_LOG_FILE`) is the terminal of
+ * one of `streams`, or `/dev/tty`. Its writes are synchronous (fs.writeSync), so Repl.guardChild
+ * could not hold them like the streams' (r10 verification).
+ */
+function logOnTerminal(streams: readonly unknown[]): boolean {
+  try {
+    const st = fs.statSync(log.file);
+    if (!st.isCharacterDevice()) return false;
+    if (st.rdev === DEV_TTY_RDEV) return true;
+    for (const s of streams) {
+      const t = s as { fd?: unknown; isTTY?: unknown } | undefined;
+      if (typeof t?.fd === 'number' && t.isTTY === true && fs.fstatSync(t.fd).rdev === st.rdev) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
@@ -342,7 +377,8 @@ export class Repl implements ReplContext {
    * restart refused as 'kiro-claude is exiting' no failure); no prompt is shown either (the line
    * reader is muted), a `!cmd` still running is not echoed (stdout nor stderr), no spinner is
    * started ({@link closeOnSignal} clears a running one) and headless prints nothing more. Only
-   * the resume hint of a `/quit` whose close the signal came into is still printed ({@link run}).
+   * the resume hint of a `/quit` whose close the signal came into is still printed ({@link run}),
+   * and only in the foreground (r10 #3).
    */
   private get silent(): boolean {
     return this.exits?.received !== undefined || dyingSignal() !== undefined;
@@ -582,11 +618,13 @@ export class Repl implements ReplContext {
   async openEditor(initial: string, opts: { suffix?: string; file?: string; command?: readonly string[] } = {}): Promise<EditorResult> {
     const io = this.childIo();
     if (io.inherit) this.reader.suspend();
+    let release: ((flush: boolean) => void) | undefined;
     try {
       if (io.inherit && !(await this.flushedForChild(io))) return { ok: false, error: 'kiro-claude is exiting' };
+      release = this.guardChild(io);
       return await openEditor(initial, io, opts);
     } finally {
-      if (io.inherit) await this.handBack();
+      if (io.inherit) await this.handBack(release);
     }
   }
 
@@ -594,14 +632,37 @@ export class Repl implements ReplContext {
   async runBang(command: string): Promise<void> {
     const io = this.childIo();
     if (io.inherit) this.reader.suspend();
+    let release: ((flush: boolean) => void) | undefined;
     try {
       if (io.inherit && !(await this.flushedForChild(io))) return;
+      release = this.guardChild(io);
       const r = await runShellCommand(command, io);
       if (r.error) this.write(`\n${c.red(`Failed to execute command: ${r.error}`)}\n\n`);
       else if (r.code !== 0) this.write(`${c.yellow(`Self exited with status: ${exitStatusText(r.code, r.signal)}`)}\n`);
     } finally {
-      if (io.inherit) await this.handBack();
+      if (io.inherit) await this.handBack(release);
     }
+  }
+
+  /**
+   * While a child that got the terminal runs ({@link childIo}: from after the reader's suspend()
+   * and {@link flushedForChild} until {@link handBack}), a SIGTTOU the child's terminal mode change
+   * sends to kiro-claude's process group does not stop a chat a fatal signal closes, and what the
+   * chat writes to the terminal meanwhile (a notice) is held until the child is done
+   * (ExitSignals.childOwnsTerminal, r10 #0: `kill %1` of a chat stopped with Ctrl+Z inside vim, or a
+   * `!cmd` whose trap runs `stty`, left it stopped with its lock until `fg`). Only with the
+   * process's own signal handling and output streams (the child writes to them itself); never while
+   * the reader is active, which changes the terminal mode (a caught SIGTTOU would make that spin
+   * forever from the background). Not while the debug log is that terminal ({@link logOnTerminal}:
+   * its writes are synchronous and cannot be held; with `stty tostop` one from the background spun
+   * at 100% CPU, r10 verification): such a chat stops in the background as before r10.
+   */
+  private guardChild(io: Parameters<typeof runShellCommand>[1]): ((flush: boolean) => void) | undefined {
+    if (!this.exits || !io.inherit || io.inheritStdout === false || io.inheritStderr === false || this.silent) return undefined;
+    if (logOnTerminal([this.ctx.stdin, this.ctx.stdout, this.ctx.stderr])) return undefined;
+    // (a spinner's frames would pile up in the held output)
+    this.spinner.stop();
+    return this.exits.childOwnsTerminal([this.ctx.stdout, this.ctx.stderr]);
   }
 
   /**
@@ -638,16 +699,40 @@ export class Repl implements ReplContext {
    * there. That tcsetattr from the background stopped the chat again at once (SIGTTOU), and
    * `kill %1` (SIGTERM, then SIGCONT) then never closed it, as at the prompt (r9 #1; r9 #2
    * verification: `kiro-claude chat | tee log` hands the terminal over too since #2). So, like
-   * the reader after a stop, the chat runs on off the terminal and asks every 250 ms until it is
-   * in the foreground again (`fg`; bash sends no SIGCONT to a job it knows to be running). A
-   * fatal signal meanwhile (`kill %1`) leaves the terminal alone: its close runs at once.
+   * the reader after a stop, the chat runs on off the terminal until it is in the foreground again
+   * ({@link awaitForeground}). A
+   * fatal signal meanwhile (`kill %1`) leaves the terminal alone: its close runs at once, and the
+   * reader is not resumed (the terminal stays as the child left it). The child's guard
+   * ({@link guardChild}) is released first, before resume()'s mode change: the output it held is
+   * written then (in the foreground), or dropped after a fatal signal. When the child ended in
+   * the background, the keys the terminal queued meanwhile (typed after `fg` before this wait
+   * noticed it) are read as typed in its cooked mode (LineReader.resume(true), r10 #2); after a
+   * child that ended in the foreground a newline typed during it stays a soft newline, as in Q.
    */
-  private async handBack(): Promise<void> {
-    while (!terminalInForeground(this.ctx.stdin)) {
-      if (this.silent) return;
-      await new Promise((r) => setTimeout(r, 250));
+  private async handBack(release?: (flush: boolean) => void): Promise<void> {
+    const away = !terminalInForeground(this.ctx.stdin);
+    try {
+      if (!(await this.awaitForeground())) return;
+    } finally {
+      release?.(!this.silent);
     }
-    this.reader.resume();
+    if (this.silent) return;
+    this.reader.resume(away);
+  }
+
+  /**
+   * Off the terminal, wait until kiro-claude is in its terminal's foreground: `fg` (bash sends no
+   * SIGCONT to a job it knows to be running), asked every FOREGROUND_POLL_MS (r10 #2: until the
+   * terminal is taken back it is in the shell's cooked mode; at 250 ms a line typed right after
+   * `fg` was echoed by the terminal and its Return taken for a soft newline). False once a fatal
+   * signal is in ({@link silent}): its close runs, nothing of the terminal is taken.
+   */
+  private async awaitForeground(): Promise<boolean> {
+    while (!terminalInForeground(this.ctx.stdin)) {
+      if (this.silent) return false;
+      await new Promise((r) => setTimeout(r, FOREGROUND_POLL_MS));
+    }
+    return !this.silent;
   }
 
   // ───────────────────────────── SessionUI ─────────────────────────────
@@ -1345,7 +1430,25 @@ export class Repl implements ReplContext {
     return e ? `${e.displayName} (${e.kiroId})` : id;
   }
 
-  private setupReader(): void {
+  /**
+   * While the chat starts ({@link run}: until its first prompt takes the terminal), what it writes
+   * to a terminal it is in the background of (a session notice, a Node warning) waits until it is
+   * in the foreground: `kiro-claude chat &`, or a stop while it starts and then `bg`. With `stty
+   * tostop` such a write stopped it (SIGTTOU) and, its SIGTERM caught, `kill %1` then never closed
+   * it (r10 #1). What is held is written in order once a write finds the foreground, or at the
+   * returned release(true); release(false) drops it (a fatal signal: nothing more is printed).
+   * Terminal mode only (its first prompt waits for the foreground too), and only for the process's
+   * own terminal streams, on Linux (elsewhere the foreground cannot be told: nothing is held).
+   */
+  private holdStartOutput(): (flush: boolean) => void {
+    if (!this.terminal || process.platform !== 'linux') return () => undefined;
+    const ttys = [this.ctx.stdout, this.ctx.stderr].filter((s) => typeof (s as { fd?: unknown }).fd === 'number');
+    if (ttys.length === 0) return () => undefined;
+    return holdTerminalOutput(ttys, (s) => !terminalInForeground(s));
+  }
+
+  /** `cooked`: the chat waited off the terminal in the background for `fg` ({@link run}). */
+  private setupReader(cooked = false): void {
     let history: string[] = [];
     let onHistory: ((e: string) => void) | undefined;
     if (this.terminal) {
@@ -1361,6 +1464,7 @@ export class Repl implements ReplContext {
       ...(onHistory ? { onHistory } : {}),
       completer: (line: string) => this.complete(line),
       muted: () => this.silent,
+      cooked,
     });
     this.reader.on('shift-tab', () => {
       this.current.planMode = !this.current.planMode;
@@ -1405,6 +1509,8 @@ export class Repl implements ReplContext {
       ? new ExitSignals(() => this.closeOnSignal(), [this.ctx.stdin, this.ctx.stdout, this.ctx.stderr])
       : undefined;
     this.exits = exits;
+    // until the first prompt takes the terminal, nothing is written to it from the background (r10 #1)
+    const startOutput = this.holdStartOutput();
     try {
       // under the signals' start signal (opening): a signal while its agentSpawn hooks run cancels it
       this.current = await this.opening(() =>
@@ -1418,16 +1524,42 @@ export class Repl implements ReplContext {
       );
       await this.current.start();
     } catch (e) {
-      if (exits?.received) return exits.die();
+      if (exits?.received) {
+        startOutput(false);
+        return exits.die();
+      }
       exits?.dispose();
+      startOutput(true);
       this.write(`${c.red(errText(e))}\n`);
       // a half-started session may own a claude child and the session lock
       if (this.current) await this.current.close().catch(() => undefined);
       return 1;
     }
-    if (exits?.received) return exits.die();
+    // The first prompt takes the terminal (readline's raw mode, a tcsetattr; the bracketed-paste
+    // switch) only in the foreground. Stopped while it started (Ctrl+Z: the terminal is still
+    // cooked; `kill -STOP`) and continued in the background (`kill %1`: SIGTERM, then SIGCONT;
+    // `bg`), or started with `kiro-claude chat &`, the chat took it from there: SIGTTOU stopped it
+    // inside that ioctl, restarted after every continue, so its SIGTERM was never handled and it
+    // kept its lock until `fg` (r10 #1; Claude Code's answer to initialize, queued during the stop,
+    // is read before the signal that came with the continue). So it waits off the terminal until
+    // `fg`, and a fatal signal meanwhile closes it at once, nothing drawn. (Keys typed after `fg`
+    // before the wait noticed it are queued in the shell's cooked mode: the reader reads them as
+    // typed there, LineReaderOptions.cooked, r10 #2.)
+    const waited = this.terminal && !terminalInForeground(this.ctx.stdin);
+    if (this.terminal && !(await this.awaitForeground())) {
+      startOutput(false);
+      if (exits?.received) return exits.die();
+      // dying of a signal the lifecycle forwarder owns (no handlers of ours): it ends the process
+      await this.current.close().catch(() => undefined);
+      return this.exitCode;
+    }
+    if (exits?.received) {
+      startOutput(false);
+      return exits.die();
+    }
+    startOutput(true);
     exits?.ready();
-    this.setupReader();
+    this.setupReader(waited);
     try {
       const rnd = this.deps.random ?? Math.random;
       const tip = TIPS[Math.floor(rnd() * TIPS.length) % TIPS.length];
@@ -1471,9 +1603,17 @@ export class Repl implements ReplContext {
       }
       // the record close() kept, never one it dropped (r4 #5/#9): an untouched spec-phase copy
       // names the record holding its conversation, a chat that never had a message none. The user
-      // quit before any signal: the hint is printed even when one came in during this close.
+      // quit before any signal: the hint is printed even when one came in during this close, but
+      // not from the background then (the chat stopped from elsewhere during this close, then
+      // `kill %1`: it would be written over the shell, and with `stty tostop` the write stops the
+      // chat, SIGTTOU, before it can die of the signal; r10 #3).
       const id = s.resumeId ? s.resumeId() : s.id;
-      this.out(id !== undefined ? `\n${resumeHint(this.progName, id)}\n` : '\n');
+      if (!exits?.received || terminalInForeground(this.ctx.stdout)) this.out(id !== undefined ? `\n${resumeHint(this.progName, id)}\n` : '\n');
+      // a signal that came in during this close ends the process now that the close is done
+      // (die() awaits the same closes): the listeners stay and the reader is not closed, whose
+      // readline close() turns raw mode off, a tcsetattr that from the background stopped the chat
+      // again (SIGTTOU) until `fg` (r10 #3). The terminal is left as the shell has it.
+      if (exits?.received) await exits.die();
       exits?.dispose();
       this.reader.close();
     }

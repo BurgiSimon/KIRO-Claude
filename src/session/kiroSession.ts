@@ -3043,6 +3043,13 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
 
   // ── agents / models / effort ──
 
+  /**
+   * Switch to agent `name`: its agentSpawn hooks first, then the switch and Claude Code's restart
+   * with it. An unknown agent, a busy session or hooks that were cancelled throw with nothing
+   * changed. A restart that fails is rethrown with the switch kept and saved (the next line
+   * starts Claude Code with the agent); callers that report the outcome (the ACP server, r10 #4)
+   * read `agent` afterwards.
+   */
   async swapAgent(name: string): Promise<void> {
     await this.start();
     this.assertIdle('/agent swap');
@@ -3091,9 +3098,26 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     this.hookRunner = runner;
     this.todoMap.clear();
     this.applySessionStart(hooks);
-    await this.restart();
+    try {
+      await this.restart();
+    } catch (e) {
+      // the swap took place and only Claude Code's restart with the new agent failed: the session
+      // keeps the agent (the next line starts Claude Code with it), so its record names it now, as
+      // setModel saves a model Claude Code did not confirm (r10 #4: ACP answers the switch)
+      this.persist();
+      throw e;
+    }
   }
 
+  /**
+   * Switch the model (control `set_model` when the child runs, else at its next start). Errors:
+   * an id that is not a Claude model throws {@link ModelNotFoundError} and changes nothing; a
+   * switch Claude Code refused (a {@link ClaudeControlError} answer) is rethrown with the model
+   * put back as it was, in memory and on disk; a request Claude Code never answered (the
+   * control-request timeout, the child died or was restarted) refused nothing: the session keeps
+   * the new model, saves it, rethrows, and its next child starts with it (`--model`). Callers
+   * that report the outcome (the ACP server, r10 #4) read `model` afterwards.
+   */
   async setModel(kiroModelId: string): Promise<void> {
     await this.start();
     const id = kiroModelId.trim();
@@ -3192,6 +3216,14 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     if (r.isError) this.uiNotice('warn', `Failed to set effort to ${level}: ${r.error ?? 'Claude Code refused it'}`);
   }
 
+  /**
+   * Set the effort level (a silent `/effort` line, queued while a turn runs or the child is
+   * down). Errors: an invalid level, or one the model does not offer, throws and changes nothing;
+   * once the level is valid it is the session's and saved, so a failure of the `/effort` line
+   * itself (the child died, Claude Code answered an error) is rethrown with the level kept, and
+   * the next child starts with it (`--effort`). Callers that report the outcome (the ACP server,
+   * r10 #4) read `effort` afterwards.
+   */
   async setEffort(level: string): Promise<void> {
     await this.start();
     const l = level.trim().toLowerCase();
