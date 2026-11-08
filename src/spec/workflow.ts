@@ -65,8 +65,9 @@
  *    continuation start gives the chat its own session back with a notice.
  *  - Spec files are read and written only through spec/docfs.ts (review X1): a document that is a
  *    symbolic link, not a regular file, behind a link that resolves to nothing or to a target that
- *    cannot be accessed, or outside the
- *    workspace is never read or written by the workflow itself (the tasks.md repair, box updates,
+ *    cannot be accessed, outside the workspace, or that the user cannot read (or in a folder it
+ *    cannot enter: r7 #6, never taken for a missing document) is never read or written by the
+ *    workflow itself (the tasks.md repair, box updates,
  *    re-lint, sync diff, task context). Such a "refused" document is never drafted (`✗ Cannot
  *    draft …`); its checkpoint names the reason and offers no Approve (headless: the flow ends with
  *    an error); a revision turn still runs (the gate denies its write through the link, with the
@@ -77,8 +78,16 @@
  *    reads), and `sync` (it builds on requirements and design too) and `run` of a spec with any
  *    refused file are refused before any turn; a
  *    task fails with the reason when a spec file became refused during the run (before its box
- *    is touched, or while its session started, so its context never silently lacks a document;
- *    a box that cannot be ticked fails it too, and the target is left alone).
+ *    is touched, while its session started, or when its context is read: store.specContextBlock
+ *    reports it, so its context never silently lacks a document; a box that cannot be ticked
+ *    fails it too, and the target is left alone). A box that cannot be marked in progress for
+ *    another reason (a spec folder the user cannot write) fails the task with that error, never
+ *    "task is no longer in tasks.md". A named spec that
+ *    is not found under a `.kiro/specs` kiro-claude does not use or cannot list
+ *    (store.specsDirRefused) gets that refusal, never "not found … Create it with … new" (r7 #7).
+ *  - Resume hints (the checkpoint's Stop label and stop hint, `new` on an existing spec, `run` and
+ *    `analyze` without their document) come from {@link SpecRuntime.resumeHint}: `/spec <name>` in
+ *    the REPL, commands it accepts in the spec CLI (r7 #8).
  *
  * The workflow talks to its host only through {@link SpecRuntime}; {@link createReplRuntime}
  * adapts a ReplHost (slash commands) and spec/cli.ts builds a headless one.
@@ -154,6 +163,7 @@ import {
   specContextBlock,
   specDocPath,
   specRefusals,
+  specsDirRefused,
   summarizeSpecDir,
   type LoadedSpec,
   type SpecSummary,
@@ -248,6 +258,13 @@ export interface SpecRuntime {
   openEditor?(file: string): Promise<void>;
   /** Hint printed when tasks are approved. */
   readyHint?(name: string): string;
+  /**
+   * The command(s) that resume spec `name` from where it stands, for the checkpoint's Stop label
+   * and stop hint, `new` on an existing spec, `run` and `analyze` without the document they need
+   * (r7 #8). Default `${commandPrefix} <name>` (the REPL's `/spec <name>`); the spec CLI, which has
+   * no such form, names commands it accepts (spec/cli.ts).
+   */
+  resumeHint?(name: string): string;
   /** End of a flow: release/settle phase sessions. */
   finish(): Promise<void>;
 }
@@ -851,7 +868,7 @@ async function checkpoint(c: FlowCtx, doc: SpecDocKind, next: SpecDocKind | unde
   options.push({ label: 'Request changes…', d: 'revise' });
   if (exists && (doc === 'requirements' || doc === 'bugfix')) options.push({ label: 'Analyze requirements', d: 'analyze' });
   if (exists && c.rt.openEditor) options.push({ label: 'Open in $EDITOR', d: 'editor' });
-  options.push({ label: `Stop here (resume later with ${c.rt.commandPrefix} ${c.name})`, d: 'stop' });
+  options.push({ label: `Stop here (resume later with ${resumeHint(c.rt, c.name)})`, d: 'stop' });
   for (;;) {
     const i = await c.rt.choose(checkpointQuestion(doc, next), options.map((o) => o.label));
     const pick = i === undefined ? undefined : options[i];
@@ -863,6 +880,11 @@ async function checkpoint(c: FlowCtx, doc: SpecDocKind, next: SpecDocKind | unde
     }
     return { kind: pick.d } as CheckpointDecision;
   }
+}
+
+/** {@link SpecRuntime.resumeHint}, else `${commandPrefix} <name>`. */
+function resumeHint(rt: SpecRuntime, name: string): string {
+  return rt.resumeHint ? rt.resumeHint(name) : `${rt.commandPrefix} ${name}`;
 }
 
 function readyHint(c: FlowCtx): string {
@@ -966,7 +988,7 @@ async function phaseLoop(c: FlowCtx, start: SpecDocKind, draft: boolean): Promis
       case 'stop': {
         c.trace.push({ state: 'stopped', doc });
         const hint = c.rt.interactive
-          ? `Stopped at the ${SPEC_DOC_FILES[doc]} checkpoint. Resume later with ${c.rt.commandPrefix} ${c.name}.`
+          ? `Stopped at the ${SPEC_DOC_FILES[doc]} checkpoint. Resume later with ${resumeHint(c.rt, c.name)}.`
           : `${SPEC_DOC_FILES[doc]} is waiting for review. Approve with: ${c.rt.commandPrefix} approve ${c.name} · Request changes: ${c.rt.commandPrefix} revise ${c.name} <feedback>`;
         c.rt.print(hint);
         return result(c, 'stopped', { awaiting: doc });
@@ -990,7 +1012,7 @@ async function withFinish<T>(rt: SpecRuntime, fn: () => Promise<T>): Promise<T> 
 export async function createNewSpec(rt: SpecRuntime, req: NewSpecRequest): Promise<FlowResult> {
   if (!isValidSpecName(req.name)) return errorResult(req.name, `Invalid spec name '${req.name}'. Use kebab-case, e.g. user-authentication.`);
   if (resolveSpecDir(rt.ws, req.name)) {
-    const msg = `Spec '${req.name}' already exists. Resume it with ${rt.commandPrefix} ${req.name}`;
+    const msg = `Spec '${req.name}' already exists. Resume it with ${resumeHint(rt, req.name)}`;
     rt.print(msg);
     return errorResult(req.name, msg);
   }
@@ -1055,10 +1077,31 @@ function findSpec(rt: SpecRuntime, name: string): SpecSummary | undefined {
   return dir ? summarizeSpecDir(dir) : undefined;
 }
 
+/**
+ * `name` was not found: "not found … Create it with … new", or, under a `.kiro/specs` kiro-claude
+ * does not use or cannot list (store.specsDirRefused: linked out of the workspace, dangling, into
+ * a folder the user cannot enter, …), that refusal (r7 #7): the spec may well exist there, and
+ * `new` would refuse.
+ */
 function notFound(rt: SpecRuntime, name: string): FlowResult {
+  return errorResult(name, reportNotFound(rt, name).msg);
+}
+
+/** Print why `name` was not found ({@link notFound}); `dirWhy`: the `.kiro/specs` refusal. */
+function reportNotFound(rt: SpecRuntime, name: string): { msg: string; dirWhy?: string } {
+  const dirWhy = specsDirRefused(rt.ws);
+  if (dirWhy) {
+    rt.print(`✗ ${specRefusalText(dirWhy)}`);
+    return { msg: dirWhy, dirWhy };
+  }
   const msg = `Spec '${name}' not found in ${path.join(rt.ws.workspaceRoot, '.kiro', 'specs')}. Create it with ${rt.commandPrefix} new ${name}`;
   rt.print(msg);
-  return errorResult(name, msg);
+  return { msg };
+}
+
+/** The `message` of a run/analyze/sync result whose spec is not found (printed by {@link reportNotFound}). */
+function notFoundMessage(rt: SpecRuntime, name: string): string {
+  return reportNotFound(rt, name).dirWhy ?? `spec '${name}' not found`;
 }
 
 /** `/spec <name>`: resume at the derived state (03 §1.1, §1.11.2). */
@@ -1221,7 +1264,7 @@ async function analyzeWithin(c: FlowCtx, o: { autoApply: boolean }): Promise<Ana
     return { status: 'error', findings: [], answers: [], message: refused };
   }
   if (!docReady(c, doc)) {
-    const msg = `No ${file} yet. Start with ${rt.commandPrefix} new <feature-name>`;
+    const msg = `No ${file} yet. Continue the spec with ${resumeHint(rt, c.name)}`;
     rt.print(msg);
     return { status: 'error', findings: [], answers: [], message: msg };
   }
@@ -1298,10 +1341,7 @@ async function analyzeWithin(c: FlowCtx, o: { autoApply: boolean }): Promise<Ana
 /** `/spec analyze_requirements <name>`. `autoApply` (CLI `--yes`) applies each finding's first option. */
 export async function analyzeRequirements(rt: SpecRuntime, name: string, opts: { autoApply?: boolean } = {}): Promise<AnalyzeResult> {
   const s = findSpec(rt, name);
-  if (!s) {
-    notFound(rt, name);
-    return { status: 'error', findings: [], answers: [], message: `spec '${name}' not found` };
-  }
+  if (!s) return { status: 'error', findings: [], answers: [], message: notFoundMessage(rt, name) };
   const c = flowCtx(rt, s, {});
   return withFinish(rt, () => analyzeWithin(c, { autoApply: opts.autoApply === true }));
 }
@@ -1403,14 +1443,17 @@ function printWarnings(rt: SpecRuntime, ws: readonly HookWarning[]): void {
  * file is gone (`refused` absent), or tasks.md is refused (a symbolic link, …: docfs; its target
  * is neither read nor written).
  */
-function setBox(rt: SpecRuntime, file: string, t: SpecTask, box: TaskBox): { refused?: string } | undefined {
+function setBox(rt: SpecRuntime, file: string, t: SpecTask, box: TaskBox): { refused?: string; error: string } | undefined {
   try {
     const r = writeTaskStatus(file, t.id, box, { expectHash: t.textHash });
     if (r.stale) rt.print(`⚠ Task ${t.id} changed in tasks.md since the run started.`);
     return undefined;
   } catch (e) {
-    rt.print(`⚠ ${e instanceof Error ? e.message : String(e)}`);
-    return e instanceof SpecFileRefusedError ? { refused: e.why } : {};
+    // `error`: what went wrong, also a write the user may not make (EACCES: a spec folder it
+    // cannot write), never taken for a task that is no longer in tasks.md (r7 verifier)
+    const error = e instanceof Error ? e.message : String(e);
+    rt.print(`⚠ ${error}`);
+    return e instanceof SpecFileRefusedError ? { refused: e.why, error } : { error };
   }
 }
 
@@ -1509,7 +1552,7 @@ async function executeTask(
     return { id: t.id, title: t.title, status: 'failed', reason: refusedNow };
   }
   const boxFail = setBox(rt, file, t, '-');
-  if (boxFail) return { id: t.id, title: t.title, status: 'failed', reason: boxFail.refused ?? 'task is no longer in tasks.md' };
+  if (boxFail) return { id: t.id, title: t.title, status: 'failed', reason: boxFail.refused ?? boxFail.error };
   let session: TaskSessionHandle;
   try {
     // the run's Ctrl+C is the start signal of the task session (session/startSignal.ts, K3): a
@@ -1529,7 +1572,10 @@ async function executeTask(
   // a file that became one kiro-claude does not read while the session started (a parallel
   // task's turn left a link): the task's context would silently lack it, so the task fails
   if (s.refused) return finishTask({ id: t.id, title: t.title, status: 'failed', reason: specRefusalText(s.refused) }, session);
-  const ctxBlock = specContextBlock(rt.ws, s);
+  // nor one that became so after that check, when its text is read for the context (r7 #6)
+  const refusedAtRead: string[] = [];
+  const ctxBlock = specContextBlock(rt.ws, s, refusedAtRead);
+  if (refusedAtRead.length) return finishTask({ id: t.id, title: t.title, status: 'failed', reason: specRefusalText(refusedAtRead[0]!) }, session);
   const input: PromptInput = {
     text: taskExecutionPrompt({
       id: t.id,
@@ -1569,10 +1615,7 @@ async function executeTask(
  */
 export async function runSpecTasks(rt: SpecRuntime, name: string, sel: TaskSelection, opts: RunOptions = {}): Promise<RunSummary> {
   const s = findSpec(rt, name);
-  if (!s) {
-    notFound(rt, name);
-    return { status: 'error', outcomes: [], remainingRequired: 0, message: `spec '${name}' not found` };
-  }
+  if (!s) return { status: 'error', outcomes: [], remainingRequired: 0, message: notFoundMessage(rt, name) };
   const planRefusal = (): string => `${PLAN_MODE_RUN_REFUSED} Exit plan mode (/plan or Shift+Tab), then run ${rt.commandPrefix} run ${s.name} again.`;
   if (rt.planMode) {
     // Kiro's plan mode is the read-only planner (00 §2.5, 03 §5.4); a task session in it could
@@ -1589,7 +1632,7 @@ export async function runSpecTasks(rt: SpecRuntime, name: string, sel: TaskSelec
     return { status: 'error', outcomes: [], remainingRequired: 0, message: msg };
   }
   if (!s.docs.tasks.nonEmpty) {
-    const msg = `Spec '${s.name}' has no tasks.md yet. Continue the spec with ${rt.commandPrefix} ${s.name}`;
+    const msg = `Spec '${s.name}' has no tasks.md yet. Continue the spec with ${resumeHint(rt, s.name)}`;
     rt.print(msg);
     return { status: 'error', outcomes: [], remainingRequired: 0, message: msg };
   }

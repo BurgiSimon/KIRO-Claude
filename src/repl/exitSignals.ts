@@ -13,11 +13,15 @@
  * agentSpawn hooks are killed and nothing of it stays), then the signal is re-raised with these
  * listeners removed, so kiro-claude still dies of it (the forwarder ends any child left). The
  * wait is bounded by {@link SIGNAL_CLOSE_GRACE_MS} from the signal; a second signal re-raises at
- * once: a different one, or the same one more than {@link DUPLICATE_SIGNAL_WINDOW_MS} after the
- * first. A repeat inside that window is the same event delivered twice, not an impatient user: a
- * terminal tab closing under an interactive shell sends SIGHUP twice within a millisecond (the
- * shell's hangup of its jobs, then the kernel's to the old foreground group once the session
- * leader exits; r5 #1), and a supervisor may signal both the process and its group.
+ * once: one more than {@link DUPLICATE_SIGNAL_WINDOW_MS} after the first, or a different one
+ * (a SIGINT: a Ctrl+C) inside it. A repeat inside that window is the same event delivered twice,
+ * not an impatient user: a terminal tab closing under an interactive shell sends SIGHUP twice
+ * within a millisecond (the shell's hangup of its jobs, then the kernel's to the old foreground
+ * group once the session leader exits; r5 #1), and a supervisor may signal both the process and
+ * its group. So are a SIGHUP and a SIGTERM inside it, either way round: closing the terminal of an
+ * interactive bash while kiro-claude is stopped (Ctrl+Z) sends SIGHUP + SIGCONT (its hangup of
+ * the jobs), then SIGTERM + SIGCONT (its exit's termination of stopped jobs) within microseconds,
+ * and a supervisor may send both.
  *
  * SIGINT during the front end's final close ({@link ExitSignals.closing}: after `/quit` or the
  * end of a headless run the front end's own Ctrl+C handling is gone, r5 #6) is handled like
@@ -43,10 +47,17 @@ import { performance } from 'node:perf_hooks';
  */
 export const SIGNAL_CLOSE_GRACE_MS = 2000;
 /**
- * A repeat of the first signal this soon after it is a duplicate of it (see the module doc): it
- * does not cut the close short. Later, it does.
+ * A repeat of the first signal this soon after it is a duplicate of it, and so is a SIGTERM after
+ * a SIGHUP or the other way round (see the module doc): it does not cut the close short. Later, it
+ * does.
  */
 export const DUPLICATE_SIGNAL_WINDOW_MS = 500;
+/** `b` right after `a` is the same event (see {@link DUPLICATE_SIGNAL_WINDOW_MS}). */
+function sameEvent(b: NodeJS.Signals, a: NodeJS.Signals): boolean {
+  const hangupOrTerm = (s: NodeJS.Signals): boolean => s === 'SIGHUP' || s === 'SIGTERM';
+  return b === a || (hangupOrTerm(a) && hangupOrTerm(b));
+}
+
 /** After the re-raise: exit with the signal's status if the process is somehow still alive. */
 const SIGNAL_EXIT_FALLBACK_MS = 5000;
 
@@ -167,8 +178,9 @@ export class ExitSignals {
 
   private onSignal(sig: NodeJS.Signals): void {
     if (this.received) {
-      // the same event delivered twice (a closing tab's SIGHUPs): keep closing
-      if (sig === this.received && performance.now() - this.receivedAt < DUPLICATE_SIGNAL_WINDOW_MS) return;
+      // the same event delivered twice (a closing tab's SIGHUPs, bash's SIGHUP then SIGTERM to a
+      // stopped job): keep closing
+      if (sameEvent(sig, this.received) && performance.now() - this.receivedAt < DUPLICATE_SIGNAL_WINDOW_MS) return;
       this.reraise(); // a second signal: stop waiting
       return;
     }

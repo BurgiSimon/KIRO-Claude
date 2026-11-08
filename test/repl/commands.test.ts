@@ -297,6 +297,8 @@ test('/chat load and /load replace the session (path, path.json, missing)', asyn
 
 test('/chat new creates a fresh session with the same agent/model/effort and sends the prompt', async () => {
   const first = new MockSession({ agent: agentOf('dev'), model: 'claude-opus-5.5', effort: 'high' });
+  // what the session made of the launch --trust-tools=read
+  first.trust.allowedTools.push('read');
   const second = new MockSession();
   second.script({ result: { text: 'new answer' } });
   const r = await runToEnd({ session: first, nextSession: () => second, input: ['/chat new hello there'], sessionOptions: { trustTools: ['read'], resume: { latest: true } } });
@@ -304,7 +306,10 @@ test('/chat new creates a fresh session with the same agent/model/effort and sen
   assert.equal(o.agentName, 'dev');
   assert.equal(o.model, 'claude-opus-5.5');
   assert.equal(o.effort, 'high');
-  assert.deepEqual(o.trustTools, ['read']);
+  // the chat's trust as it is (r7f #0), never the launch --trust-tools again
+  assert.deepEqual(o.initialTrust, { trust: { trustAll: false, allowedTools: ['read'], rules: [] }, agent: 'dev' });
+  assert.equal(o.trustTools, undefined);
+  assert.equal(o.trustAllTools, false);
   assert.equal(o.resume, undefined);
   assert.equal(first.closed, true);
   assert.deepEqual(second.prompts.map((p) => p.text), ['hello there']);

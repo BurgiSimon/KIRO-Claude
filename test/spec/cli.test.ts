@@ -336,7 +336,7 @@ test('interactive TTY: pickers and checkpoints on stdout; numbered choices', asy
     assert.equal(await r.run('new todo-export'), 0);
     assert.match(r.out.data, /\? What kind of spec\?\n {2}1\. Build a Feature\n {2}2\. Fix a Bug\n {2}3\. Quick Spec\n/);
     assert.match(r.out.data, /\? Which workflow\?\n {2}1\. Requirements-First\n {2}2\. Design-First\n/);
-    assert.match(r.out.data, /\? Do the requirements look good\? If so, we can move on to the design\.\n {2}1\. Approve and continue to design\n {2}2\. Request changes…\n {2}3\. Analyze requirements\n {2}4\. Stop here \(resume later with kiro-claude spec todo-export\)\n/);
+    assert.match(r.out.data, /\? Do the requirements look good\? If so, we can move on to the design\.\n {2}1\. Approve and continue to design\n {2}2\. Request changes…\n {2}3\. Analyze requirements\n {2}4\. Stop here \(resume later with kiro-claude spec approve todo-export · kiro-claude spec revise todo-export <feedback>\)\n/);
     assert.deepEqual(prompts, ['Choose 1-3 (empty to cancel): ', 'Choose 1-2 (empty to cancel): ', 'What should this spec cover? ', 'Choose 1-4 (empty to cancel): ', 'Choose 1-4 (empty to cancel): ', 'Choose 1-4 (empty to cancel): ']);
     assert.equal(r.opts[0]!.interactive, true);
     assert.match(r.err.data, /Stopped at the requirements\.md checkpoint\./);

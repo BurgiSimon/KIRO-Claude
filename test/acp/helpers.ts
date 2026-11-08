@@ -13,6 +13,7 @@ import { openSettings } from '../../src/config/settings.js';
 import { runAcp, type AcpServer, type AcpServerTimings, type SessionFactory } from '../../src/acp/server.js';
 import { createLogger } from '../../src/util/log.js';
 import { fakeClaudePath } from '../claude/helpers.js';
+import { removeOnExit } from '../tmpdirs.js';
 
 export interface TmpEnv {
   root: string;
@@ -25,7 +26,7 @@ export interface TmpEnv {
 
 /** A fresh HOME / KIRO_HOME / CLAUDE_CONFIG_DIR / work dir; nothing real is touched. */
 export function tmpEnv(extra: Record<string, string | undefined> = {}): TmpEnv {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-acp-')));
+  const root = removeOnExit(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-acp-'))));
   const home = path.join(root, 'home');
   const kiroHome = path.join(home, '.kiro');
   const claudeConfig = path.join(home, '.claude');

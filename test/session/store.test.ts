@@ -18,11 +18,12 @@ import {
   toDiskJson,
 } from '../../src/session/store.js';
 import type { SessionRecord, WorkspaceContext } from '../../src/types.js';
+import { removeOnExit } from '../tmpdirs.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 function tmp(): string {
-  return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-store-')));
+  return removeOnExit(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-store-'))));
 }
 
 function ws(root: string, env: NodeJS.ProcessEnv = {}): WorkspaceContext {

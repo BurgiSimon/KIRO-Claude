@@ -2,9 +2,11 @@
  * Verifier guards for the round-4 restored-history fixes (scratchpad r4-findings.json #1, #6; see
  * r4-history.test.ts for the fixer's own guards). Each case attacks the pending restored history
  * kept on the record (`SessionRecord.pendingHistory`):
- *  - a `/effort` queued while the block is pending belongs to the record it was set in: a tangent's
- *    level never reaches its parent's Claude session after `/tangent` (exit), nor a parent's the
- *    tangent (each child starts with its own record's `--effort`);
+ *  - a `/effort` queued while the block is pending is written as a line only into the child of the
+ *    record it was set in, never into another record's child after `/tangent` (exit or entry):
+ *    each child starts with its own record's `--effort`. The level itself is session state since
+ *    r7 #3 (like the model: a tangent's `/effort` is saved on the records under it and kept on
+ *    the return), so the parent's child starts with the tangent's level, as a launch flag;
  *  - a `/compact` while the block is pending compacts a Claude session that never had the
  *    conversation: the journal keeps the conversation (no compaction marker of nothing), so a later
  *    second loss of the transcript, after the block was delivered, still restores the turns
@@ -73,7 +75,7 @@ async function fallenBack(prompts = ['remember ALPHA_1']): Promise<{ sb: Sandbox
 }
 
 describe('R4 #1 (verify): a /effort queued while the history is pending stays with its record', () => {
-  it('set in a tangent (its copy of the history pending), then /tangent exit: the parent keeps its own level', async () => {
+  it('set in a tangent (its copy of the history pending), then /tangent exit: the parent starts at that level, the queued line goes nowhere', async () => {
     const { sb, s } = await fallenBack();
     try {
       assert.equal(s.effort, 'high');
@@ -81,17 +83,18 @@ describe('R4 #1 (verify): a /effort queued while the history is pending stays wi
       await s.setEffort('low'); // queued: the tangent's copy of the history is pending
       assert.equal(s.effort, 'low');
       await s.exitTangent('discard');
-      assert.equal(s.effort, 'high', "the parent's saved level");
+      // r7 #3: the effort is session state (saved on the parent's record, kept on the return)
+      assert.equal(s.effort, 'low', 'the level the user last set');
       const { result } = await drain(s.prompt({ text: 'in main' }));
-      assert.match(result.text, /^effort=high /, `the parent's Claude session runs at its own level: ${result.text.slice(0, 40)}`);
+      assert.match(result.text, /^effort=low /, `the parent's Claude session starts at that level (--effort): ${result.text.slice(0, 40)}`);
       assert.equal(count(lineFor(sb, 'in main'), BLOCK), 1, "the parent's own copy of the history, once");
-      assert.ok(!sb.userLines().map(textOf).includes('/effort low'), "the tangent's level was never written to a child");
+      assert.ok(!sb.userLines().map(textOf).includes('/effort low'), "the tangent's queued /effort line was never written to a child");
     } finally {
       await closeAll(s);
     }
   });
 
-  it('set in the parent while pending, then /tangent and back: each child runs at its own record\'s level', async () => {
+  it('set in the parent while pending, then /tangent and back: each queued line reaches only its record\'s child; the parent starts at the level set last (r7 #3)', async () => {
     const { sb, s } = await fallenBack();
     try {
       await s.setEffort('low'); // queued for the parent's next line
@@ -101,8 +104,10 @@ describe('R4 #1 (verify): a /effort queued while the history is pending stays wi
       const t = await drain(s.prompt({ text: 'in tangent' }));
       assert.match(t.result.text, /^effort=medium /, t.result.text.slice(0, 40));
       await s.exitTangent('discard');
+      // r7 #3: the tangent's /effort is saved on the parent's record too (session state): the
+      // parent's child starts with it, and the parent's own queued `/effort low` is overridden
       const m = await drain(s.prompt({ text: 'in main' }));
-      assert.match(m.result.text, /^effort=low /, m.result.text.slice(0, 40));
+      assert.match(m.result.text, /^effort=medium /, m.result.text.slice(0, 40));
       assert.equal(count(lineFor(sb, 'in main'), BLOCK), 1);
     } finally {
       await closeAll(s);

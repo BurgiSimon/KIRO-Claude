@@ -9,6 +9,7 @@ import * as path from 'node:path';
 
 import { probeCapabilities, type ClaudeCapabilities } from '../../src/claude/binary.js';
 import { createWorkspaceContext } from '../../src/config/workspace.js';
+import { removeOnExit } from '../tmpdirs.js';
 import type {
   ApprovalRequest,
   ApprovalResponse,
@@ -51,7 +52,7 @@ export interface Sandbox {
 }
 
 export function mkSandbox(opts: { script?: FakeScript; env?: Record<string, string | undefined> } = {}): Sandbox {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-session-')));
+  const root = removeOnExit(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-session-'))));
   const home = path.join(root, 'home');
   const kiroHome = path.join(home, '.kiro');
   const cwd = path.join(root, 'proj');
@@ -122,7 +123,7 @@ export function mkSandbox(opts: { script?: FakeScript; env?: Record<string, stri
 let capsPromise: Promise<ClaudeCapabilities> | undefined;
 /** Capabilities of the fake (probed once per test process into a private cache dir). */
 export function fakeCaps(): Promise<ClaudeCapabilities> {
-  capsPromise ??= probeCapabilities(fakeBinary(), { cacheDir: fs.mkdtempSync(path.join(os.tmpdir(), 'kc-caps-')), env: fakeEnv() });
+  capsPromise ??= probeCapabilities(fakeBinary(), { cacheDir: removeOnExit(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-caps-'))), env: fakeEnv() });
   return capsPromise;
 }
 

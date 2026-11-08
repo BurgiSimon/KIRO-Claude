@@ -16,6 +16,10 @@
  *    cancelled.`, neither success nor failure, and loads nothing of what it printed (R1).
  *  - `new` / `resume` create a fresh / resumed KiroSession with the current agent, model and
  *    effort and close the old one.
+ *  - `new`, `resume` and `load` keep the chat's current trust (`/tools untrust`, `/tools reset`,
+ *    `t` answers; never the launch `--trust-tools` / `--trust-all-tools` again: Q keeps trust per
+ *    process, its Load swaps the current agents into the loaded state) and plan mode; a record or
+ *    export saved in plan mode comes back in it too (ReplContext.baseSessionOptions, activate).
  *  - Ctrl+C while `new` / `resume` / `load` run the next session's agentSpawn hooks (they can
  *    take long: V2 30 s, V3 60 s, 0 = never) cancels the command (K3): the command signal is the
  *    session's start signal (session/startSignal.ts), so its hooks are killed, nothing of it stays
@@ -78,6 +82,7 @@ export async function saveTo(r: ReplContext, args: string[]): Promise<void> {
  * may already own a claude child and the session lock) and the current one stays active.
  */
 async function activate(r: ReplContext, create: () => Promise<KiroSession>): Promise<KiroSession | 'cancelled'> {
+  const planMode = r.session.planMode;
   let next: KiroSession;
   try {
     next = await withStartSignal(r.commandSignal, create);
@@ -86,6 +91,13 @@ async function activate(r: ReplContext, create: () => Promise<KiroSession>): Pro
     throw e;
   }
   try {
+    // plan mode is session state, like the trust the next session starts from
+    // (ReplContext.baseSessionOptions): the next chat keeps the chat's (Kiro's plan mode is the
+    // planner agent, which /chat new|load keep), set before the session becomes the chat's and
+    // before any prompt reaches it (a KiroSessionImpl's create() has started Claude Code already:
+    // the gate reads plan mode per tool call); a conversation saved in plan mode comes back in it
+    // all the same (the more restrictive of the two)
+    if (planMode && !next.planMode) next.planMode = true;
     await next.start();
     await r.swapSession(next);
   } catch (e) {
@@ -99,6 +111,16 @@ function cancelled(r: ReplContext, what: string): void {
   r.write(`\n${c.gray(`${what} was cancelled.`)}\n\n`);
 }
 
+/**
+ * The chat's plan mode for the session that replaces it (KiroSessionOptions.planMode): on the
+ * record from its first write, so a crash while the next session starts (its agentSpawn hooks)
+ * never leaves it on disk outside plan mode; activate() sets it again for sessions that do not
+ * take the option.
+ */
+function keepPlanMode(r: ReplContext): { planMode?: true } {
+  return r.session.planMode ? { planMode: true } : {};
+}
+
 /** /chat new|resume|load replace the session: not while a turn runs (approval prompt). */
 function assertIdle(r: ReplContext): void {
   if (r.busy) throw new Error(BUSY_MESSAGE);
@@ -107,7 +129,7 @@ function assertIdle(r: ReplContext): void {
 /** Import `file` as the active session; false when Ctrl+C cancelled it (nothing was loaded). */
 async function importFile(r: ReplContext, file: string): Promise<boolean> {
   assertIdle(r);
-  return (await activate(r, () => r.importSession(file))) !== 'cancelled';
+  return (await activate(r, () => r.importSession(file, keepPlanMode(r)))) !== 'cancelled';
 }
 
 export async function loadFrom(r: ReplContext, args: string[]): Promise<void> {
@@ -201,7 +223,7 @@ async function loadViaScript(r: ReplContext, script: string | undefined): Promis
 
 async function newChat(r: ReplContext, prompt: string): Promise<void | 'quit'> {
   assertIdle(r);
-  const next = await activate(r, () => r.createSession(r.baseSessionOptions()));
+  const next = await activate(r, () => r.createSession({ ...r.baseSessionOptions(), ...keepPlanMode(r) }));
   if (next === 'cancelled') return cancelled(r, 'Starting a new chat session');
   r.write(`\n${c.green('✔ Started a new chat session')} ${c.gray(`(${next.id})`)}\n\n`);
   if (prompt.trim()) return r.submit(prompt);
@@ -222,7 +244,7 @@ async function resume(r: ReplContext): Promise<void> {
   if (idx === undefined) return;
   const rec = list[idx]!;
   const next = await activate(r, () =>
-    r.createSession({ ...r.baseSessionOptions(), agentName: rec.agent, model: rec.model, ...(rec.effort ? { effort: rec.effort } : {}), resume: { sessionId: rec.sessionId } }),
+    r.createSession({ ...r.baseSessionOptions(), ...keepPlanMode(r), agentName: rec.agent, model: rec.model, ...(rec.effort ? { effort: rec.effort } : {}), resume: { sessionId: rec.sessionId } }),
   );
   if (next === 'cancelled') return cancelled(r, 'Resuming the chat session');
   r.write(`\n${c.magenta('Picking up where we left off...')}\n\n`);

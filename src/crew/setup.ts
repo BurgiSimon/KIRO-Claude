@@ -426,7 +426,8 @@ export async function crewUnstub(c: CrewCtx): Promise<number> {
  * keys that were absent are removed through KiroCrew's own locked config writer — only where the
  * value is still the one setup wrote); remove the shim (only if it carries our header) and our
  * stub. `--purge` also removes what crew created under `$CS`, and `$CS` itself when that leaves it
- * empty (see {@link purgeStateDir}). The KiroCrew data home and the checkout are never removed.
+ * empty (see {@link purgeStateDir}), and prints what it removed and kept ({@link reportPurge}:
+ * `Purged $CS` only when `$CS` is gone). The KiroCrew data home and the checkout are never removed.
  * Without crew.json (a plain uninstall ran earlier) only `--purge` goes on, and does just the
  * purge ({@link purgeLeftovers}); a plain uninstall says setup has not run. A crew.json that is
  * there but corrupt or unreadable (a symbolic link loop, a state dir that is a file) fails either
@@ -486,9 +487,8 @@ export async function crewUninstall(c: CrewCtx, o: { purge?: boolean } = {}): Pr
   removeOwnRunFiles(c);
   fs.rmSync(c.paths.stateFile, { force: true });
   if (o.purge) {
-    purgeStateDir(c);
-    const keep = path.resolve(state.kirocrew.dir);
-    c.out(`Purged ${c.paths.stateDir}${fs.existsSync(keep) && isSubpathOf(keep, c.paths.stateDir) ? ` (kept the Kiro Crew checkout ${keep})` : ''}`);
+    const before = purgeablePaths(c);
+    reportPurge(c, before, purgeStateDir(c), path.resolve(state.kirocrew.dir));
   }
   c.out(`Kiro Crew's data home and the checkout ${state.kirocrew.dir} were kept.`);
   return 0;
@@ -512,11 +512,13 @@ function isSubpathOf(child: string, parent: string): boolean {
   return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
-function rmdirIfEmpty(dir: string): void {
+/** Removes `dir` when it is an empty directory; returns why it is still there (or already gone). */
+function rmdirIfEmpty(dir: string): NodeJS.ErrnoException | undefined {
   try {
     fs.rmdirSync(dir);
-  } catch {
-    // not empty, or already gone
+    return undefined;
+  } catch (e) {
+    return e as NodeJS.ErrnoException; // not empty, a link, busy, or already gone
   }
 }
 
@@ -531,9 +533,11 @@ function removeOwnRunFiles(c: CrewCtx): void {
  * `--purge`: removes what crew created in `$CS` — the shim dir (when empty), the run files, the
  * build caches, crew.json leftovers and the private claude-agent-acp prefix (only when its
  * package.json depends on nothing but that adapter) — then `$CS` itself when empty. Unknown
- * entries and a Kiro Crew checkout inside `$CS` are kept.
+ * entries and a Kiro Crew checkout inside `$CS` are kept. A `$CS` that is a symbolic link is
+ * purged through the link (crew's entries of its target only) and the link itself is kept: rmdir
+ * refuses it. Returns why the final rmdir of `$CS` failed, for {@link reportPurge}.
  */
-function purgeStateDir(c: CrewCtx): void {
+function purgeStateDir(c: CrewCtx): NodeJS.ErrnoException | undefined {
   const p = c.paths;
   rmdirIfEmpty(p.binDir);
   removeOwnRunFiles(c);
@@ -547,7 +551,7 @@ function purgeStateDir(c: CrewCtx): void {
   } catch {
     // gone
   }
-  rmdirIfEmpty(p.stateDir);
+  return rmdirIfEmpty(p.stateDir);
 }
 
 /** The temp files of crew.json's atomic writes. */
@@ -588,6 +592,60 @@ function topmost(removed: readonly string[]): string[] {
 }
 
 /**
+ * The entry of `parent` that is or holds `child` (also compared by real path, for a `$CS` that is
+ * a link), and whether it is `child` itself; undefined when `child` is not inside `parent`.
+ */
+function entryHolding(child: string, parent: string): { entry: string; itself: boolean } | undefined {
+  const real = (p: string): string => {
+    try {
+      return fs.realpathSync(p);
+    } catch {
+      return path.resolve(p);
+    }
+  };
+  for (const [ch, pa] of [[path.resolve(child), path.resolve(parent)], [real(child), real(parent)]] as const) {
+    if (!isSubpathOf(ch, pa)) continue;
+    const parts = path.relative(pa, ch).split(path.sep);
+    return { entry: parts[0]!, itself: parts.length === 1 };
+  }
+  return undefined;
+}
+
+/**
+ * Prints the outcome of a purge of `$CS`, for both purge paths. `before` is {@link purgeablePaths}
+ * taken right before {@link purgeStateDir}, `rmdirError` what that returned, `checkout` the Kiro
+ * Crew checkout crew.json names (labelled among the kept entries when it is inside `$CS`).
+ * - `Purged $CS` only when `$CS` is really gone (lstat fails with ENOENT; a listing would read
+ *   through a link at `$CS`);
+ * - otherwise `Purged <topmost removed> from $CS`, or `Nothing to purge in $CS` when nothing was
+ *   removed, then `; kept <entries left>`, or, when nothing is left, why the directory itself
+ *   stays (a symbolic link, which is never removed; or the rmdir error, e.g. EBUSY for a mount
+ *   point).
+ */
+function reportPurge(c: CrewCtx, before: readonly string[], rmdirError: NodeJS.ErrnoException | undefined, checkout?: string): void {
+  const cs = c.paths.stateDir;
+  const left = purgeablePaths(c);
+  const removed = topmost(before.filter((e) => !left.includes(e)));
+  let st: fs.Stats | undefined;
+  try {
+    st = fs.lstatSync(cs); // not followed: a link at $CS is there even when its target is empty
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
+      c.out(`Purged ${cs}`);
+      return;
+    }
+  }
+  const holder = checkout !== undefined && fs.existsSync(checkout) ? entryHolding(checkout, cs) : undefined;
+  const after = (entriesOf(cs) ?? []).map((e) => (e !== holder?.entry ? e : `${e} (${holder.itself ? 'the' : 'holds the'} Kiro Crew checkout)`));
+  const what = removed.length ? `Purged ${removed.join(', ')} from ${cs}` : `Nothing to purge in ${cs}`;
+  let rest: string;
+  if (after.length) rest = `kept ${after.join(', ')}`;
+  else if (st?.isSymbolicLink()) rest = 'kept the directory itself (a symbolic link)';
+  else rest = `could not remove the directory itself${rmdirError?.code ? ` (${rmdirError.code})` : ''}`;
+  c.out(`${what}; ${rest}`);
+}
+
+/**
  * How `run/ready.json` names a gateway that may still run, or undefined when there is no such file
  * or it provably names none: its pid is gone, or now names another process (the record's boot or
  * start time reads back different). A record that cannot be read or names no pid may still name one.
@@ -615,8 +673,9 @@ function readyGatewayMayRun(c: CrewCtx): string | undefined {
  * ownership rules ({@link purgeStateDir}). It refuses (exit 1, nothing removed) while
  * `run/ready.json` names a gateway that may still run: without crew.json `crew stop` cannot stop
  * it, and its members use the bridge. Prints what was removed (also crew's files inside a folder
- * that is kept, such as cache/npm) and what was kept; exit 0. A `$CS` that is there but cannot be
- * read fails (exit 1); one that does not exist leaves nothing to purge (exit 0).
+ * that is kept, such as cache/npm) and what was kept ({@link reportPurge}); exit 0. A `$CS` that
+ * is there but cannot be read fails (exit 1); one that does not exist leaves nothing to purge
+ * (exit 0), and so does a `$CS` that is a dangling symbolic link, which is named as such and kept.
  */
 function purgeLeftovers(c: CrewCtx): number {
   const cs = c.paths.stateDir;
@@ -624,7 +683,14 @@ function purgeLeftovers(c: CrewCtx): number {
     fs.readdirSync(cs);
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
-      c.out(`Nothing to purge: ${cs} does not exist.`);
+      // The listing follows a link: a dangling one at $CS is there (lstat sees it) and is kept.
+      let dangling: string | undefined;
+      try {
+        dangling = fs.readlinkSync(cs);
+      } catch {
+        // not a link: $CS really does not exist
+      }
+      c.out(dangling !== undefined ? `Nothing to purge: ${cs} is a dangling symbolic link (to ${dangling}); kept the link.` : `Nothing to purge: ${cs} does not exist.`);
       return 0;
     }
     c.err(`kiro-claude: cannot read ${cs}: ${(e as Error).message}`);
@@ -638,13 +704,7 @@ function purgeLeftovers(c: CrewCtx): number {
   }
   c.out(`No ${path.basename(c.paths.stateFile)} in ${cs}; purging what an earlier uninstall or setup left there.`);
   const before = purgeablePaths(c);
-  purgeStateDir(c);
-  const left = purgeablePaths(c);
-  const after = entriesOf(cs);
-  const removed = topmost(before.filter((e) => !left.includes(e)));
-  if (!after?.length) c.out(`Purged ${cs}`);
-  else if (removed.length) c.out(`Purged ${removed.join(', ')} from ${cs}; kept ${after.join(', ')}`);
-  else c.out(`Nothing to purge in ${cs}; kept ${after.join(', ')}`);
+  reportPurge(c, before, purgeStateDir(c));
   c.out("Kiro Crew's data home and any Kiro Crew checkout were kept.");
   return 0;
 }

@@ -426,14 +426,28 @@ export class Repl implements ReplContext {
     this.usagePct = undefined;
   }
 
+  /**
+   * The options of a session that follows the chat (`/chat new|resume|load`, and the base of every
+   * {@link createSession}): the launch options with the chat's current agent, model and effort,
+   * and the chat's trust as it is now, never the launch `--trust-tools` / `--trust-all-tools`
+   * again (applied to the next chat they would re-trust a tool the user untrusted, or turn
+   * trust-all back on after `/tools reset`). Like the forced-stop restart: all of it as
+   * `initialTrust` (session rules, revocations, other agents' trust; the session deep-copies it
+   * and maps it to its own agent, and it replaces a resumed record's own trust: Q keeps trust per
+   * process, its Load swaps the current agents into the loaded state), and trust-all as
+   * `trustAllTools`. A caller's own `initialTrust` (a spec session's) wins.
+   */
   baseSessionOptions(): ReplSessionOptions {
     const base: ReplSessionOptions = { ...this.opts.sessionOptions };
     delete base.resume;
     delete base.fork;
+    delete base.trustTools;
     base.agentName = this.current.agent.name;
     base.model = this.current.model;
     if (this.current.effort) base.effort = this.current.effort;
     else delete base.effort;
+    base.trustAllTools = this.current.trust.trustAll;
+    base.initialTrust = { trust: this.current.trust, agent: this.current.agent.name };
     return base;
   }
 
@@ -494,9 +508,9 @@ export class Repl implements ReplContext {
     }
   }
 
-  importSession(file: string): Promise<KiroSession> {
+  importSession(file: string, extra: Partial<Omit<KiroSessionOptions, 'resume' | 'fork'>> = {}): Promise<KiroSession> {
     if (!this.deps.importSessionExport) return Promise.reject(new Error('importing sessions is not available'));
-    const base = this.baseSessionOptions();
+    const base = { ...this.baseSessionOptions(), ...extra };
     const importExport = this.deps.importSessionExport;
     return this.opening(() => importExport(file, { ...base, ws: this.ws, origin: 'repl', interactive: true, ui: this.ui }));
   }

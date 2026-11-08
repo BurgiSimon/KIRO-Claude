@@ -80,10 +80,17 @@
  * `/compact` whose compaction Claude reports failed (`system/status` `compact_result: 'failed'`
  * under a result that says success; VERIFIED 2.1.319: "Not enough messages to compact." for a
  * session holding only local-command entries, e.g. after an `/effort` or a refused `/compact`),
- * and the session's compacting state ends with that status (the next compaction is reported
+ * unless the user interrupted it: Claude reports that abort the same way (VERIFIED 2.1.319:
+ * `compact_error` "API Error: Request was aborted." under a success result with
+ * `local_command`), and that turn is stopReason `cancelled` with no error (r6 #4). Either way
+ * the session's compacting state ends with that status (the next compaction is reported
  * from its start). Every compaction published `started` ends with `finished` (its boundary) or
  * `compaction_failed` (r5x X2): Claude's failed status in any turn (an automatic compaction
- * inside a prompt turn fails and the turn goes on), with its `compact_error` as the reason;
+ * inside a prompt turn fails and the turn goes on), with `compactErrorText(compact_error)` as
+ * the reason (Claude Code's internal codes as sentences, without its own `Compaction failed ·`;
+ * worded as the turn's error, `localFailureText`: a `/compact` refused while a restored history
+ * is pending says why; `Compaction failed` when Claude gives none), or `Compaction cancelled`
+ * with `cancelled` once the turn is aborted, whatever Claude says;
  * Claude's next main-thread output (`stream_event`, `assistant`) with the compaction still open
  * (Claude streams nothing while it compacts: it ended without saying so, and its end goes before
  * that output); or the turn's end with it still open (interrupted: `cancelled`; the child died,
@@ -146,7 +153,12 @@
  *    `/spec new` leaving an empty one) keeps the state the user last set (r5 #0). The agent and
  *    every trust change (`/tools trust`, `untrust`, `reset`, `trust-all`) are saved at once on
  *    those records too, so a crash inside a tangent never resumes main with a revoked tool
- *    trusted or on the agent the user left (r6 #0).
+ *    trusted or on the agent the user left (r6 #0). So are the model and the effort (Q keeps the
+ *    model per process): the model a swapped-to agent pins (when valid), a `/model` and an
+ *    `/effort` made inside a tangent are saved at once on those records and kept on the return,
+ *    whose one restart starts the child with them (r7 #3). A tangent / rewind record is created
+ *    with the session's trust, agent, model, effort, plan mode and its pending fork, so it is
+ *    never on disk weaker than the session while its child starts (r7 #1).
  *  - A respawn that finishes after `close()` closes its new child and fails ("The session is
  *    closed"): no child outlives its session (ACP terminate during `session/set_mode`).
  *  - `KIRO_CLAUDE_FORCE_MODEL` also pins Claude subagents (`CLAUDE_CODE_SUBAGENT_MODEL[_FORCE]`);
@@ -162,7 +174,8 @@
  *    parent phase record: it is then the only record of the spec turns and is kept, r5 #2); a
  *    `set_model` Claude
  *    refuses (an error answer) leaves the model as it was, saved, while one that got no answer
- *    (the child died or was restarted, a timeout) keeps the user's choice for the next child; a local command line (`/effort`) Claude wrote into a pending
+ *    (the child died or was restarted, a timeout) keeps the user's choice for the next child,
+ *    saved at once like a confirmed one (also on the records under a tangent, r7 #3); a local command line (`/effort`) Claude wrote into a pending
  *    fork ends its pending state (`forkSource()` is then the fork itself);
  *    a quit inside a tangent drops a main that never had a message (S4), and each tangent of it
  *    that never had a message either (r5 g1).
@@ -894,8 +907,10 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
   private redirects: string[] = [];
   /**
    * A `/effort` level setEffort queued for the next prompt line, and the record it was set in: a
-   * record left since (a tangent, a rewind, its parent) never gets it (its child starts with its
-   * own saved `--effort`), so a tangent's level stays the tangent's.
+   * record left since (a tangent, a rewind, its parent) never gets it as a line (its child starts
+   * with its own saved `--effort`, which holds the level: the effort is session state, saved on
+   * the records a tangent returns to, r7 #3). A later setEffort replaces it, also when that one
+   * is written at once.
    */
   private pendingEffort: { rec: SessionRecord; level: string } | undefined;
 
@@ -997,13 +1012,17 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     this.startSignal = init.startSignal;
     this.historyKnown = init.mode.kind !== 'new';
     // KiroSessionOptions.initialTrust: the trust of the chat this session continues, as the chat
-    // has it (a /spec phase, continuation or task session, the forced-stop restart), replaces the
+    // has it (a /spec phase, continuation or task session, the forced-stop restart, /chat
+    // new|load|resume), replaces the
     // record's own and the launch flags' (applied below otherwise); per-tool trust is the agent's
     if (opts.initialTrust) {
       const t = cloneTrust(opts.initialTrust.trust);
       switchAgentTrust(t, opts.initialTrust.agent ?? this.currentAgent.name, this.currentAgent.name);
       this.rec.trust = t;
     }
+    // KiroSessionOptions.planMode (/chat new|load|resume from a chat in plan mode): on the record
+    // before its first write (build persists a fresh record before the start)
+    if (opts.planMode) this.rec.planMode = true;
     this.trustState = this.rec.trust;
     this.announcedClaudeId = this.rec.claudeSessionId;
     // unique per object: a second in-process session for the same id (the lock lets this process
@@ -1186,7 +1205,10 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         parentId: opts.fork.parentId ?? null,
         forkKind: opts.fork.kind,
         additionalDirectories: opts.additionalDirectories ?? parent?.additionalDirectories ?? [],
-        ...(parent ? { title: parent.title, contextRules: parent.contextRules } : {}),
+        // with the parent's plan mode (session state; a spec driver sets the flow's own once the
+        // child is up): the record is on disk at once, and a crash while the child starts must not
+        // leave `chat --resume` (it opens this newest record) without the plan mode (r7 #1)
+        ...(parent ? { title: parent.title, contextRules: parent.contextRules, planMode: parent.planMode } : {}),
         ...(carried ?? {}),
         // a carry merged into the parent is part of its history (01 §5.11, 06 §6.4) but not yet
         // of its Claude transcript: this fork (a spec phase / continuation, SpecSessionDriver)
@@ -2996,20 +3018,29 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     switchAgentTrust(this.trustState, this.currentAgent.name, target.name);
     this.currentAgent = target;
     this.rec.agent = target.name;
-    // the agent is session state, not part of a tangent's checkpoint (Q, 06 §6.4): the
-    // conversations a tangent returns to run on it too, and their records (which share this
-    // trust, whose per-tool part is the active agent's) must name it, saved now (a crash inside
-    // the tangent must not resume main on the agent the user left, r6 #0)
-    for (const f of this.tangentStack) {
-      f.rec.agent = target.name;
-      f.rec.trust = this.trustState;
-      this.writeStacked(f.rec);
-    }
     for (const w of target.warnings) this.uiNotice('warn', w.message, true);
+    // "Agent swap keeps the model unless target agent sets one" (01 §5.4)
+    let model: string | undefined;
     if (target.model && target.model.trim() !== '') {
       const m = kiroToClaudeModel(target.model, this.liveModels);
       if (m.error) this.uiNotice('warn', `${m.error} (from agent ${target.name}); keeping ${this.model}.`);
-      else this.rec.model = target.model;
+      else model = target.model;
+    }
+    if (model !== undefined) {
+      if (model !== this.rec.model) this.contextWindow = undefined;
+      this.rec.model = model;
+    }
+    // the agent is session state, not part of a tangent's checkpoint (Q, 06 §6.4): the
+    // conversations a tangent returns to run on it too, and their records (which share this
+    // trust, whose per-tool part is the active agent's) must name it, saved now (a crash inside
+    // the tangent must not resume main on the agent the user left, r6 #0); so is the model the
+    // agent pins (main must not run the new agent on its old model after the return or a crash
+    // inside the tangent, r7 #3)
+    for (const f of this.tangentStack) {
+      f.rec.agent = target.name;
+      f.rec.trust = this.trustState;
+      if (model !== undefined) f.rec.model = model;
+      this.writeStacked(f.rec);
     }
     this.hookRunner = runner;
     this.todoMap.clear();
@@ -3027,14 +3058,23 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     const changed = kiroId !== this.rec.model;
     const rec = this.rec;
     const prev = { model: rec.model, contextWindow: this.contextWindow };
+    // the model is session state like the agent (Q keeps it per process; a tangent's checkpoint
+    // holds the conversation, 06 §6.4): the records under a tangent get it too, kept on the
+    // return and saved with this record (a crash inside the tangent resumes main on it, r7 #3)
+    const stacked = this.tangentStack.map((f) => ({ rec: f.rec, model: f.rec.model }));
     this.rec.model = kiroId;
+    for (const f of stacked) f.rec.model = kiroId;
     if (changed) this.contextWindow = undefined;
+    const save = (): void => {
+      this.persist();
+      for (const f of stacked) if (this.tangentStack.some((t) => t.rec === f.rec)) this.writeStacked(f.rec);
+    };
     if (this.env.KIRO_CLAUDE_FORCE_MODEL?.trim()) {
       if (!this.forceModelWarned) {
         this.forceModelWarned = true;
         log.warn(`KIRO_CLAUDE_FORCE_MODEL is set; model ${kiroId} is recorded but not applied`);
       }
-      this.persist();
+      save();
       return;
     }
     if (this.proc?.running) {
@@ -3054,10 +3094,24 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
             this.persist();
           }
         }
+        // ...and on the records under the tangent (written again since, e.g. by a trust change)
+        if (refused) {
+          for (const f of stacked) {
+            if (f.rec.model !== kiroId) continue;
+            f.rec.model = f.model;
+            if (this.rec === f.rec) this.persist();
+            else if (this.tangentStack.some((t) => t.rec === f.rec)) this.writeStacked(f.rec);
+          }
+        } else {
+          // the kept choice is saved now, here and under the tangent, as a confirmed one is: a
+          // crash before the next write must not resume main on the model the user left (r7 #3
+          // verify)
+          save();
+        }
         throw e;
       }
     }
-    this.persist();
+    save();
   }
 
   async setEffort(level: string): Promise<void> {
@@ -3071,6 +3125,17 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     }
     this.rec.effort = l;
     this.persist();
+    // session state like the model (r7 #3): the records under a tangent get it too, saved now; the
+    // return's child starts with it (`--effort`)
+    for (const f of this.tangentStack) {
+      if (f.rec.effort === l) continue;
+      f.rec.effort = l;
+      this.writeStacked(f.rec);
+    }
+    // this level supersedes one queued earlier, for this record or one the tangent returns to
+    // (whose child starts with this `--effort`): written later, the stale level would leave
+    // Claude Code at it while the session reports and saves this one (r7 #3 verify)
+    this.pendingEffort = undefined;
     // queued for the next prompt line (runTurn writes it right before that line) while a turn
     // runs, while the child is down (a respawn gets `--effort` anyway) and while a restored
     // history is pending: Claude writes a fresh session's transcript for a local command line, so
@@ -3219,9 +3284,20 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     }
   }
 
+  /**
+   * The record of a tangent / rewind fork of the current conversation. store.create writes it at
+   * once, and the next write (restart's persist) waits for the new Claude child (closeProc, spawn,
+   * initialize: seconds with a real claude), so it is created with everything the session holds
+   * that must not be weaker on disk: the trust (revocations, other agents' parked trust; deep-
+   * copied), agent, model, effort, plan mode, tangent name and, from the caller, the fork still to
+   * be made (`pendingFork`). A crash in that window then never makes `chat --resume` (the newest
+   * top-level record: the rewind) or a reopen of the tangent run a revoked tool as trusted (r7 #1),
+   * and a resume forks the source again instead of falling back on the journal.
+   */
   private forkRecord(kind: 'tangent' | 'rewind', extra: Partial<SessionRecord>): SessionRecord {
     const r = this.rec;
     const rec = this.store.create({
+      trust: this.trustState,
       origin: r.origin,
       cwd: r.cwd,
       agent: r.agent,
@@ -3237,6 +3313,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       lastPreview: r.lastPreview,
       ...extra,
     });
+    // shared with the session (the gate's), like every record of its tangent stack
     rec.trust = this.trustState;
     return rec;
   }
@@ -3248,7 +3325,14 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     const parent = this.rec;
     const parentLock = this.lock;
     const src = this.forkSource();
+    // the parent fell back to a fresh Claude session and has had no turn since: Claude has no
+    // transcript of it to fork (`No conversation found`: the fallback, and its warning, a second
+    // time), so the tangent starts fresh with the parent's restored history copied below, and the
+    // return starts the parent fresh again (r5 S5)
+    const fresh = this.claudeNew && !this.pendingFork;
     const tangent = this.forkRecord('tangent', {
+      // the fork the restart below makes, on disk from the start (r7 #1)
+      ...(fresh ? {} : { pendingFork: { from: src.from, ...(src.at ? { at: src.at } : {}) } }),
       tangentName: name && name.trim() ? name.trim() : null,
       turns: parent.turns,
       messageCount: parent.messageCount,
@@ -3271,11 +3355,6 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       this.dropRecord(tangent.sessionId);
       throw e;
     }
-    // the parent fell back to a fresh Claude session and has had no turn since: Claude has no
-    // transcript of it to fork (`No conversation found`: the fallback, and its warning, a second
-    // time), so the tangent starts fresh with the parent's restored history copied above, and the
-    // return starts the parent fresh again (r5 S5)
-    const fresh = this.claudeNew && !this.pendingFork;
     this.tangentStack.push({
       rec: parent,
       lock: parentLock,
@@ -3348,9 +3427,15 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     this.rec.trust = this.trustState;
     // plan mode is session state like the agent (the planMode setter names it on this record
     // too): the state the user last set holds after the return, also when leaving is not the
-    // user's own `/tangent` (a `/spec new` leaving an empty tangent, T4), r5 #0
-    if (this.rec.planMode !== tangent.planMode) {
-      this.rec.planMode = tangent.planMode;
+    // user's own `/tangent` (a `/spec new` leaving an empty tangent, T4), r5 #0; so are the model
+    // and the effort (setModel, setEffort and swapAgent name them on this record too, r7 #3): the
+    // restart below starts the child with them (`--model`, `--effort`)
+    const keep: Partial<Pick<SessionRecord, 'planMode' | 'model' | 'effort'>> = {};
+    if (this.rec.planMode !== tangent.planMode) keep.planMode = tangent.planMode;
+    if (tangent.model && this.rec.model !== tangent.model) keep.model = tangent.model;
+    if (tangent.effort !== undefined && this.rec.effort !== tangent.effort) keep.effort = tangent.effort;
+    if (Object.keys(keep).length) {
+      Object.assign(this.rec, keep);
       this.persist();
     }
     lock?.release();
@@ -3388,6 +3473,8 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     const oldLock = this.lock;
     const src = this.forkSource();
     const rec = this.forkRecord('rewind', {
+      // the fork the restart below makes, on disk from the start (r7 #1)
+      pendingFork: { from: src.from, at: target.assistantUuid },
       turns: turns.slice(0, turn),
       messageCount: turn,
       tangentName: old.tangentName,

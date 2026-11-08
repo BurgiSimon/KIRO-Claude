@@ -132,8 +132,9 @@ logs under run/ (crashed.json included). Kiro Crew's data and the checkout are k
 Usage: kiro-claude crew uninstall [--purge]
 
   --purge  also remove the private claude-agent-acp bridge and the build caches, then the crew
-           state directory itself when it is empty. After an earlier plain uninstall, it
-           removes just these leftovers (not while a gateway may still be running)
+           state directory itself when it is empty, and print what it removed and what it
+           kept. After an earlier plain uninstall, it removes just these leftovers (not while
+           a gateway may still be running)
 `,
 });
 

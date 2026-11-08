@@ -20,14 +20,18 @@
  * Every read and write here goes through spec/docfs.ts (review X1; the research is silent on
  * links in spec folders, so this is the safest reading): a document or `.config.kiro` that is a
  * symbolic link (or not a regular file, or behind a link that resolves to nothing or whose target
- * cannot be accessed, or outside the workspace) is never read; its {@link SpecDocInfo.refused}
- * and the spec's {@link SpecSummary.refused} say why. Such a document counts as present when the phase is
+ * cannot be accessed, or outside the workspace, or that the user cannot read, whatever its size)
+ * is never read; its {@link SpecDocInfo.refused} and the spec's {@link SpecSummary.refused} say
+ * why. Such a document counts as present when the phase is
  * derived (it is never offered for drafting as if it were missing), has no known content
  * (`nonEmpty` false) and is left out of the loaded texts and the context block. A spec folder
  * linked out of the workspace (or dangling, or to a target kiro-claude cannot access: a folder on
- * the way the user cannot enter) is listed with its reason, and nothing in it is read; such a
- * `.kiro` or `.kiro/specs` is not enumerated at all ({@link specsDirRefused}: the list commands
- * print why instead; `kiro-claude spec list` and `status` exit 1).
+ * the way the user cannot enter), or that the user cannot enter itself (also through a link that
+ * points at it), is listed with its reason, and nothing in it is read (`status` gives its phase as
+ * unknown); such a `.kiro` or `.kiro/specs`, and a `.kiro/specs` the user cannot read, is not
+ * enumerated at all ({@link specsDirRefused}: the list commands print why instead; `kiro-claude
+ * spec list` and `status` exit 1), and a named spec that is not found under it gets that reason,
+ * not "not found".
  */
 
 import { randomUUID } from 'node:crypto';
@@ -35,7 +39,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { WorkspaceContext } from '../types.js';
 import { expandFileRefs } from '../config/steering.js';
-import { SpecFileRefusedError, readSpecFile, specFileRefused, specFolderRefused, specRefusalText, specsRootRefused, writeSpecFile } from './docfs.js';
+import { SpecFileRefusedError, readSpecFile, specFileRefused, specFolderRefused, specRefusalText, specsListRefused, writeSpecFile } from './docfs.js';
 import {
   SPEC_DOC_FILES,
   formatTaskLine,
@@ -115,13 +119,16 @@ export function specsDir(ws: Pick<WorkspaceContext, 'workspaceRoot'>): string {
 }
 
 /**
- * Why `.kiro/specs` itself is not used (a `.kiro` or `.kiro/specs` linked out of the workspace,
- * to nothing or to a target that cannot be accessed: docfs), else undefined. {@link listSpecs}
- * then lists nothing (the entries are another folder's) and the list commands print this reason
- * instead.
+ * Why `.kiro/specs` itself is not used or not listed (a `.kiro` or `.kiro/specs` linked out of the
+ * workspace, to nothing or to a target that cannot be accessed, one the user cannot enter: docfs;
+ * or one it may enter but not read, so its entries cannot be enumerated), else undefined.
+ * {@link listSpecs} then lists nothing (the entries are another folder's, or cannot be read), the
+ * list commands print this reason instead of "no specs", and a named command whose spec is not
+ * found prints it instead of "not found" (r7 #7). A search-only `.kiro/specs` still serves its
+ * specs by their exact name ({@link resolveSpecDir}).
  */
 export function specsDirRefused(ws: Pick<WorkspaceContext, 'workspaceRoot'>): string | undefined {
-  return specsRootRefused(ws.workspaceRoot);
+  return specsListRefused(ws.workspaceRoot);
 }
 
 export function isValidSpecName(name: string): boolean {
@@ -141,7 +148,11 @@ export function normalizeSpecName(raw: string): string {
 /**
  * Existing spec folder for `name` (exact, then case-insensitive); never escapes the specs dir.
  * A folder link that cannot be followed (dangling, a loop, a target that cannot be accessed) is
- * found too, so the commands can say why it cannot be used ({@link SpecSummary.refused}).
+ * found too, so the commands can say why it cannot be used ({@link SpecSummary.refused}). Under a
+ * `.kiro/specs` that is refused ({@link specsDirRefused}) only the exact name is looked up, and
+ * only found when `.kiro/specs` can be followed and entered (one linked out of the workspace, a
+ * search-only one);
+ * otherwise undefined, and the commands print the `.kiro/specs` refusal instead of "not found".
  */
 export function resolveSpecDir(ws: Pick<WorkspaceContext, 'workspaceRoot'>, name: string): string | undefined {
   const n = name.trim().replace(/[\\/]+$/, '');
@@ -149,8 +160,8 @@ export function resolveSpecDir(ws: Pick<WorkspaceContext, 'workspaceRoot'>, name
   const root = specsDir(ws);
   const direct = path.join(root, n);
   if (isSpecFolderEntry(direct)) return direct;
-  // a .kiro/specs linked out of the workspace is not enumerated (the exact name above still is
-  // found, so its commands can say why)
+  // a refused .kiro/specs is not enumerated (the exact name above is found when it can be
+  // reached, so its commands can say why; else the callers print the .kiro/specs refusal)
   if (specsDirRefused(ws)) return undefined;
   try {
     const hit = fs.readdirSync(root, { withFileTypes: true }).find((e) => (e.isDirectory() || e.isSymbolicLink()) && e.name.toLowerCase() === n.toLowerCase() && isSpecFolderEntry(path.join(root, e.name)));
@@ -273,7 +284,8 @@ function hasText(p: string): boolean {
 
 /**
  * The text of document `d` (BOM removed) through docfs; undefined when it is refused, missing or
- * unreadable. A refusal found only now (a link that appeared since `d` was taken) is recorded on `d`.
+ * unreadable. A refusal found only now (a link that appeared since `d` was taken, a permission
+ * that changed: docfs refuses an EACCES/EPERM) is recorded on `d`.
  */
 function readDoc(d: SpecDocInfo): string | undefined {
   if (d.refused) return undefined;
@@ -421,15 +433,19 @@ function xmlAttr(s: string): string {
 /**
  * `<spec name=… path=…>` block with the requirements (or bugfix), design and tasks documents, each
  * as `[abs path]\ncontent`, `#[[file:…]]` references expanded (03 §1.10.8, §4 `#spec:`). A refused
- * document (`docs[k].refused`, also one found refused only now) is never read into it.
+ * document (`docs[k].refused`, also one found refused only now) is never read into it; one found
+ * refused only now (it became a link, or unreadable, after `spec` was taken) has its reason
+ * pushed to `refused`, so the caller never uses a block that silently lacks it.
  */
-export function specContextBlock(ws: WorkspaceContext, spec: Pick<SpecSummary, 'name' | 'dir' | 'docs' | 'specType'>): string | undefined {
+export function specContextBlock(ws: WorkspaceContext, spec: Pick<SpecSummary, 'name' | 'dir' | 'docs' | 'specType'>, refused: string[] = []): string | undefined {
   const kinds: SpecDocKind[] = spec.specType === 'bugfix' ? ['bugfix', 'design', 'tasks'] : ['requirements', 'bugfix', 'design', 'tasks'];
   const parts: string[] = [];
   for (const k of kinds) {
     const d = spec.docs[k];
     if (!d.exists || !d.nonEmpty || d.refused) continue;
-    const raw = readDoc({ ...d });
+    const now = { ...d };
+    const raw = readDoc(now);
+    if (now.refused) refused.push(now.refused);
     if (raw === undefined) continue;
     let body = raw.replace(/\r\n?/g, '\n');
     try {
@@ -528,7 +544,10 @@ export function formatSpecStatus(spec: LoadedSpec, opts: { showTasks?: boolean }
             ? `${SPEC_DOC_FILES[spec.phase]} awaiting approval`
             : `${SPEC_DOC_FILES[spec.awaitingApproval]} awaiting approval (next: ${SPEC_DOC_FILES[spec.phase]})`
           : `drafting ${SPEC_DOC_FILES[spec.phase]}`;
-  lines.push(`Phase: ${phase}`);
+  // the phase document is refused and not known to exist (a folder that cannot be followed or
+  // entered): where the spec stands is not known
+  const unknown = spec.phase !== 'execution' && spec.phase !== 'done' && spec.docs[spec.phase].refused !== undefined && !spec.docs[spec.phase].exists;
+  lines.push(`Phase: ${unknown ? 'unknown (not read)' : phase}`);
   if (spec.tasks) {
     const next = planTasks(planRun(spec.tasks, { kind: 'next' }))[0];
     if (next) lines.push(`Next task: ${next.synthesized ? '' : `${next.id} `}${next.title}`);

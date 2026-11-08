@@ -26,8 +26,11 @@
  * `#` providers ({@link expandHashRefs}, 03 §4 grammar; skipped inside code, after
  * non-whitespace, for `# ` and for Markdown headings `^#{1,6}\s`):
  *  - `#spec:<name>` ⇒ the spec's requirements.md / bugfix.md / design.md / tasks.md, read under
- *    the rules of kiro-claude's own spec I/O (spec/docfs: a linked document, a spec folder or
- *    `.kiro/specs` linked out of the workspace or to nothing is not read; each is a notice);
+ *    the rules of kiro-claude's own spec I/O (spec/docfs: a linked or unreadable document, a spec
+ *    folder or `.kiro/specs` linked out of the workspace, to nothing or into a folder the user
+ *    cannot enter, or that the user cannot enter itself, is not read; each is a notice with the
+ *    reason the spec commands give, also for a spec folder link that cannot be followed and a
+ *    name under a refused `.kiro/specs`, never "not found");
  *  - `#steering:<file>` and bare `#<name>` of a manual/auto steering file ⇒ `steeringNames`
  *    (the caller injects bodies through SteeringActivator, once per session);
  *  - bare `#<name>` resolution order: steering → spec → existing file → existing directory →
@@ -44,7 +47,7 @@ import { execFile } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { PromptFile, SteeringFile, WorkspaceContext } from '../types.js';
-import { specFileRefused, specFolderRefused, specRefusalText, specsRootRefused } from '../spec/docfs.js';
+import { deniedWhy, specFileRefused, specFolderRefused, specRefusalText, specsListRefused, specsRootRefused } from '../spec/docfs.js';
 import { shlexSplit } from '../util/shlex.js';
 import { truncateBytes, utf8SafePrefixLength } from '../util/text.js';
 import { compareBytes } from './tokens.js';
@@ -486,12 +489,24 @@ export function findSteering(files: readonly SteeringFile[], ref: string, cwd?: 
   return undefined;
 }
 
+/**
+ * `p` is a directory (also through a link), or a symbolic link `stat` cannot follow (dangling, a
+ * loop, a target behind a folder the user cannot enter): such a spec folder is found, so its
+ * reference gets the refusal the spec commands give (spec/store.isSpecFolderEntry), not "not found".
+ */
+function isSpecFolderEntry(p: string): boolean {
+  const st = statSafe(p);
+  return st ? st.isDirectory() : lstatSafe(p)?.isSymbolicLink() === true;
+}
+
 function resolveSpecDir(specsDir: string, name: string): string | undefined {
   if (name === '' || name.includes('..') || /[\\/]/.test(name)) return undefined; // stay inside specsDir
   const direct = path.join(specsDir, name);
-  if (statSafe(direct)?.isDirectory()) return direct;
+  if (isSpecFolderEntry(direct)) return direct;
   try {
-    const hit = fs.readdirSync(specsDir, { withFileTypes: true }).find((e) => e.isDirectory() && e.name.toLowerCase() === name.toLowerCase());
+    const hit = fs
+      .readdirSync(specsDir, { withFileTypes: true })
+      .find((e) => (e.isDirectory() || e.isSymbolicLink()) && e.name.toLowerCase() === name.toLowerCase() && isSpecFolderEntry(path.join(specsDir, e.name)));
     return hit ? path.join(specsDir, hit.name) : undefined;
   } catch {
     return undefined;
@@ -500,8 +515,9 @@ function resolveSpecDir(specsDir: string, name: string): string | undefined {
 
 /**
  * `<spec name=… path=…>` block with each existing spec document as `[abs]\ncontent`. A document
- * kiro-claude itself must not read (spec/docfs: a symbolic link at it, not a regular file, or a
- * real path outside the workspace) is left out and its reason pushed to `refused`; it is opened
+ * kiro-claude itself must not read (spec/docfs: a symbolic link at it, not a regular file, a
+ * real path outside the workspace, or one the user cannot read) is left out and its reason pushed
+ * to `refused`; it is opened
  * with O_NOFOLLOW, so a link that appears after the check is not followed either.
  */
 export function formatSpecBlock(
@@ -529,6 +545,7 @@ export function formatSpecBlock(
       const code = typeof e === 'object' && e !== null && 'code' in e ? String((e as { code: unknown }).code) : '';
       if (code === 'ELOOP') refused.push(`${p} is a symbolic link`);
       else if (code === 'EFTYPE') refused.push(`${p} is not a regular file`);
+      else if (code === 'EACCES' || code === 'EPERM') refused.push(deniedWhy(p));
       continue;
     }
     if (r.content === undefined) continue;
@@ -597,12 +614,16 @@ export async function expandHashRefs(text: string, opts: HashRefsOptions): Promi
   const addSpec = (name: string, fromBare: boolean): boolean => {
     const dir = resolveSpecDir(specsDir, name);
     if (!dir) {
-      if (!fromBare) out.notices.push(`Spec '${name}' not found in ${specsDir}`);
+      // under a .kiro/specs that cannot be followed, entered or listed (spec/docfs), the spec may
+      // exist: its refusal, as the spec commands give it (a bare word is left to the other rules)
+      const dirWhy = opts.specsDir === undefined ? specsListRefused(ws.workspaceRoot) : undefined;
+      if (!fromBare) out.notices.push(dirWhy ? `Spec '${name}' was not read: ${specRefusalText(dirWhy)}` : `Spec '${name}' not found in ${specsDir}`);
       return false;
     }
     if (!once(`spec:${dir}`)) return true;
     // the rules of kiro-claude's own spec I/O (spec/docfs, r5x X1): a spec folder linked out of
-    // the workspace or to nothing, and a linked or outside document, are not read
+    // the workspace or to nothing, one the user cannot enter, and a linked, outside or unreadable
+    // document, are not read
     const folderWhy = (opts.specsDir === undefined ? specsRootRefused(ws.workspaceRoot) : undefined) ?? specFolderRefused(dir);
     if (folderWhy) {
       out.notices.push(`Spec '${name}' was not read: ${specRefusalText(folderWhy)}`);

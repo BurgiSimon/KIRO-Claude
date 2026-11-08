@@ -15,6 +15,23 @@
  *        (suspended: the SIGINT is the child's);
  *      - `Ctrl+D` on an empty line ⇒ `ctrl-d` (Q treats it like Ctrl+C, 06 §2.2);
  *      - `Shift+Tab` ⇒ `'shift-tab'` event (Kiro TUI plan-mode toggle, 01 §4.5 P2);
+ *      - `Ctrl+Z` (POSIX) suspends kiro-claude like the terminal's own Ctrl+Z, and as rustyline's
+ *        suspend does in Q: bracketed paste and raw mode are turned off, SIGTSTP stops
+ *        kiro-claude's process group (a wrapper such as `npx` included), and once it continues
+ *        (`fg`; at once when the stop is discarded because the group is orphaned: kiro-claude is
+ *        the terminal's session leader, as under `ssh -t`, `docker run -it` or `tmux new 'cmd'`)
+ *        raw mode and bracketed paste are back and the active read's prompt is drawn again with
+ *        its half-typed line. readline's own suspend is never used: it left the input paused
+ *        after SIGCONT, and raw mode off when the stop was discarded (r7 #2). While no read is
+ *        active (a turn runs) Ctrl+Z is kept as type-ahead: the stop happens at the next prompt,
+ *        once it is drawn, and an approval prompt drops it with the rest (DECISION: Q, whose
+ *        terminal is in cooked mode then, stops at once; but hook commands run in process groups
+ *        of their own and go on while kiro-claude is stopped, its timers do not wait, and a stop
+ *        that outlasted a running preToolUse hook's timeout made that hook "timed out", which
+ *        never blocks, even when it had blocked the tool). A Ctrl+Z inside a paste, read while a
+ *        child owns the terminal, or while muted is dropped. After a stop from elsewhere
+ *        (`kill -TSTP` / `kill -STOP`, then `fg`: the shell left the terminal in cooked mode) the
+ *        terminal is taken back the same way at SIGCONT, the prompt drawn on a fresh line;
  *      - while no read is active, other keys are kept as type-ahead and replayed into the next
  *        read (rustyline left them in the TTY buffer, so Classic behaves the same); reads with
  *        `discardTypeahead` (approval prompts) drop them, so text typed while a response
@@ -139,9 +156,26 @@ export function needsContinuation(text: string): boolean {
 
 const CRLF_WINDOW_MS = 100;
 const DEFAULT_HISTORY_SIZE = 1000;
+/**
+ * Ctrl+Z: a `kill(SIGTSTP)` that returns later than this really stopped the process group (a shell
+ * ran meanwhile and printed below the input); a discarded stop returns at once. It only decides
+ * where the prompt is drawn again.
+ */
+const STOP_SEEN_MS = 50;
+/**
+ * A SIGCONT this soon after the terminal was taken back belongs to that stop (its handler runs on
+ * the event loop after the stop was handled synchronously): nothing more to do.
+ */
+const OWN_CONT_MS = 250;
 
 /** See module doc. Events: `'interrupt'` (Ctrl+C with no active read), `'shift-tab'`. */
 export class LineReader extends EventEmitter {
+  /** Open terminal-mode readers (POSIX); one process SIGCONT listener serves them all. */
+  private static readonly watching = new Set<LineReader>();
+  private static readonly onSigcont = (): void => {
+    for (const r of [...LineReader.watching]) r.continued();
+  };
+
   readonly terminal: boolean;
   private readonly input: NodeJS.ReadableStream;
   private readonly output: NodeJS.WritableStream;
@@ -153,8 +187,12 @@ export class LineReader extends EventEmitter {
   private inputEnded = false;
   private closed = false;
   private pasting = false;
+  /** Between a paste-start and a paste-end key as they arrive, whether or not a read is active. */
+  private inPaste = false;
   /** Time of a Return that was the most recent key (for collapsing CRLF), else 0. */
   private lastReturnAt = 0;
+  /** When the terminal was last taken back after a stop ({@link retake}); see OWN_CONT_MS. */
+  private retakenAt = -Infinity;
   private suspended = false;
   private typeahead: [string | undefined, Key][] = [];
   private readlineAddedHistory = false;
@@ -196,6 +234,13 @@ export class LineReader extends EventEmitter {
       this.installKeyHook();
       // Fallback if the key hook could not be installed: readline emits SIGINT itself.
       this.rl.on('SIGINT', () => this.ctrlC());
+      // Likewise for Ctrl+Z; with a listener readline never suspends by itself (r7 #2).
+      this.rl.on('SIGTSTP', () => this.jobStop());
+      // A stop from elsewhere (kill -TSTP / -STOP, then fg): take the terminal back (r7 verification).
+      if (process.platform !== 'win32') {
+        LineReader.watching.add(this);
+        if (!process.listeners('SIGCONT').includes(LineReader.onSigcont)) process.on('SIGCONT', LineReader.onSigcont);
+      }
       // readline adds every accepted physical line to its history (and says so); only logical
       // inputs belong there, so that entry is taken out again in onTerminalLine.
       this.rl.on('history', () => {
@@ -215,6 +260,7 @@ export class LineReader extends EventEmitter {
     }
     this.rl.on('close', () => {
       this.unguardResize?.();
+      if (LineReader.watching.delete(this) && LineReader.watching.size === 0) process.removeListener('SIGCONT', LineReader.onSigcont);
       this.onClose();
     });
     // A failing input is its end: a hung-up terminal fails `setRawMode(false)` with EIO while
@@ -507,6 +553,16 @@ export class LineReader extends EventEmitter {
       this.ctrlC();
       return true;
     }
+    if (k.name === 'paste-start') this.inPaste = true;
+    else if (k.name === 'paste-end') this.inPaste = false;
+    if (k.ctrl && !k.shift && k.name === 'z' && (this.inPaste || this.suspended || this.top())) {
+      // a read is active: stop now; in a paste or while a child owns the terminal: dropped.
+      // While no read is active (a turn runs) it is kept as type-ahead below: the stop waits
+      // for the next prompt, never under a running hook (see module doc).
+      this.lastReturnAt = 0;
+      if (!this.inPaste && !this.suspended) this.jobStop();
+      return true;
+    }
     const t = this.top();
     if (!t || this.suspended) {
       // no read active: keep as type-ahead (bounded)
@@ -569,6 +625,103 @@ export class LineReader extends EventEmitter {
       } else this.acceptLineDisplay();
     }
     this.finish(t, { kind: 'interrupt' });
+  }
+
+  /**
+   * Ctrl+Z at an active read (terminal mode, see module doc): stop kiro-claude's process group
+   * the way the terminal's own Ctrl+Z would, then take the terminal back. Nothing on Windows (no
+   * job control, as readline), without an active read (a turn runs: never under its hooks),
+   * after the input's end, while a child owns the terminal (its own job control applies) or
+   * while muted (a fatal signal: keys are dropped). `hungUp` is not touched: only a failing input
+   * (the terminal went away meanwhile) ends it.
+   */
+  private jobStop(): void {
+    if (process.platform === 'win32' || this.closed || this.ended || this.suspended || this.muted()) return;
+    const inp = this.input as NodeJS.ReadStream;
+    const t = this.top();
+    if (!t) return;
+    // the shell prints below the input, and gets the terminal as a shell expects it
+    this.cursorToInputEnd();
+    this.output.write('\u001b[?2004l');
+    try {
+      if (typeof inp.setRawMode === 'function') inp.setRawMode(false);
+    } catch {
+      // ignore
+    }
+    if (this.ended) return; // a hung-up terminal: setRawMode failed (EIO), the input ended
+    const t0 = performance.now();
+    try {
+      // returns once the group continues (fg, bg), or at once when the stop is discarded
+      process.kill(0, 'SIGTSTP');
+    } catch {
+      // ignore
+    }
+    // after a real stop the shell's lines are below the input and the cursor is on a fresh line:
+    // the prompt is drawn there; after a discarded one the input is redrawn in place
+    this.retake(t, performance.now() - t0 >= STOP_SEEN_MS);
+  }
+
+  /**
+   * SIGCONT ({@link LineReader.onSigcont}): kiro-claude continues after a stop it did not make
+   * itself (`kill -TSTP` / `kill -STOP`, then `fg`). The shell has put the terminal back in its
+   * own (cooked) mode, where Enter would be a soft newline and Ctrl+D an end of input: it is
+   * taken back as after {@link jobStop}, the active read's prompt drawn on the shell's fresh line.
+   * Not for the SIGCONT of a stop that {@link retake} has just handled, while a child owns the
+   * terminal, while muted, or once the input ended.
+   */
+  private continued(): void {
+    if (this.closed || this.ended || this.suspended || this.muted()) return;
+    if (performance.now() - this.retakenAt < OWN_CONT_MS) return;
+    const inp = this.input as NodeJS.ReadStream;
+    try {
+      // libuv applies a mode only when it changes: off first, then on again in retake
+      if (typeof inp.setRawMode === 'function') inp.setRawMode(false);
+    } catch {
+      // ignore
+    }
+    if (this.ended) return; // a hung-up terminal (EIO)
+    this.retake(this.top(), true);
+  }
+
+  /**
+   * After a stop: raw mode back on, the input resumed, bracketed paste on again (a shell turns it
+   * off before it continues a job, bash does) and the active read `t` drawn again, on a fresh line
+   * (`freshLine`: the shell printed below the input) or in place.
+   */
+  private retake(t: PendingRead | undefined, freshLine: boolean): void {
+    const inp = this.input as NodeJS.ReadStream;
+    try {
+      // in the background (`bg`) this stops again (SIGTTOU) until `fg`
+      if (typeof inp.setRawMode === 'function') inp.setRawMode(true);
+    } catch {
+      // ignore
+    }
+    this.retakenAt = performance.now();
+    if (this.closed || this.ended) return;
+    this.rl.resume();
+    if (this.muted()) return;
+    this.output.write('\u001b[?2004h');
+    if (!t || t.done) return;
+    if (freshLine) (this.rl as unknown as { prevRows?: number }).prevRows = 0;
+    this.rl.prompt(true);
+  }
+
+  /** Put the terminal's cursor after the active read's input (readline's own cursor stays). */
+  private cursorToInputEnd(): void {
+    const r = this.rl as unknown as {
+      line: string;
+      cursor: number;
+      prevRows?: number;
+      getCursorPos?: () => { rows: number; cols: number };
+    };
+    if (typeof r.getCursorPos !== 'function') return;
+    const at = r.getCursorPos();
+    const cursor = r.cursor;
+    r.cursor = r.line.length;
+    const end = r.getCursorPos();
+    r.cursor = cursor;
+    readline.moveCursor(this.output as NodeJS.WritableStream, end.cols - at.cols, end.rows - at.rows);
+    r.prevRows = end.rows;
   }
 
   private onTerminalLine(line: string): void {

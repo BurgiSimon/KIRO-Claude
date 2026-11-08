@@ -92,6 +92,14 @@ tasks). Approval is a menu choice; the model never moves on by itself.
   ends, the chat continues in an unrestricted continuation forked from the last phase session a
   turn reached; `kiro-claude spec` closes everything instead. When no spec turn reached Claude
   (for example a Ctrl+C while the phase session was starting), the chat keeps its own session.
+  The hints that say how to go on after a stop (a checkpoint's Stop label and stop hint, `new` of
+  an existing spec, `run` or `analyze` without its document) come from `SpecRuntime.resumeHint`:
+  `/spec <name>` in chat; `kiro-claude spec`, which has no such form, names its own commands by
+  where the spec stands (r7 #8): `kiro-claude spec approve <name> · kiro-claude spec revise <name>
+  <feedback>` for a document awaiting review, `kiro-claude spec run <name> --next` once the tasks
+  are approved, `kiro-claude spec status <name>` for a spec with a refused file, and `/spec <name>
+  in kiro-claude chat` when only the chat can draft the next document (an existing folder without
+  its first document: `new` refuses an existing folder).
 * **Trust and plan mode, carried in and back.** Every phase session and the continuation start
   from the trust and plan mode of the session they continue, as the chat has them at that moment
   (a `/tools untrust`, a revoked tool, a `t` answer, Shift+Tab), never from the launch flags
@@ -125,7 +133,18 @@ tasks). Approval is a menu choice; the model never moves on by itself.
   `tasks.md` repair after a turn, the box updates of a run and `.config.kiro` never go through a
   link at a document, through a link above it that resolves to nothing or whose target cannot be
   accessed, or outside the workspace (reads use `O_NOFOLLOW`; writes rename over the path itself,
-  never a link's target). Such a document is marked `refused` with the reason: `list` and `status`
+  never a link's target). They also refuse what the user cannot access, which the gate leaves to
+  the tool's own I/O error: a document the user cannot read (whatever its size: every document is
+  checked) and a feature folder or `.kiro/specs` the user cannot enter (also one a link points at,
+  or one under such a folder) get the reason `<p> cannot be accessed (permission denied)` and the
+  advice `kiro-claude uses spec files and folders only when it can read them, and never takes one
+  it cannot read for a missing one (check their permissions)`, never the advice to replace the
+  link or move the folder; a `.kiro/specs` the user may enter but not read is not enumerated (that
+  reason too), and its specs still work by their exact name. DECISION (r7 #6, the research is
+  silent): such a file is refused rather than taken for a missing one, so it is never drafted
+  over and no task runs with a context that silently lacks it (the files of a folder that cannot
+  be entered are not known to exist: `status` gives the phase as `unknown (not read)`). Such a
+  document is marked `refused` with the reason: `list` and `status`
   show the phase `refused` and say why, `view` prints the reason instead of the text, and it is
   never drafted over as if it were missing. Its checkpoint offers no Approve and `approve` refuses
   it (a headless flow ends with an error there); a revision turn still runs and the gate denies
@@ -135,11 +154,18 @@ tasks). Approval is a menu choice; the model never moves on by itself.
   each checkpoint names every reason and offers no Approve, and no phase is drafted from it.
   `run` and `sync` (whose turn also builds on requirements and design) of a spec with a refused
   file, `analyze` with a refused requirements document, and `new` under a `.kiro/specs` that is
-  linked out of the workspace (or dangling, or to a target that cannot be accessed) are refused
-  with the reason. Such a `.kiro/specs` is not enumerated either: `list` and `status` print why
-  instead (`kiro-claude spec list` exits 1); a feature folder linked like that is listed as
-  `refused`. A task whose spec file becomes a link during the run (before it starts, or while its
-  session starts) fails with the reason, and the link's target is left alone. A link swapped
+  linked out of the workspace (or dangling, or to a target that cannot be accessed), or that the
+  user cannot enter, are refused with the reason. Such a `.kiro/specs` is not enumerated either:
+  `list` and `status` print why instead (`kiro-claude spec list` exits 1); a feature folder linked
+  like that is listed as `refused`. A spec named under such a `.kiro/specs` that is not found
+  (it may well be there) gets that refusal instead of "not found … Create it with … new" (r7 #7:
+  `kiro-claude spec status|view <name>`, `/spec <name>`, `/spec status|view <name>` and every flow;
+  `new` would refuse anyway), and `#spec:<name>` gives the same reasons (also for a feature folder
+  link that cannot be followed), never "not found". A task whose spec file becomes a link (or
+  unreadable) during the run (before it starts, while its session starts, or when its context is
+  read) fails with the reason, and the link's target is left alone; one whose box cannot be
+  marked in progress for another reason (a spec folder the user cannot write) fails with that
+  error, not as a task that is no longer in `tasks.md`. A link swapped
   into a folder between the check and the I/O is not ruled out (the same window as the gate's).
 * **Tangents.** A spec command that runs spec turns (`/spec new`, `approve`, `revise`, `analyze`,
   `sync`, and resuming a spec that still has a document to draft or review) is refused inside a
@@ -187,6 +213,24 @@ tasks). Approval is a menu choice; the model never moves on by itself.
 Sessions are kiro-cli session files in `~/.kiro/sessions/cli` (`<id>.json` and the `<id>.jsonl`
 journal); Claude Code keeps its own transcript, which kiro-claude resumes and forks.
 
+* **Switching chats.** `/chat new` (a fresh conversation) and `/chat load` (an export, imported as
+  a new record) keep the agent, model and effort of the chat (`/chat load` the export's effort
+  when the chat has none); `/chat resume` (another record of this directory) takes the record's
+  (the chat's effort when the record has none). All three keep the chat's trust and plan mode as they are
+  at that moment. Trust is per process, as in Q (its Load swaps the current agents, with their
+  allowed tools and trust-all, into the loaded state): the next chat starts from the chat's trust
+  (trust-all, per-tool trust, session rules, `/tools untrust` revocations, other agents' trust),
+  never from the launch `--trust-tools` / `--trust-all-tools` again, so a tool the user
+  untrusted, or trust-all turned off with `/tools reset`, stays so, and launch trust the user kept
+  stays too, as do a revoked tool of the agent's own `allowedTools` and trust gained with `t` or
+  `/tools trust-all`. For `/chat resume` this replaces the record's own saved trust (the chat's
+  per-tool trust of the record's agent when the record runs another one), and the record is saved
+  with it once its Claude Code is up: a revocation an earlier run saved in it is gone, also for a
+  later `chat --resume` of it (which starts from the record's own trust and the launch flags).
+  Plan mode is session state too
+  (Kiro's plan mode is the planner agent, which `/chat new` and `/chat load` keep): the next chat
+  is in plan mode when the chat is, and a record or export saved in plan mode comes back in it
+  even when the chat is not.
 * **Tangents.** `/tangent` forks the conversation into a tangent and `/tangent` again returns to
   the main one; `/tangent tail` brings the tangent's last question and answer back with it,
   `/tangent merge` a summary. Tangents nest. Plan mode is session state, not part of the tangent's
@@ -197,9 +241,15 @@ journal); Claude Code keeps its own transcript, which kiro-claude resumes and fo
   cannot lose it. The agent (`/agent swap`) and tool trust (`/tools trust`, `untrust`, `reset`,
   `trust-all`) are session state too, written to those records at once the same way: after a
   crash inside a tangent, `chat --resume` (which opens the main conversation; after a `/rewind`
-  inside the tangent it can open the rewound one, a record of its own that holds them too) never
+  inside the tangent it can open the rewound one, a record of its own that holds them too, from
+  the moment it is written, also while its Claude Code is still starting) never
   runs a tool revoked inside the tangent as trusted, nor resumes on the agent the user left
-  (trust-all is per invocation anyway: a resume without `--trust-all-tools` clears it). A `tail` carries the
+  (trust-all is per invocation anyway: a resume without `--trust-all-tools` clears it). So are the
+  model and the effort (Q CLI keeps the model per process): the model the agent pins when
+  `/agent swap` switches to it inside a tangent (when it is a valid one), and a `/model` or
+  `/effort` made inside a tangent, are written to the records under it at once and kept when the
+  chat leaves the tangent, so the main conversation runs the new agent on its model, not on the
+  model it had before. A `tail` carries the
   tangent's own last exchange: also after a return from a tangent nested in it (the exchange it
   had before), and after a `/rewind N` inside it turn N's (also when Claude Code compacted
   automatically during that turn), never a turn rewound away. What a nested tangent's `merge`
@@ -210,7 +260,10 @@ journal); Claude Code keeps its own transcript, which kiro-claude resumes and fo
   session that entered a tangent without one all the same (through the session API, after local
   commands only) keeps no record of the chat or of its empty tangents when it quits.
 * **Rewind.** `/rewind N` continues from turn N in a new record and names the record that keeps
-  the original conversation. An untouched copy (a `/spec` continuation with no message of its
+  the original conversation. The new record (like a tangent's) is written with the chat's trust,
+  agent, model, effort and plan mode and the fork still to be made, so a crash while its Claude
+  Code starts leaves `chat --resume`, which opens it, neither a revoked tool trusted nor the
+  conversation lost (the resume makes the fork again). An untouched copy (a `/spec` continuation with no message of its
   own) is dropped only when its parent record still holds every one of its turns. After a
   `/compact` Claude Code keeps the conversation from its summary on: a rewind to the turn the
   compaction followed forks the compacted conversation at that turn's answer when Claude Code kept
@@ -284,6 +337,29 @@ journal); Claude Code keeps its own transcript, which kiro-claude resumes and fo
   `!cmd` get the terminal, and its SIGINT, themselves.
 * At the idle prompt the first Ctrl+C or Ctrl+D prints `(To exit the CLI, press Ctrl+C or Ctrl+D
   again or type /quit)`; the second exits.
+* Ctrl+Z (POSIX) at a prompt (the idle prompt, an approval or a question) suspends kiro-claude
+  like any terminal program, as rustyline does at Q's prompt: the terminal reader
+  (`repl/input.ts`) turns raw mode and bracketed paste off and sends SIGTSTP to kiro-claude's
+  process group, so a wrapper such as `npx` stops with it. Claude Code runs in a process group
+  of its own and keeps running; what it writes waits in the pipe, and a permission request waits
+  for its answer, until `fg`. Pressed while a turn runs, Ctrl+Z is kept as type-ahead and the
+  stop happens at the prompt that follows (an approval prompt drops it with the rest of the
+  type-ahead). DECISION: Q stops at once there (its terminal is in cooked mode while it answers),
+  but kiro-claude's hook commands also run in groups of their own and go on while it is stopped,
+  and its timers do not wait: a stop that outlasted a running preToolUse hook's timeout counted
+  that hook as timed out, which never blocks, even when it had blocked the tool, and a trusted
+  tool then ran.
+  After `fg` raw mode and bracketed paste are back and the prompt being read is drawn again with
+  its half-typed line; an approval prompt still takes its answer. As the terminal's session
+  leader (`ssh -t host kiro-claude chat`, `docker run -it`, `tmux new 'kiro-claude chat'`) there
+  is no shell to return to: the kernel discards the stop and the chat goes on as before.
+  readline's own suspend is not used: it left the input paused after `fg`, and in cooked mode
+  when the stop was discarded (Enter no longer submitted, and Ctrl+D was an end of input taken
+  for a hangup). A stop from elsewhere (`kill -TSTP` or `kill -STOP` of kiro-claude, then `fg`)
+  leaves the terminal in the shell's cooked mode; the reader takes it back at SIGCONT the same
+  way, the prompt being read drawn on the shell's fresh line. While `$EDITOR` or `!cmd` owns the
+  terminal, Ctrl+Z is the terminal's own: it stops that program and kiro-claude together, as one
+  job.
 
 `chat --no-interactive`: the first Ctrl+C interrupts the turn (exit status 130 once it ends); a
 second one closes the session.
@@ -312,11 +388,14 @@ Both front ends use `ExitSignals` (`repl/exitSignals.ts`) on POSIX:
   status 128 + the signal number (129 for SIGHUP, 130 for SIGINT, 143 for SIGTERM), and the
   lifecycle forwarder ends any child still running. Should anything swallow the re-raised signal,
   kiro-claude exits with that status 5 s later.
-* A second signal re-raises at once: a different one, or the same one more than 500 ms after the
-  first (`DUPLICATE_SIGNAL_WINDOW_MS`). A repeat inside that window is the same event delivered
-  twice, not an impatient user: a terminal tab closing under an interactive shell sends SIGHUP
-  twice within a millisecond, an `npm` or `npx` wrapper forwards the terminal's SIGINT, and a
-  supervisor may signal both the process and its group.
+* A second signal re-raises at once: one more than 500 ms after the first
+  (`DUPLICATE_SIGNAL_WINDOW_MS`), or a SIGINT after a SIGHUP or SIGTERM inside that window. A
+  repeat inside the window is the same event delivered twice, not an impatient user: a terminal
+  tab closing under an interactive shell sends SIGHUP twice within a millisecond, an `npm` or
+  `npx` wrapper forwards the terminal's SIGINT, and a supervisor may signal both the process and
+  its group. So is a SIGTERM right after a SIGHUP, or the other way round: closing the terminal
+  of an interactive bash while the chat is stopped (Ctrl+Z) sends SIGHUP and then SIGTERM (each
+  with a SIGCONT) within microseconds.
 * After the signal kiro-claude prints nothing more. The REPL shows no prompt, no turn error, no
   notice and nothing a command prints, drops the output of a `!cmd` still running, clears a
   spinner, and neither sends nor runs input typed during the grace. Nor does such input answer a
@@ -507,13 +586,22 @@ launcher, the identity stub (only if kiro-claude created it), `crew.json`, and t
 logs under `run/` (`gateway.out`, `gateway.err`, `setup.log`, `ready.json`, `token`,
 `crashed.json`). `--purge` also removes the private claude-agent-acp bridge (only while it holds
 nothing else), the npm and pip build caches, and then the crew state directory itself when it is
-empty. KiroCrew's data home and its checkout are kept. Without `crew.json` (after an earlier
-plain uninstall) a plain uninstall exits 1 ("not set up yet"), but `--purge` runs just the purge,
+empty. KiroCrew's data home and its checkout are kept. Both purge paths print what they removed
+(also crew's files inside a folder that is kept, such as `cache/npm`) and what they kept:
+`Purged <dir>` only when the state directory is really gone (lstat fails with `ENOENT`);
+otherwise `Purged <entries> from <dir>` or `Nothing to purge in <dir>`, then `; kept <entries>`
+(with `crew.json`, the checkout it names is labelled as such when it is inside), or, when nothing
+is left, why the directory itself stays:
+it is a symbolic link (purged through the link, crew's entries of its target only; the link is
+never removed) or rmdir failed (its error code, e.g. `EBUSY` for a mount point). Without
+`crew.json` (after an earlier plain uninstall) a plain uninstall exits 1 ("not set up yet"), but
+`--purge` runs just the purge,
 by the same ownership rules: the bridge only while it holds nothing else, the caches, the run
 files above, an empty `bin/` and `run/`, `crew.json` temp files, then the state directory when
-empty. Unknown entries and a checkout inside are kept, and it prints what it removed (also crew's
-files inside a folder it keeps, such as `cache/npm`) and what it kept (exit 0). It refuses, removing
-nothing (exit 1), while `run/ready.json` names a gateway that may still run (its pid is alive and
+empty. Unknown entries and a checkout inside are kept, with the same report (exit 0). A state
+directory that does not exist, or is a dangling symbolic link (named as such; the link is kept),
+leaves nothing to purge (exit 0). It
+refuses, removing nothing (exit 1), while `run/ready.json` names a gateway that may still run (its pid is alive and
 neither its boot nor its start time proves it another process, or the file cannot be read or
 names no pid), since
 `crew stop` cannot stop that gateway without `crew.json`. A `crew.json` that is there but corrupt

@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 
 import type { ClaudeBinary } from '../../src/claude/binary.js';
 import { ClaudeProcess, type ClaudeHandlers, type ClaudeStartOptions } from '../../src/claude/process.js';
+import { removeOnExit } from '../tmpdirs.js';
 import type { ClaudeFrame, InitializeRequest, ResultFrame } from '../../src/claude/protocol.js';
 
 /**
@@ -50,7 +51,7 @@ export const STREAM_ARGS: readonly string[] = Object.freeze([
 ]);
 
 export function mkTmp(prefix = 'kc-claude-test-'): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  return removeOnExit(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
 }
 
 export interface FakeScript {

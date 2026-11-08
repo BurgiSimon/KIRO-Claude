@@ -25,13 +25,15 @@
  * `status`, `view` and task runs work in a tangent.
  *
  * A spec document (or `.config.kiro`) that is a symbolic link, not a regular file, behind a link
- * that resolves to nothing, to a target that cannot be accessed or outside the workspace is never
- * read or written by kiro-claude
+ * that resolves to nothing, to a target that cannot be accessed or outside the workspace, or that
+ * the user cannot read (or in a folder it cannot enter), is never read or written by kiro-claude
  * (spec/docfs.ts, review X1): `list` / `status` show the phase `refused` and why, `status <name>`
  * marks the document, `view` of it prints the reason instead, and the flows refuse or stop with
  * it (spec/workflow.ts); `run` without a scope refuses such a spec before asking one. A
- * `.kiro/specs` linked out of the workspace is not listed: `list`, `status` and the pickers print
- * the reason instead.
+ * `.kiro/specs` linked out of the workspace (or dangling, or into a folder the user cannot
+ * enter), or one it cannot enter or read, is not listed: `list`, `status` and the pickers print
+ * the reason instead, and so do `/spec <name>`, `/spec status|view <name>` and the flows for a
+ * name not found under it (r7 #7), never "not found … Create it with /spec new".
  *
  * Not reproduced (gap): the V3 full-screen reader (Ctrl+X line comments) and "spec mode" for
  * later free-form turns (needs a REPL hook; ReplHost has none).
@@ -335,7 +337,7 @@ function cmdView(host: ReplHost, args: string[]): void {
   }
   const spec = loadSpec(host.ws, name);
   if (!spec) {
-    host.print(`Spec '${name}' not found. Create it with /spec new ${name}`);
+    host.print(notFoundText(host, name, `Spec '${name}' not found. Create it with /spec new ${name}`));
     return;
   }
   let doc = parseDoc(args[1]);
@@ -378,7 +380,17 @@ function cmdStatus(host: ReplHost, name: string | undefined): void {
     return;
   }
   const spec = loadSpec(host.ws, name);
-  host.print(spec ? formatSpecStatus(spec) : `Spec '${name}' not found.`);
+  host.print(spec ? formatSpecStatus(spec) : notFoundText(host, name, `Spec '${name}' not found.`));
+}
+
+/**
+ * What a named command prints for a spec that is not found: under a `.kiro/specs` kiro-claude does
+ * not use or cannot list (store.specsDirRefused) that refusal (r7 #7: the spec may exist there,
+ * and `/spec new` would refuse), else `text`.
+ */
+function notFoundText(host: ReplHost, name: string, text: string): string {
+  const dirWhy = specsDirRefused(host.ws);
+  return dirWhy ? `✗ ${specRefusalText(dirWhy)}` : text;
 }
 
 async function runSpec(args: string[], host: ReplHost): Promise<void> {
@@ -462,7 +474,7 @@ async function runSpec(args: string[], host: ReplHost): Promise<void> {
     }
     default: {
       if (!summarizeSpec(host.ws, sub)) {
-        host.print(`Spec '${sub}' not found. Create it with /spec new ${sub}\n\n${SPEC_USAGE}`);
+        host.print(notFoundText(host, sub, `Spec '${sub}' not found. Create it with /spec new ${sub}\n\n${SPEC_USAGE}`));
         return;
       }
       if (await tangentRefuses(host, sub)) return;

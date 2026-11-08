@@ -118,6 +118,12 @@ In chat:
   restarts it with the conversation (`--resume`); a Ctrl+C while the restarted session runs its
   agentSpawn hooks cancels the restart. An idle Claude Code is never stopped this way.
 * At the prompt, Ctrl+C or Ctrl+D twice exits (or type `/quit`).
+* **Ctrl+Z** suspends kiro-claude like any terminal program; `fg` brings the chat back with what
+  you had typed. Pressed while the agent works, it takes effect at the next prompt (a running
+  hook's timeout never runs out while kiro-claude is stopped); an approval prompt drops it like
+  other keys typed ahead. When kiro-claude is the terminal's first program (`ssh -t host kiro-claude chat`,
+  `docker run -it`, `tmux new 'kiro-claude chat'`) there is no shell to return to, and Ctrl+Z does
+  nothing.
 
 `chat --no-interactive`: the first Ctrl+C interrupts the answer (exit status 130), a second one
 closes the session.
@@ -158,8 +164,19 @@ documents in `.kiro/specs/<feature>/`.
   `analyze` refuse to use it, `#spec:<name>` in chat leaves it out with a notice, and no phase of
   that spec is approved or drafted (its checkpoints say why). A `.kiro`, `.kiro/specs` or feature folder that is a symbolic link works when it
   resolves inside the workspace; one that points outside it, or that cannot be followed (dangling,
-  or into a folder you cannot enter: the reason then says `cannot be accessed (permission
-  denied)`), is refused the same way.
+  or whose target is behind a folder you cannot enter), is refused the same way. So are a spec
+  document you cannot read (whatever its size) and a feature folder or `.kiro/specs` you cannot
+  enter, also one a link points at: kiro-claude never takes them for missing ones, so nothing is
+  drafted over them and no task runs without them. For these, and for a link whose target is
+  behind a folder you cannot enter, the reason says `cannot be accessed (permission denied)`. A
+  `.kiro/specs` you may enter but not read is not listed (`list` gives that reason, not "No specs
+  found"); its specs still work by name. A spec named under a `.kiro/specs` that is refused gets
+  that folder's reason, not "not found", and `#spec:<name>` gives the same reasons.
+* When a spec stops (a checkpoint's Stop, `new` of an existing spec, `run` without `tasks.md`),
+  the hint says how to go on: `/spec <name>` in chat, while `kiro-claude spec` names its own commands
+  (`approve` / `revise`, `run <name> --next`, `status <name>`), or `/spec <name>` in
+  `kiro-claude chat` when only the chat can draft the next document (a spec folder without its
+  first document).
 * Ctrl+C stops a run before its next task and interrupts the running one; the next Ctrl+C kills
   the PostTaskExec hooks of a task it interrupted. In `kiro-claude spec run` that second Ctrl+C
   lets the run print its summary; without such a hook it exits at once.
@@ -276,7 +293,8 @@ be freed. See [KiroCrew](docs/ARCHITECTURE.md#kirocrew-persistent-pipeline-on-cl
 removes what setup added: the launcher, the identity stub (only if kiro-claude created it),
 `crew.json`, and the run files and logs under `run/` (`crashed.json` included). `--purge` also
 removes the private claude-agent-acp bridge and the build caches, then the crew state directory
-itself when it is empty. Your KiroCrew data and the checkout are kept. `--purge` also works after
+itself when it is empty. It prints what it removed and what it kept (`Purged <dir>` only when the
+directory is gone). Your KiroCrew data and the checkout are kept. `--purge` also works after
 an earlier plain `crew uninstall`: it then removes just these leftovers, and refuses while
 `run/ready.json` names a gateway that may still be running.
 

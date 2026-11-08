@@ -2,10 +2,11 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import type { KiroAgent, SteeringFile, WorkspaceContext } from '../../src/types.js';
+import { removeOnExit } from '../tmpdirs.js';
 
 /** Temp workspace: `<tmp>/home` (HOME), `<tmp>/home/.kiro` (KIRO_HOME), `<tmp>/ws` (cwd/root). */
 export function tmpWorkspace(): WorkspaceContext & { tmp: string } {
-  const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-context-')));
+  const tmp = removeOnExit(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-context-'))));
   const home = path.join(tmp, 'home');
   const kiroHome = path.join(home, '.kiro');
   const ws = path.join(tmp, 'ws');

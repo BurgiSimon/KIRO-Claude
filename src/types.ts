@@ -555,8 +555,15 @@ export type SessionEvent =
   /**
    * The end of a compaction reported `started` that did not compact (manual or automatic): Claude
    * reported it failed (`system/status` `compact_result: 'failed'`, no boundary: refused, failed
-   * or interrupted; `reason` = its `compact_error`), or the turn ended with it still open.
-   * `cancelled`: the turn was interrupted. Every `started` ends with exactly one `finished` or
+   * or interrupted), or the turn ended with it still open. `reason` is Claude's `compact_error`
+   * made readable: Claude Code's internal codes (`too_few_groups`, `exhausted`,
+   * `media_unstrippable`) as sentences (`Not enough messages to compact.`, …), without Claude's
+   * own `Compaction failed ·` before it, worded as the turn's error words it (a `/compact` refused
+   * while a restored history is pending also says why it had nothing to compact), and
+   * `Compaction failed` when Claude gives none; `Claude Code did not finish the compaction` for one
+   * Claude's next output or the turn's end found still open. Whenever the turn was interrupted it
+   * is `Compaction cancelled` with `cancelled`, whatever `compact_error` says (2.1.319: `API
+   * Error: Request was aborted.`). Every `started` ends with exactly one `finished` or
    * `compaction_failed`. A type of its own, so a consumer that knows only `started` / `finished`
    * never shows it as a success.
    */
@@ -653,10 +660,17 @@ export interface KiroSessionOptions {
    * agent the snapshot's flat per-tool fields belong to (default: this session's); when this
    * session runs another agent they are parked under `byAgent` (Q keeps per-agent trust). Used for
    * the sessions that continue a chat: `/spec` phase sessions, the continuation, `/spec run` task
-   * sessions, the REPL's forced-stop restart (a launch `--trust-tools` applied again would re-trust
-   * a tool the user untrusted).
+   * sessions, the REPL's forced-stop restart and `/chat new|load|resume` (a launch `--trust-tools`
+   * applied again would re-trust a tool the user untrusted).
    */
   initialTrust?: { trust: SessionTrust; agent?: string };
+  /**
+   * Start in plan mode: set on the record before it is first written, so a crash while the
+   * session starts (agentSpawn hooks, Claude Code's start) never leaves it on disk outside plan
+   * mode. A record saved in plan mode stays in it either way (false / unset keep the record's own).
+   * Used by `/chat new|load|resume` from a chat in plan mode.
+   */
+  planMode?: boolean;
   /** Resume an existing kiro-claude session id, or the newest for this cwd. */
   resume?: { sessionId: string } | { latest: true };
   /** Fork from a Claude session (tangent / rewind / chat load). */
@@ -731,7 +745,11 @@ export interface KiroSession extends EventEmitter {
   clear(): Promise<void>;
   /** /compact [instructions] */
   compact(instructions?: string): AsyncGenerator<SessionEvent, TurnResult>;
-  /** /tangent: enter (fork) or exit back to the parent. */
+  /**
+   * /tangent: enter (fork) or exit back to the parent. The agent, tool trust, plan mode, model
+   * and effort are session state, not part of the tangent: a change made inside one is saved on
+   * the records under it at once and kept on the exit.
+   */
   enterTangent(name?: string): Promise<void>;
   exitTangent(mode: 'discard' | 'tail' | 'merge'): Promise<void>;
   /** /rewind N: fork at turn N (1-based). */

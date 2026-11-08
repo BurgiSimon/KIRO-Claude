@@ -70,12 +70,12 @@ export interface ReplContext extends ReplHost {
   openEditor(initial: string, opts?: { suffix?: string; file?: string }): Promise<EditorResult>;
   /** Run `!cmd` semantics (01 §4.3 step 4). */
   runBang(command: string): Promise<void>;
-  /** Options to create a sibling session (current agent/model/effort, no resume/fork). */
+  /** Options to create a sibling session (current agent/model/effort and trust, no resume/fork). */
   baseSessionOptions(): ReplSessionOptions;
   /** Close the active session and make `next` active (/chat new|resume|load). */
   swapSession(next: KiroSession): Promise<void>;
   /** /chat load: import a `/chat save` export (undefined when unsupported). */
-  importSession(path: string): Promise<KiroSession>;
+  importSession(path: string, extra?: Partial<Omit<KiroSessionOptions, 'resume' | 'fork'>>): Promise<KiroSession>;
   /** Re-read cached values (usage %, prompt) after a command changed the session. */
   refreshUsage(): Promise<void>;
   /** Ask the REPL to exit after the current command (with an exit code). */

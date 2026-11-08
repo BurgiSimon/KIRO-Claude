@@ -390,7 +390,9 @@ export class SessionStore {
   /**
    * Create, persist and return a new record. Ids are fresh UUIDs unless given;
    * `claudeSessionId` defaults to the session id (00 §2.5 "New session"); `cwd` is stored as
-   * its realpath. Throws when `<id>.json` already exists (use {@link write} to replace).
+   * its realpath. `trust` (byAgent included) and the other nested fields are deep-copied, so a
+   * fork record is written with the session's trust and fork from the start (r7 #1). Throws when
+   * `<id>.json` already exists (use {@link write} to replace).
    */
   create(init: Partial<SessionRecord> & Pick<SessionRecord, 'origin' | 'cwd' | 'agent' | 'model'>): SessionRecord {
     const now = new Date().toISOString();
@@ -430,6 +432,7 @@ export class SessionStore {
     if (init.pendingContext?.length) rec.pendingContext = [...init.pendingContext];
     if (init.pendingHistory !== undefined && init.pendingHistory.trim() !== '') rec.pendingHistory = init.pendingHistory;
     if (init.effort !== undefined) rec.effort = init.effort;
+    if (init.pendingFork) rec.pendingFork = { from: init.pendingFork.from, ...(init.pendingFork.at ? { at: init.pendingFork.at } : {}) };
     this.persist(rec);
     return rec;
   }

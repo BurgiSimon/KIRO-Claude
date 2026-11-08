@@ -2,7 +2,9 @@
  * Round-5 fix "signals", unit level:
  *  - #1(c) ExitSignals: a repeat of the first signal within {@link DUPLICATE_SIGNAL_WINDOW_MS}
  *    (a closing tab delivers SIGHUP from the shell and from the kernel within a millisecond) does
- *    not cut the close short; a later repeat, or a different signal, still re-raises at once.
+ *    not cut the close short, nor does a SIGTERM right after a SIGHUP or the other way round
+ *    (r7g: bash closing the terminal of a stopped job); a later second signal still re-raises at
+ *    once.
  *  - #6 ExitSignals.closing(): during the front end's final close a SIGINT closes first (bounded
  *    by the grace) and then re-raises; a second press re-raises at once; never re-armed after
  *    dispose().
@@ -105,10 +107,27 @@ test('r5f #1(c): a repeat of the signal after the window still re-raises at once
   assert.ok(r.diedAfter < SIGNAL_CLOSE_GRACE_MS - 300, `died ${r.diedAfter} ms after the first signal (second at +${later - 50})`);
 });
 
-test('r5f #1(c): a different signal right after the first still re-raises at once (the first one)', { timeout: 30_000 }, async () => {
-  const r = await runChild({ closeMs: 10_000, setup: ['ready'], plan: [[50, 'SIGHUP'], [55, 'SIGTERM']] });
-  assert.equal(r.signal, 'SIGHUP', JSON.stringify(r));
+test('r7g: a SIGTERM right after a SIGHUP (bash hanging up a stopped job), or the other way round, does not cut the close short', { timeout: 30_000 }, async () => {
+  for (const [first, second] of [['SIGHUP', 'SIGTERM'], ['SIGTERM', 'SIGHUP']] as const) {
+    const r = await runChild({ closeMs: 600, setup: ['ready'], plan: [[50, first], [52, second]] });
+    assert.equal(r.signal, first, JSON.stringify(r));
+    assert.ok(r.lines.some((l) => /close-done/.test(l)), `${first} then ${second}: the close was cut short:\n${r.lines.join('\n')}`);
+  }
+});
+
+test('r7g: a SIGINT right after a SIGTERM (during the final close) still re-raises at once', { timeout: 30_000 }, async () => {
+  const r = await runChild({ closeMs: 10_000, setup: ['ready', 'closing'], plan: [[50, 'SIGTERM'], [55, 'SIGINT']] });
+  assert.equal(r.signal, 'SIGTERM', JSON.stringify(r));
+  assert.ok(!r.lines.some((l) => /close-done/.test(l)), r.lines.join('\n'));
   assert.ok(r.diedAfter < 800, `died ${r.diedAfter} ms after the first signal`);
+});
+
+test('r5f #1(c): a different signal after the window still re-raises at once (the first one)', { timeout: 30_000 }, async () => {
+  const later = 50 + DUPLICATE_SIGNAL_WINDOW_MS + 250;
+  const r = await runChild({ closeMs: 10_000, setup: ['ready'], plan: [[50, 'SIGHUP'], [later, 'SIGTERM']] });
+  assert.equal(r.signal, 'SIGHUP', JSON.stringify(r));
+  assert.ok(!r.lines.some((l) => /close-done/.test(l)), r.lines.join('\n'));
+  assert.ok(r.diedAfter < SIGNAL_CLOSE_GRACE_MS - 300, `died ${r.diedAfter} ms after the first signal (second at +${later - 50})`);
 });
 
 test('r5f #6: after closing(), a SIGINT during the final close closes first, then kiro-claude dies of SIGINT', { timeout: 30_000 }, async () => {

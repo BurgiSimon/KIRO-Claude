@@ -51,7 +51,13 @@
  * not a regular file, a link above it that resolves to nothing or whose target cannot be
  * accessed, a real path outside the workspace) and {@link specFolderRefusal} for a spec folder
  * or `.kiro/specs` (a link at the folder is followed when it resolves inside the workspace).
- * src/spec/docfs.ts applies them, and words its advice by {@link isLinkAccessRefusal}.
+ * They also refuse what the user cannot access, which the gate leaves to the tool's own I/O
+ * error: a document the user cannot read (whatever its size) and a folder it cannot enter, also
+ * one a link points at, or a folder under such a folder (EACCES or EPERM: `<p> cannot be accessed
+ * (permission denied)`, {@link isAccessRefusal}). DECISION (r7 #6; the research is silent): such
+ * a file is refused rather than taken for a missing one, so it is never drafted over and no task
+ * runs without it. src/spec/docfs.ts applies them, and words its advice by
+ * {@link isLinkAccessRefusal} and {@link isAccessRefusal}.
  */
 
 import * as fs from 'node:fs';
@@ -169,6 +175,69 @@ export function isLinkAccessRefusal(why: string): boolean {
   return /: the target of the symbolic link .+ cannot be accessed \([^()]+\)$/s.test(why);
 }
 
+/** Error codes meaning the user may not access a path (worded "permission denied"). */
+const DENIED_CODES: ReadonlySet<string> = new Set(['EACCES', 'EPERM']);
+
+/** The reason of a spec file or folder `p` that the user cannot access ({@link isAccessRefusal}). */
+export function deniedWhy(p: string): string {
+  return `${p} cannot be accessed (permission denied)`;
+}
+
+/**
+ * `why` (a reason of {@link specFileRefusal} or {@link specFolderRefusal}) says that a spec file
+ * or folder itself, or a folder above it, cannot be accessed by the user (EACCES or EPERM): not a
+ * link problem, so the advice is to check permissions. Not a {@link isLinkAccessRefusal} reason.
+ * The paths in it may hold any character a file name may, a newline included (`s` flag).
+ */
+export function isAccessRefusal(why: string): boolean {
+  return !isLinkAccessRefusal(why) && / cannot be accessed \(permission denied\)$/s.test(why);
+}
+
+/** `stat(<d>/.)`: undefined when the folder `d` can be entered (searched), else the error code. */
+function enterCode(d: string): string | undefined {
+  try {
+    fs.statSync(`${d}${path.sep}.`);
+    return undefined;
+  } catch (e) {
+    return errCode(e) ?? 'EUNKNOWN';
+  }
+}
+
+/**
+ * `p` is, or lies under, a folder the user cannot enter: walking up from the folder `from` (`p`
+ * itself or its folder), the topmost folder whose entering fails with EACCES or EPERM (`stat` of
+ * `<folder>/.` fails so for that folder and everything below it), until one can be entered. The
+ * reason names `p`, and that folder when it is another one; undefined when there is none (also
+ * when `p` merely does not exist).
+ */
+function deniedFolderWhy(p: string, from: string): string | undefined {
+  let denied: string | undefined;
+  for (let cur = from; ; ) {
+    const code = enterCode(cur);
+    if (code === undefined) break;
+    if (DENIED_CODES.has(code)) denied = cur;
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  if (denied === undefined) return undefined;
+  return denied === p ? deniedWhy(p) : `${p}: ${deniedWhy(denied)}`;
+}
+
+/**
+ * The user cannot read the spec file `p` (`st`: its lstat, undefined when lstat failed with
+ * `code`): an existing file it may not read, or a folder above it it cannot enter.
+ */
+function fileAccessWhy(p: string, st: fs.Stats | undefined, code: string | undefined): string | undefined {
+  if (!st) return code !== undefined && DENIED_CODES.has(code) ? (deniedFolderWhy(p, path.dirname(p)) ?? deniedWhy(p)) : undefined;
+  try {
+    fs.accessSync(p, fs.constants.R_OK);
+    return undefined;
+  } catch (e) {
+    return DENIED_CODES.has(errCode(e) ?? '') ? deniedWhy(p) : undefined;
+  }
+}
+
 /** `p` (canonical `c`) is outside the workspace `base`. */
 function outsideWhy(p: string, c: string, base: string): string {
   return `${p}${c === p ? ' is' : ` resolves to ${c},`} outside the workspace ${base}`;
@@ -187,30 +256,37 @@ function placeRefusal(p: string, unresolved: UnresolvedLink | undefined, base: s
  * also when `file` does not exist yet (and may be created). Refused: a symbolic link at `file`
  * (also one to another document of the folder), anything at `file` that is not a regular file,
  * a symbolic link above it that resolves to nothing or whose target cannot be accessed, a real
- * path outside the workspace.
+ * path outside the workspace; then a file the user cannot read, or one in a folder the user
+ * cannot enter (EACCES or EPERM: {@link deniedWhy}, never taken for a missing file), whatever its
+ * size.
  */
 export function specFileRefusal(file: string, workspaceRoot: string): string | undefined {
   const p = path.resolve(file);
   let st: fs.Stats | undefined;
+  let code: string | undefined;
   try {
     st = fs.lstatSync(p);
-  } catch {
-    // missing (or unreadable): the folder rules decide
+  } catch (e) {
+    // missing, or in a folder that cannot be entered: the folder rules decide
+    code = errCode(e);
   }
   if (st?.isSymbolicLink()) return `${p} is a symbolic link`;
   if (st && !st.isFile()) return `${p} is not a regular file`;
-  return placeRefusal(p, unresolvedLinkAbove(p), workspaceRoot);
+  return placeRefusal(p, unresolvedLinkAbove(p), workspaceRoot) ?? fileAccessWhy(p, st, code);
 }
 
 /**
  * Why kiro-claude itself must not use the spec folder `dir` (or `.kiro/specs`) of the workspace
  * `workspaceRoot`: a symbolic link at it or above it that resolves to nothing or whose target
- * cannot be accessed, or a real path outside the workspace. A folder that is a link resolving
- * inside the workspace may be used.
+ * cannot be accessed, or a real path outside the workspace; then a folder the user cannot enter,
+ * also through a link that points at it, or one under such a folder ({@link deniedWhy}: its
+ * documents could not even be told apart from missing ones). A folder that is a link resolving
+ * inside the workspace may be used. Reading the folder (listing it) is not required: a
+ * search-only folder may be used by name.
  */
 export function specFolderRefusal(dir: string, workspaceRoot: string): string | undefined {
   const p = path.resolve(dir);
-  return placeRefusal(p, unresolvedLinkFrom(p), workspaceRoot);
+  return placeRefusal(p, unresolvedLinkFrom(p), workspaceRoot) ?? deniedFolderWhy(p, p);
 }
 
 /** The path a write tool's input names as written (before toolmap resolved it), else `fallback`. */

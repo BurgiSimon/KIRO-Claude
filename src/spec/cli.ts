@@ -22,11 +22,15 @@
  *
  * Spec files are read and written through spec/docfs.ts (review X1): a document (or
  * `.config.kiro`) that is a symbolic link, not a regular file, behind a link that resolves to
- * nothing or outside the workspace is never read or written. `list` / `status` show such a spec
+ * nothing or outside the workspace, or that the user cannot read (or in a folder it cannot enter)
+ * is never read or written. `list` / `status` show such a spec
  * with the phase `refused` and print why on stderr; `status <name>` marks the document and says
  * why; `view` of it is an error (exit 1); `new`, `run`, `sync`, `analyze` and `approve` refuse
- * with the reason (spec/workflow.ts). A `.kiro/specs` linked out of the workspace is not
- * enumerated: `list` and `status` without a name are an error with the reason (exit 1).
+ * with the reason (spec/workflow.ts). A `.kiro/specs` linked out of the workspace (or dangling,
+ * or into a folder the user cannot enter), or one it cannot enter or read, is not
+ * enumerated: `list` and `status` without a name are an error with the reason (exit 1), and a
+ * named spec not found under it is that error too, not "not found" (r7 #7). Resume hints name
+ * commands this CLI accepts ({@link cliResumeHint}, r7 #8).
  *
  * Ctrl+C during `spec run`: the first press stops scheduling and interrupts the running tasks.
  * The PostTaskExec hooks of a task it interrupted run under the NEXT press, as in the REPL
@@ -59,7 +63,7 @@ import { allHooksFor } from '../config/hooks.js';
 import { loadAgents, selectAgent } from '../config/agents.js';
 import { HookRunner } from '../hooks/runner.js';
 import { SPEC_DOC_FILES, type SpecDocKind, type TaskSelection, type WorkflowType } from './model.js';
-import { formatSpecList, formatSpecRefusals, formatSpecStatus, isValidSpecName, listSpecs, loadSpec, normalizeSpecName, specSummaryJson, specsDirRefused } from './store.js';
+import { formatSpecList, formatSpecRefusals, formatSpecStatus, isValidSpecName, listSpecs, loadSpec, normalizeSpecName, specSummaryJson, specsDirRefused, summarizeSpec } from './store.js';
 import { specRefusalText } from './docfs.js';
 import {
   SpecSessionDriver,
@@ -515,8 +519,33 @@ function cliRuntime(ctx: CliContext, o: CliRuntimeOptions, deps: SpecCliDeps, io
     },
     ...(press ? { nextPressSignal: () => press.signal() } : {}),
     readyHint: (name) => `Spec ready. Run all tasks: ${prog} spec run ${name} · Step through: ${prog} spec run ${name} --next`,
+    resumeHint: (name) => cliResumeHint(ctx, name),
     finish: () => driver.finish('close'),
   };
+}
+
+/**
+ * The spec CLI's resume hint (SpecRuntime.resumeHint, r7 #8): the CLI has no `spec <name>` form,
+ * so it names commands it accepts, by where the spec stands now: `approve` / `revise` for a
+ * document awaiting review, `run <name> --next` once the tasks are approved, `status <name>` for
+ * a spec with a refused file (it says why). A spec whose next step is drafting a document nothing
+ * awaits approval before (an existing folder without its first document) can only be continued
+ * in chat (`new` refuses an existing folder): `/spec <name> in kiro-claude chat`.
+ */
+function cliResumeHint(ctx: CliContext, name: string): string {
+  const prog = `${ctx.progName || 'kiro-claude'} spec`;
+  const s = summarizeSpec(ctx.ws, name);
+  if (!s || s.refused) return `${prog} status ${name}`;
+  if (s.phase === 'execution' || s.phase === 'done') return `${prog} run ${name} --next`;
+  if (s.awaitingApproval) return `${prog} approve ${name} · ${prog} revise ${name} <feedback>`;
+  return `/spec ${name} in ${ctx.progName || 'kiro-claude'} chat`;
+}
+
+/** `error: <why>` for a named spec that is not found: the `.kiro/specs` refusal (r7 #7), else "not found". */
+function specNotFound(ctx: CliContext, name: string): number {
+  const dirWhy = specsDirRefused(ctx.ws);
+  ctx.stderr.write(dirWhy ? `error: ${specRefusalText(dirWhy)}\n` : `error: spec '${name}' not found\n`);
+  return 1;
 }
 
 // ───────────────────────────── commands ─────────────────────────────
@@ -607,10 +636,7 @@ export async function runSpecCommandWith(args: string[], ctx: CliContext, deps: 
           return 0;
         }
         const spec = loadSpec(ctx.ws, pos[0]);
-        if (!spec) {
-          ctx.stderr.write(`error: spec '${pos[0]}' not found\n`);
-          return 1;
-        }
+        if (!spec) return specNotFound(ctx, pos[0]);
         if (format !== 'plain') {
           ctx.stdout.write(
             `${json({
@@ -627,10 +653,7 @@ export async function runSpecCommandWith(args: string[], ctx: CliContext, deps: 
         const name = needName();
         if (!name) return 2;
         const spec = loadSpec(ctx.ws, name);
-        if (!spec) {
-          ctx.stderr.write(`error: spec '${name}' not found\n`);
-          return 1;
-        }
+        if (!spec) return specNotFound(ctx, name);
         let doc = parseDoc(pos[1]);
         if (pos[1] && !doc) {
           ctx.stderr.write(`error: unknown document '${pos[1]}' (requirements, bugfix, design, tasks)\n`);
