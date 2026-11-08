@@ -122,11 +122,20 @@ In chat:
   you had typed. Pressed while the agent works, it takes effect at the next prompt, once however
   often you pressed it; an approval prompt drops it like other keys typed ahead. Hook commands
   keep running while kiro-claude is stopped, but the time it spends stopped (Ctrl+Z, or `kill
-  -STOP` from elsewhere) does not count against their timeouts, and a hook that finished
-  meanwhile counts with its exit status (a blocking preToolUse hook still blocks).
+  -STOP` from elsewhere, however often) does not count against their timeouts, and a hook that
+  finished meanwhile counts with its exit status (a blocking preToolUse hook still blocks).
+  Continued in the background (`bg`, or `kill -CONT` while the shell has the terminal), the chat
+  keeps running but stays off the terminal (no prompt, nothing read) until `fg` (on Linux;
+  elsewhere it stops again until `fg`).
   When kiro-claude is the terminal's first program (`ssh -t host kiro-claude chat`,
   `docker run -it`, `tmux new 'kiro-claude chat'`) there is no shell to return to, and Ctrl+Z does
   nothing.
+* `$EDITOR` (`/editor`, `/reply`, the spec's "Open in $EDITOR") and `!cmd` get the terminal while
+  they run, also when the chat's output is piped (`kiro-claude chat | tee session.log`): what you
+  type, Ctrl+C and Ctrl+Z are theirs. As in Kiro CLI, their output goes where the chat's goes (into
+  that log too). A Ctrl+C for a `!cmd` there also ends the `tee` (`tee -i` ignores it). One that
+  ends after Ctrl+Z and `bg` leaves the chat running in the background, off the terminal, until
+  `fg` (a `kill %1` closes it).
 
 `chat --no-interactive`: the first Ctrl+C interrupts the answer (exit status 130), a second one
 closes the session.
@@ -136,7 +145,9 @@ kiro-claude close every open session first, your chat first (a session still sta
 cancelled): SessionEnd hooks run, the conversation's record is saved and its lock released, so
 `kiro-claude chat --resume` continues that conversation. The close gets at most 2 s; then
 kiro-claude exits with the signal (a shell shows 128 + the signal number, e.g. 143 for SIGTERM)
-and ends any child process still running. A second signal ends it at once, unless it comes
+and ends any child process still running. A chat suspended with Ctrl+Z (or `kill -STOP`) closes
+the same way when you kill it, without `fg`: `kill %1` in its shell sends SIGTERM, then SIGCONT.
+A second signal ends it at once, unless it comes
 within half a second of the first and is the same signal, or the other of SIGHUP and SIGTERM
 (closing a terminal tab can send SIGHUP twice; closing the terminal of a chat stopped with Ctrl+Z
 sends SIGHUP then SIGTERM). A SIGINT (`kill -INT`; Ctrl+C in `chat --no-interactive`, with
@@ -175,7 +186,8 @@ documents in `.kiro/specs/<feature>/`.
   or whose target is behind a folder you cannot enter), is refused the same way. So are a spec
   document you cannot read (whatever its size) and a feature folder or `.kiro/specs` you cannot
   enter, also one a link points at: kiro-claude never takes them for missing ones, so nothing is
-  drafted over them, no phase writes them and no task runs without them (a `bugfix.md` you cannot read still makes the
+  drafted over them, no phase writes them (the write is denied with the reason, in plan mode
+  too) and no task runs without them (a `bugfix.md` you cannot read still makes the
   spec a bugfix spec when `.config.kiro` does not give its type). For these, and for a link
   whose target is
   behind a folder you cannot enter, the reason says `cannot be accessed (permission denied)`. A
@@ -187,10 +199,17 @@ documents in `.kiro/specs/<feature>/`.
   (`approve` / `revise`, `run <name> --next`, `status <name>`), or `/spec <name>` in
   `kiro-claude chat` when only the chat can draft the next document (a spec folder without its
   first document). A Stop at any checkpoint, the `tasks.md` one included, names `approve` /
-  `revise`, so you come back to the review you stopped at; `run <name> --next` is named only
-  outside a checkpoint, for a spec whose tasks you approved. At the checkpoint of a document the
-  model did not write, the hint is the one for where the spec stands (for the first document,
-  `/spec <name>` in `kiro-claude chat`).
+  `revise`, so you come back to the review you stopped at, never a command that runs a task.
+  kiro-claude works out which document is under review from the files alone, so when a document
+  is drafted again next to a `tasks.md` that already has tasks (a `design.md` you removed to
+  have it redrafted, say), the hint names it: `approve <name> --doc <doc>` approves that document
+  and drafts the next one, `revise <name> --doc <doc> <feedback>` revises it (also `/spec approve`
+  / `/spec revise` in chat, and the headless "… is waiting for review" line). Outside a checkpoint
+  (`new` of an existing spec, `run` without `tasks.md`), a spec whose `tasks.md` has tasks gets
+  `run <name> --next`: kiro-claude does not record that you approved `tasks.md`, so if you
+  stopped at its review, go on with `approve <name>` / `revise <name> <feedback>` instead. At the
+  checkpoint of a document the model did not write, the hint is the one for where the spec stands
+  (for the first document, `/spec <name>` in `kiro-claude chat`).
 * Ctrl+C stops a run before its next task and interrupts the running one; the next Ctrl+C kills
   the PostTaskExec hooks of a task it interrupted. In `kiro-claude spec run` that second Ctrl+C
   lets the run print its summary; without such a hook it exits at once.
@@ -282,11 +301,14 @@ What `crew setup` does:
    `npm run build`), a `.venv` with KiroCrew installed by `pip install -e`, and the staged
    frontend. `--full` runs KiroCrew's own `make build` instead, which its pytest suites need;
    `--no-build` skips the build. KiroCrew's code is not modified. Setup refuses a checkout
-   inside crew's own build caches (`cache/npm`, `cache/pip`) or claude-agent-acp bridge
-   (`node/`) under `~/.local/share/kiro-claude/crew/`, where the build and npm would delete
-   it, as well as one in a linked git worktree or, without `--allow-tmp`, under
-   the system temp directory; nor does it build or install the bridge while one of them holds a
-   Kiro Crew checkout (it names it: move it out of there first).
+   inside crew's own build caches (`cache/npm`, `cache/pip`; every build empties them) or the
+   claude-agent-acp bridge's `node/node_modules` (npm keeps only packages there), or at the
+   bridge prefix `node/` itself (npm installs the bridge there), under
+   `~/.local/share/kiro-claude/crew/`; a directory beside `node_modules` in `node/` is fine.
+   It also refuses one in a linked git worktree or, without `--allow-tmp`, under
+   the system temp directory; nor does it build while a cache holds a Kiro Crew checkout, or
+   install the bridge while `node/node_modules` holds one or `node/` is one (it names it: move it
+   out of there first).
 2. Writes a small `kiro-claude` launcher under `~/.local/share/kiro-claude/crew/bin/` with
    absolute paths to Node, kiro-claude and `claude`. It then configures KiroCrew to use it as
    its `kiro-cli` (`KIROCREW_KIRO_BIN`, `agent.acp_backend kiro`, `auto_update false`).
@@ -311,7 +333,8 @@ be freed. See [KiroCrew](docs/ARCHITECTURE.md#kirocrew-persistent-pipeline-on-cl
 `kiro-claude crew uninstall` stops the gateway, restores KiroCrew's previous configuration and
 removes what setup added: the launcher, the identity stub (only if kiro-claude created it),
 `crew.json`, and the run files and logs under `run/` (`crashed.json` included). `--purge` also
-removes the private claude-agent-acp bridge and the build caches, then the crew state directory
+removes the private claude-agent-acp bridge (while `node/` holds nothing else) and the build
+caches, then the crew state directory
 itself when it is empty. It prints what it removed and what it kept (`Purged <dir>` only when the
 directory is gone). Your KiroCrew data and the checkout are kept: a cache or the bridge that
 holds a Kiro Crew checkout stays, and is named as such. `--purge` also works after

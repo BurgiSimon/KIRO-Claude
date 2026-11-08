@@ -118,7 +118,8 @@ export function forbiddenMessage(toolName: string): string {
 /**
  * Spec-phase denial (03 §1.11.3): `Spec phase <name>: only <paths> may be written now`, with the
  * reason in parentheses when the call names a phase document the allowance refused
- * (policy/specwrite.ts: a symbolic link, a folder that leaves the workspace).
+ * (policy/specwrite.ts: a symbolic link, a folder that leaves the workspace) or that the phase
+ * left out of it (`refusedWritePaths`: not a regular file, unreadable; r9 #7).
  */
 function specDenial(phase: { name: string; allowedWritePaths: readonly string[] }, check: SpecWriteCheck | undefined): StaticEval {
   const paths = phase.allowedWritePaths.length ? phase.allowedWritePaths.join(', ') : '(nothing)';
@@ -220,7 +221,7 @@ export interface GateDeps {
   mcpAutoApprove(server: string, claudeTool?: string): string[];
   isIgnored?(p: string): boolean;
   planMode(): boolean;
-  specPhase(): { name: string; allowedWritePaths: string[] } | undefined;
+  specPhase(): { name: string; allowedWritePaths: string[]; refusedWritePaths?: { path: string; why: string }[] } | undefined;
   /** Extra PostToolUse context for a successful call (e.g. fileMatch steering). */
   onPostToolContext?(call: KiroToolCall): string | undefined;
   notify(level: 'info' | 'warn' | 'error', msg: string): void;
@@ -757,12 +758,14 @@ export class Gate {
     const inv = checkInvariants(call, ws, this.deps.isIgnored ? { isIgnored: (p) => this.deps.isIgnored!(p) } : undefined);
     if (inv?.effect === 'deny') return { kind: 'deny', reason: inv.reason, reasons: [inv.reason] };
     const phase = this.deps.specPhase();
-    const spec = phase && call.capability === 'fs_write' && !call.mcp ? checkSpecWrite(call, phase.allowedWritePaths, ws) : undefined;
+    const spec = phase && call.capability === 'fs_write' && !call.mcp ? checkSpecWrite(call, phase.allowedWritePaths, ws, phase.refusedWritePaths) : undefined;
     // plan mode denies every mutating call. The one exception is a spec phase of a plan-mode chat
     // (its phase sessions take the chat's plan mode, SpecSessionDriver): a write of that phase's own
     // documents, every path named and allowed (policy/specwrite.ts), goes on to the spec-phase rule
     // below (T2). A write of a phase document the allowance refuses (a symbolic link, a folder that
-    // leaves the workspace; r5 #3) gets the spec-phase denial with that reason instead
+    // leaves the workspace; r5 #3) or that the phase left out of it (`refusedWritePaths`: not a
+    // regular file, unreadable; r9 #7) gets the spec-phase denial with that reason instead: leaving
+    // plan mode would not let it through
     if (this.deps.planMode() && call.mutating && !spec?.ok) {
       if (phase && spec?.refused) return specDenial(phase, spec);
       return { kind: 'deny', reason: PLAN_MODE_DENY, reasons: [PLAN_MODE_DENY] };

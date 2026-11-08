@@ -163,6 +163,7 @@ test('r7f #2: readline itself never suspends (its SIGTSTP event takes the same p
   await tick();
   const mark = log.length;
   rl.emit('SIGTSTP');
+  await tick(); // r9 #0/#1: the terminal is taken back two event-loop turns after the continue
   const after = since(mark);
   const kill = after.indexOf('kill:0:SIGTSTP');
   assert.ok(kill >= 0 && after.indexOf('raw:true') > kill, JSON.stringify(after));

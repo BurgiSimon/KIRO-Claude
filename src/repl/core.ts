@@ -110,7 +110,7 @@ import { builtinCommands } from './commands/index.js';
 import { PLAN_EXECUTE_PROMPT, PLAN_EXECUTE_QUESTION, looksLikePlan } from './commands/plan.js';
 import { DUPLICATE_SIGNAL_WINDOW_MS, ExitSignals, anySignal } from './exitSignals.js';
 import { openEditor, runShellCommand } from './external.js';
-import { LineReader, appendHistoryFile, historyFilePath, loadHistoryFile, sanitizeUnicodeTags } from './input.js';
+import { LineReader, appendHistoryFile, historyFilePath, loadHistoryFile, sanitizeUnicodeTags, terminalInForeground } from './input.js';
 import { BUSY_MESSAGE, TIPS, approvalQuestion, colorPrompt, exitHint, formatGreeting, resumeHint } from './prompt.js';
 import { CommandRegistry, formatCommandHelp } from './registry.js';
 import { Spinner, TurnRenderer } from './render.js';
@@ -550,10 +550,22 @@ export class Repl implements ReplContext {
     }
   }
 
-  private childIo(): { inherit: boolean; out: (s: string) => void; err: (s: string) => void; cwd: string; env: NodeJS.ProcessEnv } {
-    const inherit = this.terminal && !!this.ctx.stdout.isTTY && this.ctx.stdin === process.stdin;
+  /**
+   * How `$EDITOR` and `!cmd` run (repl/external.ts). They get the terminal (`inherit`: stdin
+   * inherited, the caller suspends the reader around them) whenever the chat reads the keyboard:
+   * terminal mode on the process's own stdin, whatever stdout is. `kiro-claude chat | tee log`
+   * reads raw keys as well; before r9 #2 such a child got stdin /dev/null there (vim hung) while
+   * the reader took its keys as type-ahead, and a Ctrl+C for it only aborted the command signal,
+   * which nothing watches. Their output goes to the process's own stdout and stderr, a pipe
+   * included (Q inherits every stream), or through write() for a stream that is not the
+   * process's. Otherwise (piped input, tests) stdin is closed and the output goes through write().
+   */
+  private childIo(): Parameters<typeof runShellCommand>[1] {
+    const inherit = this.terminal && this.ctx.stdin === process.stdin;
     return {
       inherit,
+      inheritStdout: this.ctx.stdout === process.stdout,
+      inheritStderr: this.ctx.stderr === process.stderr,
       out: (s: string) => this.write(s),
       err: (s: string) => {
         // a `!cmd` still running at a fatal signal: its stderr is dropped like its stdout (write())
@@ -566,26 +578,76 @@ export class Repl implements ReplContext {
     };
   }
 
+  /** ReplContext.openEditor; also the spec checkpoint's "Open in $EDITOR" (r8g). See {@link childIo}. */
   async openEditor(initial: string, opts: { suffix?: string; file?: string; command?: readonly string[] } = {}): Promise<EditorResult> {
     const io = this.childIo();
     if (io.inherit) this.reader.suspend();
     try {
+      if (io.inherit && !(await this.flushedForChild(io))) return { ok: false, error: 'kiro-claude is exiting' };
       return await openEditor(initial, io, opts);
     } finally {
-      if (io.inherit) this.reader.resume();
+      if (io.inherit) await this.handBack();
     }
   }
 
+  /** ReplContext.runBang: `!cmd` through the platform shell (01 §4.3 step 4). See {@link childIo}. */
   async runBang(command: string): Promise<void> {
     const io = this.childIo();
     if (io.inherit) this.reader.suspend();
     try {
+      if (io.inherit && !(await this.flushedForChild(io))) return;
       const r = await runShellCommand(command, io);
       if (r.error) this.write(`\n${c.red(`Failed to execute command: ${r.error}`)}\n\n`);
       else if (r.code !== 0) this.write(`${c.yellow(`Self exited with status: ${exitStatusText(r.code, r.signal)}`)}\n`);
     } finally {
-      if (io.inherit) this.reader.resume();
+      if (io.inherit) await this.handBack();
     }
+  }
+
+  /**
+   * Before a child that gets the terminal ({@link childIo}) writes to kiro-claude's own stdout and
+   * stderr itself, what the chat wrote there so far (the end of an answer, the prompt, the
+   * reader's bracketed-paste switch from suspend()) is handed to the OS. Writes to a pipe are
+   * asynchronous: Node queues what the pipe does not take at once (a consumer that lags, `| tee
+   * log` over a slow link), and the child's output overtook it (r9 #2 verification). On a
+   * terminal the writes are synchronous and nothing waits. Like a blocking write in Q this waits
+   * as long as the consumer takes; false when a fatal signal came meanwhile (no child is started).
+   */
+  private async flushedForChild(io: Parameters<typeof runShellCommand>[1]): Promise<boolean> {
+    for (const [own, s] of [
+      [io.inheritStdout, this.ctx.stdout],
+      [io.inheritStderr, this.ctx.stderr],
+    ] as const) {
+      const w = s as { writableLength?: number; writable?: boolean; destroyed?: boolean };
+      if (own === false || !w.writableLength || w.destroyed || w.writable === false) continue;
+      await new Promise<void>((resolve) => {
+        try {
+          s.write('', () => resolve());
+        } catch {
+          resolve();
+        }
+      });
+    }
+    return !this.silent;
+  }
+
+  /**
+   * After a child that had the terminal ({@link childIo}) the reader takes it back (raw mode,
+   * bracketed paste: LineReader.resume) only in the foreground. The child can end while
+   * kiro-claude runs in the background: a Ctrl+Z in it stops the whole job, `bg` continues it
+   * there. That tcsetattr from the background stopped the chat again at once (SIGTTOU), and
+   * `kill %1` (SIGTERM, then SIGCONT) then never closed it, as at the prompt (r9 #1; r9 #2
+   * verification: `kiro-claude chat | tee log` hands the terminal over too since #2). So, like
+   * the reader after a stop, the chat runs on off the terminal and asks every 250 ms until it is
+   * in the foreground again (`fg`; bash sends no SIGCONT to a job it knows to be running). A
+   * fatal signal meanwhile (`kill %1`) leaves the terminal alone: its close runs at once.
+   */
+  private async handBack(): Promise<void> {
+    while (!terminalInForeground(this.ctx.stdin)) {
+      if (this.silent) return;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    this.reader.resume();
   }
 
   // ───────────────────────────── SessionUI ─────────────────────────────

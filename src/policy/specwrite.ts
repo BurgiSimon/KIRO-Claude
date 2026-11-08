@@ -43,7 +43,10 @@
  *
  * A refused subject that names an allowed document (or lies under an allowed folder, or matches
  * an allowed pattern) carries a `refused` explanation; the gate appends it to its spec-phase
- * denial, so the model and the user see why the phase cannot write its own document.
+ * denial, so the model and the user see why the phase cannot write its own document. So does a
+ * subject that names a document the phase left out of the allowance (SpecPhaseRestriction
+ * `refusedWritePaths`: a document that is not a regular file or that the user cannot read, which
+ * the rules above would allow; r9 #7), with the reason the phase recorded, in plan mode too.
  *
  * kiro-claude's OWN reads and writes of spec files (review X1: listing, status, view, the task
  * context, the tasks.md repair, box updates, `.config.kiro`) follow the same subject rules:
@@ -297,17 +300,40 @@ function rawPathOf(call: Pick<KiroToolCall, 'claudeName' | 'input'>, fallback: s
 
 type EntryVerdict = { kind: 'match' } | { kind: 'refused'; why: string } | { kind: 'none' };
 
+/** A phase document left out of the allowance, with the reason (SpecPhaseRestriction `refusedWritePaths`). */
+export interface SpecRefusedPath {
+  path: string;
+  why: string;
+}
+
+/**
+ * The reason of the first `refused` document that subject `lexS` (canonical `c`) names: that
+ * path, or a path inside it (a document that is a directory), as written or canonical.
+ */
+function leftOutWhy(lexS: string, c: string, refused: readonly SpecRefusedPath[]): string | undefined {
+  for (const r of refused) {
+    const p = path.resolve(r.path);
+    if (isSubpath(lexS, p) || isSubpath(c, realpathDeep(p))) return r.why;
+  }
+  return undefined;
+}
+
 /**
  * Whether every subject of the `fs_write` call `call` is one of `allowed` (see module doc).
  * `ws` supplies the workspace root (relative entries and the anchor), the env (`~`; `$VAR` in
- * pattern entries) and the home directory.
+ * pattern entries) and the home directory. `refused`: phase documents the phase left out of
+ * `allowed` (spec/workflow.restrictionFor: not a regular file, unreadable), each with its reason:
+ * a subject that names one (as written or canonical, also a path inside it) is refused with that
+ * reason, whatever an entry says (r9 #7: the gate's spec-phase denial then names it, in plan mode
+ * too). It only ever refuses.
  */
 export function checkSpecWrite(
   call: Pick<KiroToolCall, 'claudeName' | 'input' | 'subjects' | 'cwd'>,
   allowed: readonly string[],
   ws: Pick<WorkspaceContext, 'workspaceRoot' | 'cwd' | 'env' | 'home'>,
+  refused: readonly SpecRefusedPath[] = [],
 ): SpecWriteCheck {
-  if (call.subjects.length === 0 || allowed.length === 0) return { ok: false };
+  if (call.subjects.length === 0 || (allowed.length === 0 && refused.length === 0)) return { ok: false };
   const base = ws.workspaceRoot || ws.cwd;
   const cwd = call.cwd || ws.cwd;
   const anchor = realpathDeep(base);
@@ -328,6 +354,8 @@ export function checkSpecWrite(
       if (dd) why = `${raw} has '..' after the symbolic link ${dd}`;
     }
     if (!why && !isSubpath(c, anchor)) why = outsideWhy(lexS, c, base);
+    const left = leftOutWhy(lexS, c, refused);
+    if (left !== undefined) return { ok: false, refused: why ?? left };
     let matched = false;
     let note: string | undefined;
     for (const e of allowed) {

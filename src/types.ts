@@ -493,7 +493,9 @@ export interface SessionRecord {
   pendingContext?: string[];
   /**
    * This record's conversation is a fork (a tangent, rewind, transferred copy, spec-phase session
-   * or continuation, a `/chat load` import without a transcript) that has not completed a turn of
+   * or continuation, a `/chat load` import without a transcript whose Claude session or pending
+   * fork's source still has one; an import whose Claude sessions are all gone starts a new
+   * conversation with `pendingHistory` instead, no fork) that has not completed a turn of
    * its own yet, and this is where it forks from (`--resume <from> --fork-session
    * [--resume-session-at <at>]`). A record kiro-claude makes as a fork holds it from its first
    * write, before its Claude Code is up (a crash while it starts still forks again, r7 #1, r8 #7).
@@ -678,8 +680,13 @@ export interface KiroSessionOptions {
   resume?: { sessionId: string } | { latest: true };
   /** Fork from a Claude session (tangent / rewind / chat load). */
   fork?: { fromClaudeSessionId: string; at?: string; kind: SessionRecord['forkKind']; parentId?: string };
-  /** Spec phase write restriction (00 §5.1 specPhase). */
-  specPhase?: { name: string; allowedWritePaths: string[] };
+  /**
+   * Spec phase write restriction (00 §5.1 specPhase). `refusedWritePaths`: phase documents left
+   * out of `allowedWritePaths` because kiro-claude refuses them (spec/workflow.restrictionFor: not
+   * a regular file, unreadable), each with the reason; a write that names one gets the spec-phase
+   * denial with that reason, in plan mode too (policy/gate.ts, r9 #7). It never allows anything.
+   */
+  specPhase?: { name: string; allowedWritePaths: string[]; refusedWritePaths?: { path: string; why: string }[] };
   /** Additional `--add-dir` directories. */
   additionalDirectories?: string[];
   /**

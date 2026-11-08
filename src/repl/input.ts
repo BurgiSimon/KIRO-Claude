@@ -9,10 +9,13 @@
  *    compatibility):
  *      - `Ctrl+J` (LF) and `Alt+Enter` insert a newline: the current physical line is accepted
  *        as a non-final line of a multi-line input (01 §4.5 P1);
- *      - bracketed paste (`ESC[200~ … ESC[201~`) keeps pasted newlines inside one input; it is
- *        turned on again whenever the terminal is taken back: after a stop, and after a child
- *        (`!cmd`, `$EDITOR`), which may have turned it off (vim at exit; bash before `fg`
- *        continues a job stopped while the child owned the terminal; r8 #2);
+ *      - bracketed paste (`ESC[200~ … ESC[201~`) keeps pasted newlines inside one input. It is
+ *        off whenever the reader hands the terminal over: to the shell at Ctrl+Z, and to a child
+ *        (`!cmd`, `$EDITOR`), which gets plain pastes, as from Q's rustyline and from bash (r9 #8);
+ *        and on again whenever the terminal is taken back: after a stop, and after a child, which
+ *        may have toggled it itself (vim at exit; bash before `fg` continues a job stopped while
+ *        the child owned the terminal; r8 #2). The switches are written to the reader's own
+ *        output only, in terminal mode, and none while muted;
  *      - `Ctrl+C` ⇒ `interrupt` (resolves the active read, or emits `'interrupt'` while no
  *        read is active, i.e. while a turn runs); ignored while a child owns the terminal
  *        (suspended: the SIGINT is the child's);
@@ -38,7 +41,22 @@
  *        runningTimeout, r8 #0/#1). A Ctrl+Z inside a paste, read while a child owns the
  *        terminal, or while muted is dropped. After a stop from elsewhere
  *        (`kill -TSTP` / `kill -STOP`, then `fg`: the shell left the terminal in cooked mode) the
- *        terminal is taken back the same way at SIGCONT, the prompt drawn on a fresh line;
+ *        terminal is taken back the same way at SIGCONT, the prompt drawn on a fresh line.
+ *        From the stop on the input is paused and nothing is drawn until the terminal is taken
+ *        back, which happens two event-loop turns after the continue, never inside the stop's
+ *        callback or the SIGCONT dispatch, and only in the foreground (r9 #0/#1: a mode change
+ *        from the background stops kiro-claude again at once, SIGTTOU, before the other SIGCONT
+ *        listeners and the signals that came with the continue run). So `kill %1` of a stopped
+ *        chat (bash: SIGTERM, then SIGCONT) or a closed terminal (SIGHUP) closes it at once,
+ *        muted, with the terminal left as the shell has it; and continued in the background
+ *        (`bg`, `kill -CONT` while a shell holds the terminal) the chat runs on (a turn's output
+ *        still appears) but stays off the terminal (no prompt, no mode change, no read) until
+ *        `fg`: its SIGCONT, or the next look at the foreground (every 250 ms while away: bash's
+ *        `fg` of a job it knows to be running sends none). The foreground test is Linux's
+ *        /proc/self/stat ({@link terminalInForeground}); elsewhere (DECISION, no portable
+ *        tcgetpgrp without a native module) it takes the foreground: after `bg` the chat stops
+ *        again (SIGTTOU) at the retake until `fg`, as before, while the deferral still lets a
+ *        fatal signal win;
  *      - while no read is active, other keys are kept as type-ahead and replayed into the next
  *        read (rustyline left them in the TTY buffer, so Classic behaves the same); reads with
  *        `discardTypeahead` (approval prompts) drop them, so text typed while a response
@@ -78,6 +96,7 @@ import { EventEmitter } from 'node:events';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
+import * as tty from 'node:tty';
 import type { WorkspaceContext } from '../types.js';
 import { isSafeSessionId } from '../session/store.js';
 
@@ -124,6 +143,12 @@ export interface LineReaderOptions {
    * get their lines; terminal-mode keys are dropped.
    */
   muted?: () => boolean;
+  /**
+   * Terminal mode: whether kiro-claude is in the terminal's foreground process group, asked before
+   * the terminal is taken back after a stop (module doc). Default {@link terminalInForeground} on
+   * the input; tests pass their own.
+   */
+  foreground?: () => boolean;
 }
 
 interface PendingRead {
@@ -174,9 +199,49 @@ const STOP_SEEN_MS = 50;
  * the event loop after the stop was handled synchronously): nothing more to do.
  */
 const OWN_CONT_MS = 250;
+/**
+ * Continued in the background after a stop, the reader asks this often whether kiro-claude is in
+ * the foreground again ({@link LineReader.retakeNow}: `fg` of a running job sends no SIGCONT).
+ */
+const AWAY_POLL_MS = 250;
 
 /** Ctrl+Z (readline's key for \x1a). */
 const isCtrlZ = (k: Key): boolean => k.ctrl === true && !k.shift && k.name === 'z';
+
+/** Linux's `/dev/tty` (character device 5:0, as fstat's `rdev` gives it): the controlling terminal. */
+const DEV_TTY_RDEV = 5 << 8;
+
+/**
+ * Whether kiro-claude's process group is the foreground process group of the terminal `input`
+ * reads, i.e. whether changing that terminal's mode (tcsetattr) or reading it would NOT stop
+ * kiro-claude (SIGTTOU / SIGTTIN, as a background job). Linux: /proc/self/stat, `pgrp` against
+ * `tpgid` of the controlling terminal, when the input is that terminal (`tty_nr` = its device, or
+ * `/dev/tty`, which is it under another device number: `kiro-claude chat < /dev/tty`; r9
+ * verification: taken for another terminal, it stopped the chat again in the background).
+ * True whenever that cannot stop kiro-claude or cannot be told: an input that is no terminal
+ * file descriptor (tests' fakes), a terminal that is not the controlling one (no job control
+ * applies to it), no controlling terminal or no foreground group, and on other systems (no
+ * /proc: DECISION, the module doc says what that leaves).
+ */
+export function terminalInForeground(input: unknown): boolean {
+  if (process.platform !== 'linux') return true;
+  const fd = (input as { fd?: unknown } | undefined)?.fd;
+  if (typeof fd !== 'number' || !tty.isatty(fd)) return true;
+  try {
+    const stat = fs.readFileSync('/proc/self/stat', 'utf8');
+    // after the command name: state ppid pgrp session tty_nr tpgid …
+    const f = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    const pgrp = Number(f[2]);
+    const ttyNr = Number(f[4]);
+    const tpgid = Number(f[5]);
+    if (!(ttyNr > 0) || !(tpgid > 0)) return true;
+    const rdev = fs.fstatSync(fd).rdev;
+    if (rdev !== ttyNr && rdev !== DEV_TTY_RDEV) return true;
+    return pgrp === tpgid;
+  } catch {
+    return true;
+  }
+}
 
 /** See module doc. Events: `'interrupt'` (Ctrl+C with no active read), `'shift-tab'`. */
 export class LineReader extends EventEmitter {
@@ -203,12 +268,30 @@ export class LineReader extends EventEmitter {
   private lastReturnAt = 0;
   /** When the terminal was last taken back after a stop ({@link retake}); see OWN_CONT_MS. */
   private retakenAt = -Infinity;
+  /**
+   * Terminal mode, from a stop until the terminal is taken back ({@link retake}): from
+   * {@link jobStop}'s SIGTSTP or the SIGCONT after a stop from elsewhere, for as long as
+   * kiro-claude runs in the background (`bg`, `kill -CONT`) or a fatal signal closes it. The input
+   * is paused meanwhile (a read in the background stops kiro-claude, SIGTTIN), nothing is drawn
+   * and the terminal's mode is not touched (SIGTTOU) (r9 #0/#1).
+   */
+  private away = false;
+  /** A {@link retake} is scheduled ({@link scheduleRetake}); `freshLine` for its redraw. */
+  private retakePending: { freshLine: boolean } | undefined;
+  /** Away in the background: the next look at the foreground ({@link retakeNow}). */
+  private awayPoll: NodeJS.Timeout | undefined;
+  /**
+   * A stop from elsewhere: the shell put the terminal in its own mode behind libuv's back, which
+   * still believes it raw, so {@link retake} turns raw mode off first (libuv applies only changes).
+   */
+  private modeLost = false;
   private suspended = false;
   private typeahead: [string | undefined, Key][] = [];
   private readlineAddedHistory = false;
   private ttyWrite: ((s: string | undefined, key: Key | undefined) => void) | undefined;
   private readonly onHistory: ((entry: string) => void) | undefined;
   private readonly muted: () => boolean;
+  private readonly foreground: () => boolean;
   private readonly historySize: number;
   private readonly fallbackHistory: string[] = [];
   /** Terminal mode: removes the guarded stand-ins of readline's 'resize' listeners ({@link guardResize}). */
@@ -221,6 +304,7 @@ export class LineReader extends EventEmitter {
     this.output = opts.output;
     this.onHistory = opts.onHistory;
     this.muted = opts.muted ?? (() => false);
+    this.foreground = opts.foreground ?? (() => terminalInForeground(opts.input));
     this.historySize = opts.historySize ?? DEFAULT_HISTORY_SIZE;
     if (this.terminal) {
       const ifOpts: readline.ReadLineOptions = {
@@ -345,11 +429,14 @@ export class LineReader extends EventEmitter {
     });
   }
 
-  /** Feed keys typed while no read was active into the read that just started. */
+  /**
+   * Feed keys typed while no read was active into the read that just started. A replayed Ctrl+Z
+   * stops kiro-claude: the rest is replayed once the terminal is taken back ({@link retake}).
+   */
   private replayTypeahead(): void {
     const write = this.ttyWrite;
     if (!write) return;
-    while (this.typeahead.length > 0 && this.reading && !this.suspended) {
+    while (this.typeahead.length > 0 && this.reading && !this.suspended && !this.away) {
       const [s, key] = this.typeahead.shift()!;
       write(s, key);
     }
@@ -411,7 +498,8 @@ export class LineReader extends EventEmitter {
   private showPrompt(p: PendingRead): void {
     if (this.closed || this.muted()) return;
     if (this.terminal) {
-      if (this.suspended) return;
+      // a child owns the terminal, or it is not taken back yet after a stop (drawn then)
+      if (this.suspended || this.away) return;
       this.rl.setPrompt(p.prompt);
       this.rl.prompt();
     } else if (p.prompt !== '') {
@@ -424,7 +512,7 @@ export class LineReader extends EventEmitter {
     const t = this.top();
     if (!t) return;
     t.prompt = prompt;
-    if (this.terminal && !this.suspended && !this.muted()) {
+    if (this.terminal && !this.suspended && !this.away && !this.muted()) {
       this.rl.setPrompt(prompt);
       this.rl.prompt(true);
     }
@@ -434,7 +522,7 @@ export class LineReader extends EventEmitter {
   printAbove(text: string): void {
     if (this.muted()) return;
     const t = this.top();
-    if (!t || !this.terminal || this.suspended) {
+    if (!t || !this.terminal || this.suspended || this.away) {
       // line mode: the prompt is already on the current line; end it, then show it again
       const reprompt = t && !this.terminal && t.prompt !== '';
       this.output.write(reprompt ? `\n${text}${t.prompt}` : text);
@@ -526,7 +614,7 @@ export class LineReader extends EventEmitter {
       if (before.has(l)) continue;
       out.removeListener('resize', l);
       const guarded = (...args: unknown[]): void => {
-        if (this.closed || this.suspended || this.muted() || !this.top()) return;
+        if (this.closed || this.suspended || this.away || this.muted() || !this.top()) return;
         l.apply(out, args);
       };
       out.on('resize', guarded);
@@ -649,10 +737,12 @@ export class LineReader extends EventEmitter {
    * while kiro-claude is stopped, and the stop does not count against their timeouts
    * (util/process.ts runningTimeout; one that exited meanwhile keeps its exit status, r8 #0/#1).
    * Any other Ctrl+Z still typed ahead is dropped (one press, one stop: r8 #4). `hungUp` is not
-   * touched: only a failing input (the terminal went away meanwhile) ends it.
+   * touched: only a failing input (the terminal went away meanwhile) ends it. The terminal is
+   * taken back later, never here ({@link scheduleRetake}): what came with the continue (a SIGTERM
+   * from `kill %1`, a hangup) is handled first, and in the background (`bg`) it is left alone.
    */
   private jobStop(): void {
-    if (process.platform === 'win32' || this.closed || this.ended || this.suspended || this.muted()) return;
+    if (process.platform === 'win32' || this.closed || this.ended || this.suspended || this.away || this.muted()) return;
     const inp = this.input as NodeJS.ReadStream;
     const t = this.top();
     if (!t) return;
@@ -665,6 +755,11 @@ export class LineReader extends EventEmitter {
       // ignore
     }
     if (this.ended) return; // a hung-up terminal: setRawMode failed (EIO), the input ended
+    // not ours until it is taken back: nothing read (in the background a read stops kiro-claude
+    // again, SIGTTIN), nothing drawn
+    this.away = true;
+    this.modeLost = false;
+    this.rl.pause();
     const t0 = performance.now();
     try {
       // returns once the group continues (fg, bg), or at once when the stop is discarded
@@ -676,52 +771,129 @@ export class LineReader extends EventEmitter {
     this.typeahead = this.typeahead.filter(([, q]) => !isCtrlZ(q));
     // after a real stop the shell's lines are below the input and the cursor is on a fresh line:
     // the prompt is drawn there; after a discarded one the input is redrawn in place
-    this.retake(t, performance.now() - t0 >= STOP_SEEN_MS);
+    this.scheduleRetake(performance.now() - t0 >= STOP_SEEN_MS);
   }
 
   /**
    * SIGCONT ({@link LineReader.onSigcont}): kiro-claude continues after a stop it did not make
-   * itself (`kill -TSTP` / `kill -STOP`, then `fg`). The shell has put the terminal back in its
-   * own (cooked) mode, where Enter would be a soft newline and Ctrl+D an end of input: it is
-   * taken back as after {@link jobStop}, the active read's prompt drawn on the shell's fresh line.
-   * Not for the SIGCONT of a stop that {@link retake} has just handled, while a child owns the
-   * terminal, while muted, or once the input ended.
+   * itself (`kill -TSTP` / `kill -STOP`, then `fg`), or in the background after any stop (`bg`,
+   * `kill -CONT`), or is brought back to the foreground after that (`fg`). The shell has put the
+   * terminal in its own (cooked) mode, where Enter would be a soft newline and Ctrl+D an end of
+   * input: it is taken back as after {@link jobStop} ({@link scheduleRetake}), the active read's
+   * prompt drawn on the shell's fresh line. Nothing of the terminal is touched here, inside the
+   * SIGCONT dispatch (r9 #0/#1). Not for the SIGCONT of a stop whose retake is scheduled or has
+   * just run, while a child owns the terminal, or once the input ended; while muted (a fatal
+   * signal closes kiro-claude) the input is only paused.
    */
   private continued(): void {
-    if (this.closed || this.ended || this.suspended || this.muted()) return;
-    if (performance.now() - this.retakenAt < OWN_CONT_MS) return;
-    const inp = this.input as NodeJS.ReadStream;
-    try {
-      // libuv applies a mode only when it changes: off first, then on again in retake
-      if (typeof inp.setRawMode === 'function') inp.setRawMode(false);
-    } catch {
-      // ignore
+    if (this.closed || this.ended || this.suspended) return;
+    if (this.muted()) {
+      // nothing more is read: in the background a read would stop the close (SIGTTIN)
+      this.rl.pause();
+      return;
     }
-    if (this.ended) return; // a hung-up terminal (EIO)
-    this.retake(this.top(), true);
+    if (this.retakePending) return;
+    if (!this.away && performance.now() - this.retakenAt < OWN_CONT_MS) return;
+    if (!this.away) {
+      this.away = true;
+      this.modeLost = true;
+      this.rl.pause();
+    }
+    this.scheduleRetake(true);
   }
 
   /**
-   * After a stop: raw mode back on, the input resumed, bracketed paste on again (a shell turns it
-   * off before it continues a job, bash does) and the active read `t` drawn again, on a fresh line
-   * (`freshLine`: the shell printed below the input) or in place.
+   * Take the terminal back after a stop ({@link retakeNow}) two event-loop turns from now, never
+   * inside the stop's own callback or the SIGCONT dispatch: a terminal mode change from the
+   * background stops kiro-claude again at once (SIGTTOU), before the other SIGCONT listeners and
+   * the signals that came with the continue had run (r9 #0/#1). The first turn's check phase runs
+   * before the poll phase that dispatches those signals (`kill %1`: SIGTERM, then SIGCONT; a
+   * closed terminal: SIGHUP), the second after it.
+   */
+  private scheduleRetake(freshLine: boolean): void {
+    const p = this.retakePending;
+    if (p) {
+      p.freshLine ||= freshLine;
+      return;
+    }
+    const pending = { freshLine };
+    this.retakePending = pending;
+    setImmediate(() =>
+      setImmediate(() => {
+        if (this.retakePending !== pending) return;
+        this.retakePending = undefined;
+        this.retakeNow(pending.freshLine);
+      }),
+    );
+  }
+
+  /**
+   * The scheduled retake: nothing while muted (a fatal signal's close runs; the terminal stays as
+   * the shell left it, nothing is drawn: r9 #1) nor in the background (`bg`, `kill -CONT` while a
+   * shell holds the terminal: the chat runs on, off the terminal); else {@link retake}. In the
+   * background the foreground is asked again every {@link AWAY_POLL_MS}: `fg` of a job a shell
+   * knows to be running (bash, after `bg` or a `kill -CONT` it saw) gives it the terminal without
+   * a SIGCONT. A SIGCONT comes back here at once ({@link continued}).
+   */
+  private retakeNow(freshLine: boolean): void {
+    this.stopAwayPoll();
+    if (this.closed || this.ended || !this.away || this.muted()) return;
+    if (this.suspended) {
+      // a child owns the terminal: resume() takes it back
+      this.away = false;
+      return;
+    }
+    if (this.foreground()) {
+      this.retake(this.top(), freshLine);
+      return;
+    }
+    this.awayPoll = setTimeout(() => {
+      this.awayPoll = undefined;
+      this.scheduleRetake(true);
+    }, AWAY_POLL_MS);
+  }
+
+  private stopAwayPoll(): void {
+    if (this.awayPoll) clearTimeout(this.awayPoll);
+    this.awayPoll = undefined;
+  }
+
+  /**
+   * After a stop, in the foreground: raw mode back on, the input resumed, bracketed paste on again
+   * (a shell turns it off before it continues a job, bash does), the active read `t` drawn again,
+   * on a fresh line (`freshLine`: the shell printed below the input) or in place, and the keys
+   * still typed ahead after a replayed Ctrl+Z replayed into it.
    */
   private retake(t: PendingRead | undefined, freshLine: boolean): void {
     const inp = this.input as NodeJS.ReadStream;
+    if (this.modeLost) {
+      this.modeLost = false;
+      try {
+        // libuv applies a mode only when it changes: off first, then on again below
+        if (typeof inp.setRawMode === 'function') inp.setRawMode(false);
+      } catch {
+        // ignore
+      }
+      if (this.ended) return; // a hung-up terminal (EIO)
+    }
     try {
-      // in the background (`bg`) this stops again (SIGTTOU) until `fg`
       if (typeof inp.setRawMode === 'function') inp.setRawMode(true);
     } catch {
       // ignore
     }
     this.retakenAt = performance.now();
+    this.away = false;
     if (this.closed || this.ended) return;
     this.rl.resume();
     if (this.muted()) return;
     this.output.write('\u001b[?2004h');
-    if (!t || t.done) return;
-    if (freshLine) (this.rl as unknown as { prevRows?: number }).prevRows = 0;
-    this.rl.prompt(true);
+    if (t && !t.done) {
+      if (freshLine) (this.rl as unknown as { prevRows?: number }).prevRows = 0;
+      // (a read that started while away has not had its prompt set: showPrompt drew nothing)
+      this.rl.setPrompt(t.prompt);
+      this.rl.prompt(true);
+    }
+    this.replayTypeahead();
   }
 
   /** Put the terminal's cursor after the active read's input (readline's own cursor stays). */
@@ -771,12 +943,19 @@ export class LineReader extends EventEmitter {
     return [...(this.rlHistory() ?? this.fallbackHistory)];
   }
 
-  /** Give the terminal to a child process (`$EDITOR`, `!cmd`). */
+  /**
+   * Give the terminal to a child process (`$EDITOR`, `!cmd`): the input paused, bracketed paste
+   * off (r9 #8: the terminal would wrap a paste into the child in ESC[200~ … ESC[201~, which a
+   * cooked-mode program such as `cat` or `read` takes as input; Q's rustyline and bash turn it off
+   * too whenever they leave raw mode) and raw mode off. The bracketed-paste switch goes where the
+   * reader turned it on, its own output (terminal mode only), and not while muted or closed.
+   */
   suspend(): void {
     if (this.suspended) return;
     this.suspended = true;
     if (!this.terminal) return;
     this.rl.pause();
+    if (!this.closed && !this.ended && !this.muted()) this.output.write('\u001b[?2004l');
     const inp = this.input as NodeJS.ReadStream;
     try {
       if (typeof inp.setRawMode === 'function') inp.setRawMode(false);
@@ -787,9 +966,10 @@ export class LineReader extends EventEmitter {
 
   /**
    * Take the terminal back from the child: raw mode, the input resumed, and bracketed paste on
-   * again, as after a stop ({@link retake}): the child may have turned it off (vim at exit; bash
-   * before it continues a job stopped with Ctrl+Z while the child owned the terminal, whose
-   * SIGCONT {@link continued} leaves to the child), and a paste would then submit line by line (r8 #2).
+   * again, as after a stop ({@link retake}): {@link suspend} turned it off for the child, which
+   * may also have toggled it itself (vim at exit; bash before it continues a job stopped with
+   * Ctrl+Z while the child owned the terminal, whose SIGCONT {@link continued} leaves to the
+   * child), and a paste would then submit line by line (r8 #2).
    */
   resume(): void {
     if (!this.suspended) return;
@@ -807,6 +987,7 @@ export class LineReader extends EventEmitter {
 
   private onClose(): void {
     this.ended = true;
+    this.stopAwayPoll();
     // every pending read gets EOF (top first)
     for (const p of [...this.stack].reverse()) this.finish(p, { kind: 'eof' });
   }
@@ -814,6 +995,7 @@ export class LineReader extends EventEmitter {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.stopAwayPoll();
     if (this.terminal) this.output.write('\u001b[?2004l');
     this.rl.close();
   }

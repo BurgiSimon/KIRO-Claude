@@ -13,7 +13,8 @@
  *
  * Now the allowance leaves out every phase document that exists and is refused for a reason the
  * gate does not see itself (a link at it keeps its place: the gate refuses it with that reason,
- * r5 #3), so the write is denied ("only (nothing) may be written now"). Through the real gate:
+ * r5 #3), so the write is denied ("only (nothing) may be written now", since r9 #7 with the
+ * reason in parentheses). Through the real gate:
  * the headless spec CLI over test/fixtures/fake-claude.mjs (it answers "File created
  * successfully" only for a Write the gate allowed); the unreadable cases run as uid 65534 through
  * setpriv when the tests run as root (else as the user, mode 0200).
@@ -99,7 +100,7 @@ async function headless(w: Ws, args: string[], script: unknown): Promise<{ code:
   return { code, out: out.data, err: err.data };
 }
 
-const NOTHING = /Spec phase (\w+): only \(nothing\) may be written now$/;
+const NOTHING = /Spec phase (\w+): only \(nothing\) may be written now \(.+ (is not a regular file|cannot be accessed \(permission denied\))\)$/;
 
 test('a bugfix.md that is a directory (no .config.kiro: a bugfix spec, r8 #9): spec revise writes neither it nor into it', { timeout: 60_000 }, async () => {
   const w = ws();
@@ -122,8 +123,8 @@ test('a design.md that is a directory (feature spec): spec revise of design.md w
   fs.mkdirSync(doc);
   const r = await headless(w, ['revise', 'feat', 'make', 'it', 'shorter'], writes([doc, path.join(doc, 'inner.md')]));
   const all = `(exit ${r.code})\n${r.out}\n${r.err}`;
-  assert.match(result(r.out, 0), /Spec phase design: only \(nothing\) may be written now$/, all);
-  assert.match(result(r.out, 1), /Spec phase design: only \(nothing\) may be written now$/, all);
+  assert.match(result(r.out, 0), /Spec phase design: only \(nothing\) may be written now \(.*design\.md is not a regular file\)$/, all);
+  assert.match(result(r.out, 1), /Spec phase design: only \(nothing\) may be written now \(.*design\.md is not a regular file\)$/, all);
   assert.doesNotMatch(r.out, /File created successfully/, all);
 });
 
@@ -136,7 +137,7 @@ test('design-first: the revision of requirements.md may write it, never into a d
   const r = await headless(w, ['revise', 'feat', 'add', 'a', 'criterion'], writes([req, path.join(design, 'inner.md')]));
   const all = `(exit ${r.code})\n${r.out}\n${r.err}`;
   assert.match(result(r.out, 0), /File created successfully at: .*requirements\.md/, all);
-  assert.equal(result(r.out, 1).match(/Spec phase requirements: only (\S+) may be written now$/)?.[1], req, all);
+  assert.equal(result(r.out, 1).match(/Spec phase requirements: only (\S+) may be written now \(.*design\.md is not a regular file\)$/)?.[1], req, all);
 });
 
 test('control: a symbolic link at the document keeps the gate\'s own reason (r5 #3)', { timeout: 60_000 }, async () => {

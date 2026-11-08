@@ -17,10 +17,13 @@
  * $KCDIR/.venv/bin/python -m kiro_crew.frontend stage $KCDIR
  * ```
  * `--full`: `make -C $KCDIR build PY=$PY` (needed for KiroCrew's pytest suites).
- * Neither starts in a `$KCDIR` that is or is inside those caches or `$CS/node` ({@link crewDirHolding}),
- * nor while a cache holds a Kiro Crew checkout ({@link crewDirCheckout}): both caches are emptied after it.
+ * Neither starts in a `$KCDIR` that is or is inside those caches or `$CS/node/node_modules`, or
+ * that is `$CS/node` itself ({@link crewDirHolding}), nor while a cache holds a Kiro Crew checkout
+ * ({@link crewDirCheckout}): both caches are emptied after it.
  * Members: `npm i --prefix $CS/node @agentclientprotocol/claude-agent-acp@0.101.0 --omit=optional --no-audit --no-fund`
- * (not while `$CS/node` holds a Kiro Crew checkout, which npm would remove).
+ * (not while `$CS/node/node_modules` holds a Kiro Crew checkout, which npm would remove, nor while
+ * `$CS/node` itself is one, which npm would write into; npm leaves a directory beside node_modules
+ * alone, so a checkout at `$CS/node/KiroCrew` is allowed).
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -220,28 +223,47 @@ async function runStep(
   return cmd;
 }
 
-/** One of crew's own directories under `$CS` whose contents crew deletes. */
+/** One of crew's own directories under `$CS` whose contents crew deletes or writes. */
 export interface CrewOwnedDir {
   path: string;
+  /**
+   * Set for the bridge prefix `$CS/node`: only `path` itself and these entries of it (with what
+   * is in them) are crew's, not the rest of what is in it.
+   */
+  only?: readonly string[];
   /** e.g. `crew's pip build cache` */
   what: string;
-  /** Why a checkout there is lost. */
+  /** Why a checkout there is lost or written into. */
   why: string;
-  /** What deletes a checkout left there, e.g. `which the build empties` ({@link crewDirCheckout}). */
+  /** What deletes or writes into a checkout left there, e.g. `which the build empties` ({@link crewDirCheckout}). */
   loses: string;
 }
 
-/** The npm and pip build caches and the claude-agent-acp bridge prefix, in that order. */
+/**
+ * The npm and pip build caches, the claude-agent-acp bridge's node_modules and the bridge prefix,
+ * in that order. `npm i --prefix $CS/node <bridge>` (VERIFIED with npm 10.9 for a first install,
+ * a version change and a reinstall) removes from `node_modules` what is not a package and writes
+ * `package.json`, `package-lock.json` and `node_modules` in the prefix; it leaves anything else in
+ * the prefix alone, such as a checkout at `$CS/node/KiroCrew` beside node_modules (r9 #5).
+ */
 function crewOwnedDirs(paths: CrewPaths): CrewOwnedDir[] {
   const cacheWhy = 'every build empties it';
+  const npmWrites = "the bridge's package.json, package-lock.json and node_modules";
   return [
     { path: paths.npmCache, what: "crew's npm build cache", why: cacheWhy, loses: 'which the build empties' },
     { path: paths.pipCache, what: "crew's pip build cache", why: cacheWhy, loses: 'which the build empties' },
     {
-      path: paths.membersPrefix,
+      path: path.join(paths.membersPrefix, 'node_modules'),
       what: "crew's claude-agent-acp bridge",
       why: 'npm removes what is not a package there when it installs the bridge',
       loses: 'where npm removes what is not a package when it installs the bridge',
+    },
+    {
+      path: paths.membersPrefix,
+      only: ['package.json', 'package-lock.json'],
+      what: "crew's claude-agent-acp bridge prefix",
+      why: `npm writes ${npmWrites} there when it installs the bridge`,
+      loses: `where npm writes ${npmWrites} when it installs the bridge`,
     },
   ];
 }
@@ -252,6 +274,23 @@ function lexists(p: string): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+/** `entries` (those of `dir`) show a Kiro Crew checkout: `bin/kirocrew` or a `.git` (file or directory). */
+function marksCheckout(dir: string, entries: readonly fs.Dirent[]): boolean {
+  return entries.some((e) => e.name === '.git' || (e.name === 'bin' && e.isDirectory() && lexists(path.join(dir, 'bin', 'kirocrew'))));
+}
+
+/**
+ * `dir` itself looks like a Kiro Crew checkout ({@link checkoutInside}'s test, its
+ * subdirectories not searched). A symbolic link at `dir` is followed (npm writes through one).
+ */
+export function looksLikeCheckout(dir: string): boolean {
+  try {
+    return marksCheckout(dir, fs.readdirSync(dir, { withFileTypes: true }));
+  } catch {
+    return false; // nothing there, not a directory, or unreadable
   }
 }
 
@@ -276,10 +315,7 @@ export function checkoutInside(target: string): string | undefined {
     } catch {
       continue;
     }
-    for (const e of entries) {
-      if (e.name === '.git') return dir;
-      if (e.name === 'bin' && e.isDirectory() && lexists(path.join(dir, 'bin', 'kirocrew'))) return dir;
-    }
+    if (marksCheckout(dir, entries)) return dir;
     for (const e of entries) if (e.isDirectory()) stack.push(path.join(dir, e.name));
   }
   return undefined;
@@ -287,40 +323,72 @@ export function checkoutInside(target: string): string | undefined {
 
 /**
  * Why the build (`build`: it empties the npm and pip caches when it is done) or the bridge install
- * (`members`: npm removes what is not a package in `$CS/node`) must not run now: a directory in
- * them looks like a Kiro Crew checkout ({@link checkoutInside}), e.g. one an earlier kiro-claude
- * set up there before `crew setup` refused that. undefined when none does (r8 #3).
+ * (`members`: npm removes what is not a package in `$CS/node/node_modules`, and writes its files
+ * into `$CS/node`) must not run now: a directory in the caches or in node_modules looks like a
+ * Kiro Crew checkout ({@link checkoutInside}), or `$CS/node` itself does
+ * ({@link looksLikeCheckout}; a directory beside node_modules is not searched, npm leaves it
+ * alone: r9 #5), e.g. one an earlier kiro-claude set up there before `crew setup` refused that.
+ * undefined when none does (r8 #3).
  */
 export function crewDirCheckout(paths: CrewPaths, step: 'build' | 'members'): string | undefined {
   const dirs = crewOwnedDirs(paths);
   for (const d of step === 'build' ? dirs.slice(0, 2) : dirs.slice(2)) {
-    const found = checkoutInside(d.path);
-    if (found) return `${found} looks like a Kiro Crew checkout (bin/kirocrew or .git) and is in ${d.path}, ${d.what}, ${d.loses}. Move it out of there first.`;
+    const found = d.only ? (looksLikeCheckout(d.path) ? d.path : undefined) : checkoutInside(d.path);
+    if (found) return `${found} looks like a Kiro Crew checkout (bin/kirocrew or .git) and is ${found === d.path ? '' : `in ${d.path}, `}${d.what}, ${d.loses}. Move it out of there first.`;
   }
   return undefined;
 }
 
+/** The forms of `p` that {@link crewDirHolding} compares: as given (resolved) and its real path. */
+function pathForms(p: string): string[] {
+  return [path.resolve(p), realpathDeep(p)];
+}
+
+/** `dir` is `o`'s directory, or inside it (for the bridge prefix: is it, or is in one of its `only` entries). */
+function ownedBy(o: CrewOwnedDir, dir: string): boolean {
+  const forms = pathForms(dir);
+  return pathForms(o.path).some((p) =>
+    forms.some((f) => (o.only ? f === p || o.only.some((e) => isSubpath(f, path.join(p, e))) : isSubpath(f, p))),
+  );
+}
+
 /**
  * The directory of crew's own that is or holds `dir`, compared as given and by real path:
- * the npm or pip build cache (every build empties them) or the claude-agent-acp bridge prefix
- * (npm keeps only packages in its node_modules); `crew uninstall --purge` removes all three
- * unless they hold a checkout. undefined when `dir` is outside them. A Kiro Crew checkout there
- * would be destroyed, so `crew setup` refuses one and {@link buildKiroCrew} does not start in one
- * (r8 #3).
+ * the npm or pip build cache (every build empties them), the claude-agent-acp bridge's
+ * `$CS/node/node_modules` (npm keeps only packages there), or the bridge prefix `$CS/node` itself
+ * and the `package.json` and `package-lock.json` npm writes in it. A directory beside node_modules
+ * in `$CS/node` is none of these: npm leaves it alone (r9 #5). `crew uninstall --purge` removes the
+ * caches, and the prefix while it holds nothing else, unless they hold a checkout. undefined when
+ * `dir` is outside them. A Kiro Crew checkout there would be destroyed or written into, so
+ * `crew setup` refuses one ({@link crewDirRefusal}) and {@link buildKiroCrew} does not start in
+ * one (r8 #3).
  */
 export function crewDirHolding(dir: string, paths: CrewPaths): CrewOwnedDir | undefined {
-  const forms = [path.resolve(dir), realpathDeep(dir)];
-  return crewOwnedDirs(paths).find((o) => [path.resolve(o.path), realpathDeep(o.path)].some((p) => forms.some((f) => isSubpath(f, p))));
+  return crewOwnedDirs(paths).find((o) => ownedBy(o, dir));
+}
+
+/**
+ * Why `dir` must not be a Kiro Crew checkout ({@link crewDirHolding}), e.g. `<dir> is in
+ * $CS/cache/pip, crew's pip build cache: every build empties it` or `<dir> is $CS/node, crew's
+ * claude-agent-acp bridge prefix: npm writes …`; undefined when it may be one.
+ */
+export function crewDirRefusal(dir: string, paths: CrewPaths): string | undefined {
+  const o = crewDirHolding(dir, paths);
+  if (!o) return undefined;
+  const forms = pathForms(dir);
+  const itself = o.only !== undefined && pathForms(o.path).some((p) => forms.includes(p));
+  return `${dir} is ${itself ? '' : 'in '}${o.path}, ${o.what}: ${o.why}`;
 }
 
 /**
  * Runs the light or full build. Returns the commands run. Neither starts in a `dir` inside crew's
- * caches or bridge ({@link crewDirHolding}) nor while a cache holds a Kiro Crew checkout
- * ({@link crewDirCheckout}): the build empties both caches when it is done.
+ * caches or the bridge's node_modules, or at the bridge prefix ({@link crewDirRefusal}), nor while
+ * a cache holds a Kiro Crew checkout ({@link crewDirCheckout}): the build empties both caches when
+ * it is done.
  */
 export async function buildKiroCrew(opts: BuildOptions): Promise<string[]> {
-  const held = crewDirHolding(opts.dir, opts.paths);
-  if (held) throw new CrewStepError('build', `${opts.dir} is in ${held.path}, ${held.what}: ${held.why}; not building there`);
+  const held = crewDirRefusal(opts.dir, opts.paths);
+  if (held) throw new CrewStepError('build', `${held}; not building there`);
   const atRisk = crewDirCheckout(opts.paths, 'build');
   if (atRisk) throw new CrewStepError('build', atRisk);
   const commands: string[] = [];
@@ -382,7 +450,7 @@ export async function installMembersAdapter(opts: {
   force?: boolean;
 }): Promise<{ installed: boolean; command?: string }> {
   if (!opts.force && membersAdapterInstalled(opts.paths)) return { installed: false };
-  // npm would remove a checkout left in node_modules (r8 #3).
+  // npm would remove a checkout left in node_modules (r8 #3), and write into a prefix that is one.
   const atRisk = crewDirCheckout(opts.paths, 'members');
   if (atRisk) throw new CrewStepError('members', atRisk);
   fs.mkdirSync(opts.paths.membersPrefix, { recursive: true });

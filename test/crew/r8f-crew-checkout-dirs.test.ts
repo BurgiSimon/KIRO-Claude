@@ -95,7 +95,9 @@ describe('r8f crew: setup refuses a checkout inside crew\'s build caches or brid
         const work = checkoutWithWork(fe, dir);
         const r = await setup(fe, ['--dir', dir]);
         assert.equal(r.code, 1, `${r.stdout}\n${r.stderr}`);
-        assert.match(r.stderr, new RegExp(`❌ preflight: ${esc(dir)} is in ${esc(path.join(fe.cs, rel.startsWith('node') ? 'node' : rel.split('/').slice(0, 2).join('/')))}, `), r.stderr);
+        // r9 #5: the bridge prefix is refused only as itself ("is $CS/node"); what npm prunes is its node_modules.
+        const held = rel === 'node' ? `is ${esc(path.join(fe.cs, 'node'))}` : `is in ${esc(path.join(fe.cs, ...(rel.startsWith('node') ? ['node', 'node_modules'] : rel.split('/').slice(0, 2))))}`;
+        assert.match(r.stderr, new RegExp(`❌ preflight: ${esc(dir)} ${held}, `), r.stderr);
         assert.match(r.stderr, what, r.stderr);
         assert.match(r.stderr, /Put the Kiro Crew checkout elsewhere \(--dir <path>, or KIRO_CLAUDE_CREW_DIR\)/, r.stderr);
         assert.equal(fs.readFileSync(work, 'utf8'), 'uncommitted work', 'the checkout is untouched');
@@ -119,7 +121,7 @@ describe('r8f crew: setup refuses a checkout inside crew\'s build caches or brid
       const work = checkoutWithWork(fe, dir);
       const r = await setup(fe, ['--dir', dir]);
       assert.equal(r.code, 1, `${r.stdout}\n${r.stderr}`);
-      assert.match(r.stderr, new RegExp(`preflight: ${esc(dir)} is in ${esc(path.join(fe.cs, 'node'))}, crew's claude-agent-acp bridge`));
+      assert.match(r.stderr, new RegExp(`preflight: ${esc(dir)} is in ${esc(path.join(fe.cs, 'node', 'node_modules'))}, crew's claude-agent-acp bridge`));
       assert.equal(fs.readFileSync(stateFile, 'utf8'), before, 'crew.json still names the first checkout');
       assert.equal(fs.existsSync(work), true);
     } finally {
@@ -409,7 +411,8 @@ describe('r8f crew: the help and docs describe where the checkout may live and w
     try {
       const s = await crew(fe, ['setup', '--help']);
       assert.equal(s.code, 0);
-      assert.match(flat(s.stdout), /must not be in a linked git worktree, nor under the system temp directory without --allow-tmp, nor in crew's build caches \(cache\/npm, cache\/pip\) or claude-agent-acp bridge \(node\/\)/);
+      // r9 #5: of the bridge, node/node_modules and node/ itself (a directory beside node_modules is fine).
+      assert.match(flat(s.stdout), /must not be in a linked git worktree, nor under the system temp directory without --allow-tmp, nor in crew's build caches \(cache\/npm, cache\/pip\) in the crew state directory, which every build empties, nor in node\/node_modules, where npm keeps only packages when it installs the claude-agent-acp bridge, nor be node\/ itself/);
       const u = await crew(fe, ['uninstall', '--help']);
       assert.equal(u.code, 0);
       assert.match(flat(u.stdout), /A cache or the bridge that holds a Kiro Crew checkout is kept\./);
@@ -421,7 +424,7 @@ describe('r8f crew: the help and docs describe where the checkout may live and w
   it('README and ARCHITECTURE.md state both rules', () => {
     const root = repoRoot();
     const readme = flat(fs.readFileSync(path.join(root, 'README.md'), 'utf8'));
-    assert.match(readme, /Setup refuses a checkout inside crew's own build caches \(`cache\/npm`, `cache\/pip`\) or claude-agent-acp bridge \(`node\/`\)/);
+    assert.match(readme, /Setup refuses a checkout inside crew's own build caches \(`cache\/npm`, `cache\/pip`; every build empties them\) or the claude-agent-acp bridge's `node\/node_modules` \(npm keeps only packages there\), or at the bridge prefix `node\/` itself/);
     assert.match(readme, /a cache or the bridge that holds a Kiro Crew checkout stays, and is named as such/);
     const arch = fs.readFileSync(path.join(root, 'docs', 'ARCHITECTURE.md'), 'utf8');
     const where = flat(arch.split(/\n\n/).find((p) => p.startsWith('**Where the checkout may live.**')) ?? '');

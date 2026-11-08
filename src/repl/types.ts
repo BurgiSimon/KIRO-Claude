@@ -68,7 +68,8 @@ export interface ReplContext extends ReplHost {
   submit(text: string): Promise<void | 'quit'>;
   /**
    * Open `$EDITOR` (fallback `vi`; `opts.command` names another editor command) on a temp file
-   * prefilled with `initial`, or on `opts.file`; the reader hands the terminal over meanwhile.
+   * prefilled with `initial`, or on `opts.file`; the reader hands the terminal over meanwhile
+   * whenever it reads the keyboard, also when stdout is piped (`kiro-claude chat | tee log`).
    */
   openEditor(initial: string, opts?: { suffix?: string; file?: string; command?: readonly string[] }): Promise<EditorResult>;
   /** Run `!cmd` semantics (01 §4.3 step 4). */

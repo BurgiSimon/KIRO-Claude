@@ -12,7 +12,7 @@
  * | `/spec view\|open <name> [requirements\|bugfix\|design\|tasks]` | print a document |
  * | `/spec run <name> [ids…\|--next\|--all\|--include-optional]` | scope picker (All remaining required tasks / include optional / Select tasks… / Cancel) then execution; Ctrl+C stops scheduling tasks and interrupts the running one, kills a running PreTaskExec/PostTaskExec command hook and cancels a task session start whose agentSpawn hooks run (the REPL command signal, via createReplRuntime) |
  * | `/spec analyze_requirements\|analyze [name]` | Analyze Requirements (picker over specs with requirements) |
- * | `/spec approve [name]` · `/spec revise [name] <feedback>` | approve / revise the pending checkpoint (scripted use) |
+ * | `/spec approve [name] [--doc <doc>]` · `/spec revise [name] [--doc <doc>] <feedback>` | approve / revise the pending checkpoint (scripted use); `--doc` names the document under review when it is not the one the files give (a document drafted again next to an existing tasks.md: a checkpoint's Stop names this form there, r9 #6); for `revise` only before the feedback, which is free text (a `--doc` in it stays feedback) |
  * | `/spec sync <name>` | adapter extension (03 §1.7.4) |
  *
  * In plan mode `/spec run` (and running tasks from `/spec <name>`) is refused: Kiro's plan mode is
@@ -72,8 +72,8 @@ export const SPEC_USAGE = [
   '/spec view <feature-name> [requirements|design|tasks]   Print a document (alias: open)',
   '/spec run <feature-name> [<task-id>…|--next|--all|--include-optional]',
   '/spec analyze_requirements [feature-name]               Analyze requirements (alias: analyze)',
-  '/spec approve [feature-name]            Approve the pending checkpoint',
-  '/spec revise [feature-name] <feedback>  Revise the document under review',
+  '/spec approve [feature-name] [--doc <doc>]            Approve the pending checkpoint',
+  '/spec revise [feature-name] [--doc <doc>] <feedback>  Revise the document under review',
   '/spec sync <feature-name>               Update task boxes from the code',
 ].join('\n');
 
@@ -175,6 +175,49 @@ function parseDoc(v: string | undefined): SpecDocKind | undefined {
   const x = v.toLowerCase().replace(/\.md$/, '');
   if (x === 'requirements' || x === 'req' || x === 'bugfix' || x === 'design' || x === 'tasks') return x === 'req' ? 'requirements' : x;
   return undefined;
+}
+
+/**
+ * `--doc <doc>` / `--doc=<doc>` taken out of `/spec approve|revise` arguments (r9 #6: the
+ * document under review named, workflow.explicitReview); an error for a value that names none.
+ */
+function takeDoc(args: readonly string[]): { args: string[]; doc?: SpecDocKind } | { error: string } {
+  const out: string[] = [];
+  let doc: SpecDocKind | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a !== '--doc' && !a.startsWith('--doc=')) {
+      out.push(a);
+      continue;
+    }
+    const v = a === '--doc' ? args[++i] : a.slice('--doc='.length);
+    doc = parseDoc(v);
+    if (!doc) return { error: `Unknown document '${v ?? ''}'. Use requirements, bugfix, design or tasks.` };
+  }
+  return doc ? { args: out, doc } : { args: out };
+}
+
+/**
+ * `/spec revise [feature-name] [--doc <doc>] <feedback>`: the name (a word that names a spec) and
+ * `--doc` ({@link takeDoc}) only before the feedback, in either order. The feedback is free text:
+ * from its first word on, a `--doc` in it stays feedback (r9 #6 verification: `explain the --doc
+ * flag` was refused, and `mention --doc requirements …` revised requirements.md, not the document
+ * under review, with those words cut out of the feedback).
+ */
+function reviseArgs(host: ReplHost, args: readonly string[]): { name?: string; words: string[]; doc?: SpecDocKind } | { error: string } {
+  let name: string | undefined;
+  let i = 0;
+  while (i < args.length) {
+    const a = args[i]!;
+    if (a === '--doc' || a.startsWith('--doc=')) i += a === '--doc' ? 2 : 1;
+    else if (name === undefined && resolveSpecDir(host.ws, a)) {
+      name = a;
+      i++;
+    } else break;
+  }
+  const lead = takeDoc(args.slice(0, i));
+  if ('error' in lead) return lead;
+  return { ...(name ? { name } : {}), words: args.slice(i), ...(lead.doc ? { doc: lead.doc } : {}) };
 }
 
 /** Pick a spec when no name was given; `filter` narrows the candidates. */
@@ -440,28 +483,32 @@ async function runSpec(args: string[], host: ReplHost): Promise<void> {
       return;
     }
     case 'approve': {
-      const name = await resolveName(host, rest[0], 'Approve which spec?', (s) => s.awaitingApproval !== undefined);
+      const named = takeDoc(rest);
+      if ('error' in named) {
+        host.print(named.error);
+        return;
+      }
+      const name = await resolveName(host, named.args[0], 'Approve which spec?', (s) => s.awaitingApproval !== undefined);
       if (!name) return;
       if (await tangentRefuses(host, name)) return;
       remember(host, name);
-      await approveSpec(rt, name);
+      await approveSpec(rt, name, named.doc ? { doc: named.doc } : {});
       return;
     }
     case 'revise': {
       if (await tangentRefuses(host)) return;
-      let name: string | undefined;
-      let words = rest;
-      if (rest[0] && resolveSpecDir(host.ws, rest[0])) {
-        name = rest[0];
-        words = rest.slice(1);
+      const named = reviseArgs(host, rest);
+      if ('error' in named) {
+        host.print(named.error);
+        return;
       }
-      name = await resolveName(host, name, 'Revise which spec?', (s) => s.awaitingApproval !== undefined);
+      const name = await resolveName(host, named.name, 'Revise which spec?', (s) => s.awaitingApproval !== undefined);
       if (!name) return;
-      let feedback = words.join(' ').trim();
+      let feedback = named.words.join(' ').trim();
       if (!feedback) feedback = (await host.ask('What should change?')).trim();
       if (!feedback) return;
       remember(host, name);
-      await reviseSpec(rt, name, feedback);
+      await reviseSpec(rt, name, feedback, named.doc ? { doc: named.doc } : {});
       return;
     }
     case 'sync': {

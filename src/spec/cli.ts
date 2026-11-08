@@ -8,7 +8,8 @@
  *   spec view <name> [requirements|bugfix|design|tasks]
  *   spec new <name> [--type feature|bugfix|quick] [--workflow requirements-first|design-first]
  *                   [--detail high|low] [--description <text> | <text…>] [--yes]
- *   spec approve <name> [--yes]          spec revise <name> <feedback…> [--yes]
+ *   spec approve <name> [--doc <doc>] [--yes]
+ *   spec revise <name> [--doc <doc>] <feedback…> [--yes]
  *   spec run <name> [<task-id>…|--next|--all] [--include-optional]
  *   spec analyze <name> [--yes]          spec sync <name>
  *   common: --agent <name> --model <id> --trust-all-tools|-a --trust-tools <a,b> --no-interactive
@@ -31,8 +32,10 @@
  * enumerated: `list` and `status` without a name are an error with the reason (exit 1), and a
  * named spec not found under it is that error too, not "not found" (r7 #7). Resume hints name
  * commands this CLI accepts ({@link cliResumeHint}, r7 #8); a checkpoint's Stop resumes its
- * review (`approve` / `revise`), also at tasks.md (r8 #10), unless its document was not written
- * (then the hint is the one outside a checkpoint).
+ * review (`approve` / `revise`), also at tasks.md (r8 #10), with `--doc <doc>` when the files give
+ * another review (a document drafted again next to an existing tasks.md, r9 #6), unless its
+ * document was not written (then the hint is the one outside a checkpoint). `approve` and `revise`
+ * take the document under review explicitly with `--doc <doc>` (workflow.explicitReview).
  *
  * Ctrl+C during `spec run`: the first press stops scheduling and interrupts the running tasks.
  * The PostTaskExec hooks of a task it interrupted run under the NEXT press, as in the REPL
@@ -73,6 +76,8 @@ import {
   analyzeRequirements,
   approveSpec,
   createNewSpec,
+  reviewCommands,
+  reviewDocOption,
   reviseSpec,
   runSpecTasks,
   syncSpec,
@@ -122,6 +127,7 @@ Options:
       --type <TYPE>          new: feature, bugfix or quick [default: feature]
       --workflow <WORKFLOW>  new: requirements-first or design-first [default: requirements-first]
       --detail <LEVEL>       new (design-first): high or low [default: high]
+      --doc <DOC>            approve/revise: the document under review (requirements, bugfix, design or tasks)
   -d, --description <TEXT>   new: what the spec should cover
   -y, --yes                  Approve every checkpoint automatically (analyze: apply the first fix of each finding)
       --spec-auto-approve    Same as --yes
@@ -144,7 +150,7 @@ interface Parsed {
   flags: Map<string, string | true>;
 }
 
-const VALUE_FLAGS = new Set(['--type', '--workflow', '--detail', '--description', '--agent', '--model', '--trust-tools', '--format']);
+const VALUE_FLAGS = new Set(['--type', '--workflow', '--detail', '--description', '--agent', '--model', '--trust-tools', '--format', '--doc']);
 const BOOL_FLAGS = new Set(['--yes', '--spec-auto-approve', '--next', '--all', '--include-optional', '--trust-all-tools', '--no-interactive', '--help']);
 const SHORT: Record<string, string> = { '-y': '--yes', '-a': '--trust-all-tools', '-d': '--description', '-h': '--help' };
 
@@ -532,8 +538,12 @@ function cliRuntime(ctx: CliContext, o: CliRuntimeOptions, deps: SpecCliDeps, io
  * refused file (it says why); `approve` / `revise` for the document under review at a checkpoint
  * the user stops at (`awaiting`) when that review is the one they resume (the document the files
  * say awaits review, or tasks.md once it has tasks: a tasks.md under review derives as
- * `execution`, but its review is what resumes, r8 #10) and for a document awaiting review; `run
- * <name> --next` outside a checkpoint once the tasks are approved. At the checkpoint of a document
+ * `execution`, but its review is what resumes, r8 #10) and for a document awaiting review; `approve
+ * <name> --doc <doc>` / `revise <name> --doc <doc>` at a checkpoint whose document is not that
+ * review (a document drafted again next to an existing tasks.md with tasks, r9 #6:
+ * workflow.reviewDocOption), so a checkpoint's hint never runs a task; `run <name> --next` outside
+ * a checkpoint once tasks.md has tasks (whether they were approved is not recorded: a spec stopped
+ * at its tasks.md review gets it too, r9 #9). At the checkpoint of a document
  * the turn did not write (or a revision emptied), `approve` / `revise` would act on another
  * document or on none ("Nothing to approve yet"), so the hint comes from where the spec stands, as
  * outside a checkpoint. A spec whose next step is drafting a document nothing awaits approval
@@ -544,9 +554,10 @@ function cliResumeHint(ctx: CliContext, name: string, awaiting?: SpecDocKind): s
   const prog = `${ctx.progName || 'kiro-claude'} spec`;
   const s = summarizeSpec(ctx.ws, name);
   if (!s || s.refused) return `${prog} status ${name}`;
-  // the review `approve` / `revise` resume (workflow.approveSpec / reviseSpec)
-  const review = s.awaitingApproval ?? (s.phase === 'execution' || s.phase === 'done' ? 'tasks' : undefined);
-  if (awaiting && awaiting === review) return `${prog} approve ${name} · ${prog} revise ${name} <feedback>`;
+  // the review stopped at: plain approve / revise when they resume it (workflow.approveSpec /
+  // reviseSpec), with `--doc <doc>` when the files give another review (r9 #6)
+  const opt = awaiting ? reviewDocOption(s, awaiting) : undefined;
+  if (opt !== undefined) return reviewCommands(prog, name, opt);
   if (s.phase === 'execution' || s.phase === 'done') return `${prog} run ${name} --next`;
   if (s.awaitingApproval) return `${prog} approve ${name} · ${prog} revise ${name} <feedback>`;
   return `/spec ${name} in ${ctx.progName || 'kiro-claude'} chat`;
@@ -614,6 +625,17 @@ export async function runSpecCommandWith(args: string[], ctx: CliContext, deps: 
     return n;
   };
   const json = (v: unknown): string => (format === 'json-pretty' ? JSON.stringify(v, null, 2) : JSON.stringify(v));
+  // `--doc <DOC>`: approve / revise only, the document under review named (r9 #6); null after a usage error
+  const docArg = str(p, '--doc');
+  if (docArg !== undefined && sub !== 'approve' && sub !== 'revise') {
+    ctx.stderr.write(`error: unexpected argument '--doc' found\n\nFor more information, try '--help'.\n`);
+    return 2;
+  }
+  const doc: SpecDocKind | undefined | null = docArg === undefined ? undefined : (parseDoc(docArg) ?? null);
+  const badDoc = (): number => {
+    ctx.stderr.write(`error: unknown document '${docArg}' (requirements, bugfix, design, tasks)\n`);
+    return 2;
+  };
   try {
     switch (sub) {
       case 'list':
@@ -756,18 +778,20 @@ export async function runSpecCommandWith(args: string[], ctx: CliContext, deps: 
       case 'approve': {
         const name = needName();
         if (!name) return 2;
-        const r = await approveSpec(cliRuntime(ctx, rtOpts, deps, io), name, { autoApprove: yes });
+        if (doc === null) return badDoc();
+        const r = await approveSpec(cliRuntime(ctx, rtOpts, deps, io), name, { autoApprove: yes, ...(doc ? { doc } : {}) });
         return r.status === 'error' ? 1 : 0;
       }
       case 'revise': {
         const name = needName();
         if (!name) return 2;
+        if (doc === null) return badDoc();
         const feedback = pos.slice(1).join(' ').trim();
         if (!feedback) {
-          ctx.stderr.write(`error: feedback is required\n\nUsage: ${ctx.progName} spec revise <NAME> <FEEDBACK>...\n`);
+          ctx.stderr.write(`error: feedback is required\n\nUsage: ${ctx.progName} spec revise <NAME> [--doc <DOC>] <FEEDBACK>...\n`);
           return 2;
         }
-        const r = await reviseSpec(cliRuntime(ctx, rtOpts, deps, io), name, feedback, { autoApprove: yes });
+        const r = await reviseSpec(cliRuntime(ctx, rtOpts, deps, io), name, feedback, { autoApprove: yes, ...(doc ? { doc } : {}) });
         return r.status === 'error' ? 1 : 0;
       }
       case 'run': {

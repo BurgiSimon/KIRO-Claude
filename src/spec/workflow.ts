@@ -73,7 +73,8 @@
  *    an error); a revision turn still runs and its write of the document is denied: the gate
  *    refuses it through the link, with the reason, and a document that is not a regular file or
  *    that the user cannot read (which the gate would allow) is left out of the turn's write
- *    allowance ({@link restrictionFor}, r8 #9 verifier). The same holds for every phase of a spec
+ *    allowance ({@link restrictionFor}, r8 #9 verifier) and named with its reason, so the gate's
+ *    spec-phase denial says why, in plan mode too (r9 #7). The same holds for every phase of a spec
  *    with ANY refused file (an input document such as requirements.md, or `.config.kiro`, whose
  *    type and workflow kiro-claude then does
  *    not know): no phase is drafted from it, every checkpoint names each reason and offers no
@@ -94,7 +95,12 @@
  *    the document under review, so the CLI resumes that review at every checkpoint (`approve` /
  *    `revise`), the tasks.md one included, never `run <name> --next` (r8 #10); at the checkpoint
  *    of a document the turn did not write the hint is the one outside a checkpoint (the first
- *    document: `/spec <name>` in chat, r7 #8).
+ *    document: `/spec <name>` in chat, r7 #8). The review is derived from the files alone, so at
+ *    a checkpoint whose document is not the one they give (a document drafted again next to an
+ *    existing tasks.md with tasks: the files say tasks.md), the hint names that document
+ *    explicitly, `approve <name> --doc <doc>` / `revise <name> --doc <doc>` ({@link
+ *    reviewDocOption}, {@link explicitReview}; in the REPL too, and in the headless stop line),
+ *    so no hint at a checkpoint runs a task or skips the review stopped at (r9 #6).
  *
  * The workflow talks to its host only through {@link SpecRuntime}; {@link createReplRuntime}
  * adapts a ReplHost (slash commands) and spec/cli.ts builds a headless one.
@@ -166,6 +172,7 @@ import {
   docSummary,
   isValidSpecName,
   loadSpecDir,
+  present,
   resolveSpecDir,
   specContextBlock,
   specDocPath,
@@ -271,9 +278,10 @@ export interface SpecRuntime {
    * (r7 #8). `awaiting`: the document whose checkpoint the user stops at (the Stop label and the
    * stop hint pass it, r8 #10): the hint resumes that review, never what the files alone suggest
    * (a tasks.md under review already has tasks, so it derives as `execution`), when the files hold
-   * that review (a document the turn did not write has none: the hint is the one without). Default
-   * `${commandPrefix} <name>` (the REPL's `/spec <name>`); the spec CLI, which has no such form,
-   * names commands it accepts (spec/cli.ts).
+   * that review (a document the turn did not write has none: the hint is the one without), with
+   * `--doc <doc>` when the files give another review ({@link reviewDocOption}, r9 #6). Default
+   * `${commandPrefix} <name>` (the REPL's `/spec <name>`; `approve` / `revise --doc` at such a
+   * checkpoint); the spec CLI, which has no such form, names commands it accepts (spec/cli.ts).
    */
   resumeHint?(name: string, awaiting?: SpecDocKind): string;
   /** End of a flow: release/settle phase sessions. */
@@ -369,7 +377,8 @@ function carryRestrictions(from: KiroSession, to: KiroSession): void {
 }
 
 function phaseKey(p: SpecPhaseRestriction): string {
-  return JSON.stringify([p.name, [...p.allowedWritePaths].sort()]);
+  const refused = (p.refusedWritePaths ?? []).map((r) => `${r.path}\0${r.why}`).sort();
+  return JSON.stringify([p.name, [...p.allowedWritePaths].sort(), ...(refused.length ? [refused] : [])]);
 }
 
 /** A spec turn that was not sent (Ctrl+C while its session started). */
@@ -496,7 +505,9 @@ export class SpecSessionDriver {
     const key = phaseKey(phase);
     if (!s || !this.restricted || this.restricted.session !== s || this.restricted.key !== key) {
       try {
-        s = await this.fork(s, { ...this.opts.phaseOptions, specPhase: { name: phase.name, allowedWritePaths: [...phase.allowedWritePaths] } });
+        const specPhase: SpecPhaseRestriction = { name: phase.name, allowedWritePaths: [...phase.allowedWritePaths] };
+        if (phase.refusedWritePaths?.length) specPhase.refusedWritePaths = phase.refusedWritePaths.map((r) => ({ ...r }));
+        s = await this.fork(s, { ...this.opts.phaseOptions, specPhase });
       } catch (e) {
         // Ctrl+C while the phase session ran its agentSpawn hooks (the host's start signal,
         // session/startSignal.ts): that start was cancelled and nothing changed, the turn is not sent
@@ -752,23 +763,37 @@ function nextDoc(order: readonly SpecDocKind[], doc: SpecDocKind): SpecDocKind |
  * the gate (policy/specwrite.checkSpecWrite) refuses a link at the document or a path that leaves
  * the workspace, with the reason, but would allow, without asking, the write of a document that is
  * not a regular file (a directory: its subtree) or that the user cannot read. Such a document is
- * never written, as never read, so its write is denied ("only (nothing) may be written now").
+ * never written, as never read, so its write is denied. The restriction names it with the reason
+ * (`refusedWritePaths`, only when there is one): the gate's spec-phase denial then says why
+ * ("only (nothing) may be written now (<doc> is not a regular file)"), in plan mode too, never
+ * the plan-mode denial, which leaving plan mode would not lift (r9 #7).
  */
 function restrictionFor(c: Pick<FlowCtx, 'dir' | 'prompt'>, doc: SpecDocKind): SpecPhaseRestriction {
   const folderRefused = specFolderRefused(c.dir) !== undefined;
   const paths = phaseWritableDocs(doc, c.prompt).map((k) => specDocPath(c.dir, k));
-  return { name: doc, allowedWritePaths: folderRefused ? paths : paths.filter((p) => !refusedInPlace(p)) };
+  if (folderRefused) return { name: doc, allowedWritePaths: paths };
+  const allowedWritePaths: string[] = [];
+  const refusedWritePaths: { path: string; why: string }[] = [];
+  for (const p of paths) {
+    const why = refusedInPlace(p);
+    if (why === undefined) allowedWritePaths.push(p);
+    else refusedWritePaths.push({ path: p, why });
+  }
+  return { name: doc, allowedWritePaths, ...(refusedWritePaths.length ? { refusedWritePaths } : {}) };
 }
 
-/** `p` exists, is no symbolic link (the gate refuses one itself) and kiro-claude refuses it (docfs: not a regular file, unreadable). */
-function refusedInPlace(p: string): boolean {
+/**
+ * Why kiro-claude refuses `p` (docfs: not a regular file, unreadable) when it exists and is no
+ * symbolic link (the gate refuses one itself, with its own reason), else undefined.
+ */
+function refusedInPlace(p: string): string | undefined {
   let st: fs.Stats;
   try {
     st = fs.lstatSync(p);
   } catch {
-    return false; // missing: it may be created
+    return undefined; // missing: it may be created
   }
-  return !st.isSymbolicLink() && specFileRefused(p) !== undefined;
+  return st.isSymbolicLink() ? undefined : specFileRefused(p);
 }
 
 function baseBlock(c: Pick<FlowCtx, 'name' | 'dir' | 'kindLabel' | 'rt'>): string {
@@ -914,9 +939,53 @@ async function checkpoint(c: FlowCtx, doc: SpecDocKind, next: SpecDocKind | unde
   }
 }
 
-/** {@link SpecRuntime.resumeHint} (`awaiting`: the document whose checkpoint is stopped at), else `${commandPrefix} <name>`. */
+/**
+ * How `approve` / `revise` reach the review of `doc`, the document whose checkpoint the user stops
+ * at (r9 #6): '' when they act on it as they are (it is the review the files give, which
+ * approveSpec / reviseSpec take: the document awaiting approval, or tasks.md once it has tasks);
+ * ` --doc <doc>` when the files give another one (a document drafted again next to an existing
+ * tasks.md with tasks: every document is present, so the files say `execution` and plain approve
+ * / revise act on tasks.md; a tasks.md without parseable tasks, where they act on design.md);
+ * undefined when `doc` cannot be under review (it or a document before it has not been written,
+ * or the spec has a refused file).
+ */
+export function reviewDocOption(s: SpecSummary, doc: SpecDocKind): string | undefined {
+  const i = s.order.indexOf(doc);
+  if (s.refused || i < 0 || s.order.slice(0, i + 1).some((k) => !s.docs[k].nonEmpty)) return undefined;
+  const review = s.awaitingApproval ?? (s.phase === 'execution' || s.phase === 'done' ? 'tasks' : undefined);
+  return review === doc ? '' : ` --doc ${doc}`;
+}
+
+/** `<prefix> approve <name><opt> · <prefix> revise <name><opt> <feedback>` ({@link reviewDocOption}). */
+export function reviewCommands(prefix: string, name: string, opt: string): string {
+  return `${prefix} approve ${name}${opt} · ${prefix} revise ${name}${opt} <feedback>`;
+}
+
+/**
+ * {@link SpecRuntime.resumeHint} (`awaiting`: the document whose checkpoint is stopped at), else
+ * `${commandPrefix} <name>` (the REPL's `/spec <name>`, which resumes the review the files give),
+ * or, at a checkpoint whose document is not that review, `approve` / `revise --doc <doc>`: only
+ * they reach it (r9 #6; `/spec <name>` would offer the tasks).
+ */
 function resumeHint(rt: SpecRuntime, name: string, awaiting?: SpecDocKind): string {
-  return rt.resumeHint ? rt.resumeHint(name, awaiting) : `${rt.commandPrefix} ${name}`;
+  if (rt.resumeHint) return rt.resumeHint(name, awaiting);
+  const s = awaiting ? findSpec(rt, name) : undefined;
+  const opt = s && awaiting ? reviewDocOption(s, awaiting) : undefined;
+  return opt ? reviewCommands(rt.commandPrefix, name, opt) : `${rt.commandPrefix} ${name}`;
+}
+
+/**
+ * What a Stop at the checkpoint of `doc` prints. Interactive: where to resume ({@link resumeHint}).
+ * Headless: `<doc> is waiting for review` with the approve / revise that act on `doc` (`--doc
+ * <doc>` when the files give another review, r9 #6); at the checkpoint of a document that cannot
+ * be under review (a revision emptied it) the interactive line.
+ */
+function stopLine(c: FlowCtx, doc: SpecDocKind): string {
+  const file = SPEC_DOC_FILES[doc];
+  const opt = c.rt.interactive ? undefined : reviewDocOption(summarizeSpecDir(c.dir), doc);
+  if (opt === undefined) return `Stopped at the ${file} checkpoint. Resume later with ${resumeHint(c.rt, c.name, doc)}.`;
+  const p = c.rt.commandPrefix;
+  return `${file} is waiting for review. Approve with: ${p} approve ${c.name}${opt} · Request changes: ${p} revise ${c.name}${opt} <feedback>`;
 }
 
 function readyHint(c: FlowCtx): string {
@@ -1019,10 +1088,7 @@ async function phaseLoop(c: FlowCtx, start: SpecDocKind, draft: boolean): Promis
         continue;
       case 'stop': {
         c.trace.push({ state: 'stopped', doc });
-        const hint = c.rt.interactive
-          ? `Stopped at the ${SPEC_DOC_FILES[doc]} checkpoint. Resume later with ${resumeHint(c.rt, c.name, doc)}.`
-          : `${SPEC_DOC_FILES[doc]} is waiting for review. Approve with: ${c.rt.commandPrefix} approve ${c.name} · Request changes: ${c.rt.commandPrefix} revise ${c.name} <feedback>`;
-        c.rt.print(hint);
+        c.rt.print(stopLine(c, doc));
         return result(c, 'stopped', { awaiting: doc });
       }
     }
@@ -1102,6 +1168,12 @@ export interface ResumeOptions {
   autoApprove?: boolean;
   /** Description used when no document exists yet (else asked interactively). */
   description?: string;
+  /**
+   * approve / revise: the document under review, named explicitly (`--doc <doc>`, r9 #6) instead
+   * of the one the files give ({@link explicitReview}); `requirements` names a bugfix spec's
+   * bugfix.md.
+   */
+  doc?: SpecDocKind;
 }
 
 function findSpec(rt: SpecRuntime, name: string): SpecSummary | undefined {
@@ -1211,10 +1283,52 @@ async function selectAndRun(rt: SpecRuntime, name: string): Promise<RunSummary> 
   return runSpecTasks(rt, name, { kind: 'ids', ids: ids.split(/[\s,]+/).filter(Boolean), includeOptional: true });
 }
 
+/**
+ * The document `want` of spec `s` that `approve --doc` / `revise --doc` act on (r9 #6): the
+ * review is derived from the files alone (03 §1.11.2), so a document drafted again next to an
+ * existing tasks.md (every document present: the files say tasks.md) can only be reached by
+ * name. It must be a document of the spec's order and present, and so must every document
+ * before it (a checkpoint of it is reached only after them); `requirements` names a bugfix
+ * spec's bugfix.md. Else what to print (and the refusal of a spec whose files are refused, when
+ * that is why something is missing).
+ */
+function explicitReview(s: SpecSummary, want: SpecDocKind, verb: 'approve' | 'revise'): { doc: SpecDocKind } | { error: string; why?: string } {
+  const doc: SpecDocKind = want === 'requirements' && s.specType === 'bugfix' ? 'bugfix' : want;
+  const file = SPEC_DOC_FILES[doc];
+  const i = s.order.indexOf(doc);
+  if (i < 0) return { error: `✗ ${file} is not a document of spec '${s.name}' (${s.order.map((k) => SPEC_DOC_FILES[k]).join(', ')})` };
+  const missing = s.order.slice(0, i + 1).find((k) => !present(s.docs[k]));
+  if (missing === undefined) return { doc };
+  if (s.refused) return { error: `✗ Spec '${s.name}' cannot continue: ${specRefusalText(s.refused)}`, why: s.refused };
+  return { error: missing === doc ? `Nothing to ${verb} yet: ${file} has not been written.` : `✗ Cannot ${verb} ${file}: ${SPEC_DOC_FILES[missing]} has not been written yet.` };
+}
+
 /** `/spec approve [name]`: approve the pending checkpoint, draft the next phase. */
 export async function approveSpec(rt: SpecRuntime, name: string, opts: ResumeOptions = {}): Promise<FlowResult> {
   const s = findSpec(rt, name);
   if (!s) return notFound(rt, name);
+  if (opts.doc) {
+    // the document named (r9 #6): approved as the checkpoint's Approve does, the next one drafted
+    const e = explicitReview(s, opts.doc, 'approve');
+    if ('error' in e) {
+      rt.print(e.error);
+      return errorResult(s.name, e.why ?? e.error);
+    }
+    const refused = s.docs[e.doc].refused ?? s.refused;
+    if (refused) {
+      rt.print(`✗ Cannot approve ${SPEC_DOC_FILES[e.doc]}: ${specRefusalText(refused)}`);
+      return errorResult(s.name, refused);
+    }
+    const c = flowCtx(rt, s, { autoApprove: opts.autoApprove === true, ...(opts.description ? { desc: opts.description } : {}) });
+    c.trace.push({ state: 'approved', doc: e.doc });
+    const next = nextDoc(c.order, e.doc);
+    if (!next) {
+      c.trace.push({ state: 'ready' });
+      onReady(c);
+      return result(c, 'ready');
+    }
+    return withFinish(rt, () => phaseLoop(c, next, true));
+  }
   if (s.phase === 'execution' || s.phase === 'done') {
     const c = flowCtx(rt, s, {});
     c.trace.push({ state: 'approved', doc: 'tasks' }, { state: 'ready' });
@@ -1244,7 +1358,13 @@ export async function approveSpec(rt: SpecRuntime, name: string, opts: ResumeOpt
 export async function reviseSpec(rt: SpecRuntime, name: string, feedback: string, opts: ResumeOptions = {}): Promise<FlowResult> {
   const s = findSpec(rt, name);
   if (!s) return notFound(rt, name);
-  const doc: SpecDocKind | undefined = s.awaitingApproval ?? (s.phase === 'execution' || s.phase === 'done' ? 'tasks' : undefined);
+  // `--doc`: the document named (r9 #6), not the one the files give
+  const named = opts.doc ? explicitReview(s, opts.doc, 'revise') : undefined;
+  if (named && 'error' in named) {
+    rt.print(named.error);
+    return errorResult(s.name, named.why ?? named.error);
+  }
+  const doc: SpecDocKind | undefined = named ? named.doc : (s.awaitingApproval ?? (s.phase === 'execution' || s.phase === 'done' ? 'tasks' : undefined));
   if (!doc) {
     const msg = s.refused
       ? `✗ Spec '${s.name}' cannot continue: ${specRefusalText(s.refused)}`

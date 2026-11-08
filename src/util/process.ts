@@ -32,7 +32,8 @@
  *  - `timeoutMs` counts only the time kiro-claude was running ({@link runningTimeout}, r8 #0/#1):
  *    the child goes on while kiro-claude is stopped (its own Ctrl+Z, `kill -TSTP`, `kill -STOP`),
  *    but the stop is not counted against its timeout, and a child that exited meanwhile is
- *    reported with its exit status (a hook's block stays a block), never as timed out.
+ *    reported with its exit status (a hook's block stays a block), never as timed out; also
+ *    after several stops back to back (stopped again while it handled a continue, r9 #0).
  *  - While kiro-claude dies of a fatal signal that claude/lifecycle.ts forwards (`dyingSignal()`,
  *    review r5 H2) no command is started (`aborted`, `error` "kiro-claude is shutting down"),
  *    and a run that a signal ended meanwhile is `aborted` too, not a failure: the hook runner
@@ -225,6 +226,8 @@ function hrMs(start: bigint): number {
 const BEAT_MS = 100;
 /** A beat this much later than the one before saw a gap: a stop (if a SIGCONT confirms it) or a blocked loop. */
 const GAP_MS = 2 * BEAT_MS;
+/** How many turns in a row a {@link runningTimeout} expiry may be put off (see there). */
+const MAX_REDEFERS = 10;
 
 const nowMs = (): number => Number(process.hrtime.bigint()) / 1e6;
 
@@ -236,7 +239,9 @@ const nowMs = (): number => Number(process.hrtime.bigint()) / 1e6;
  * heartbeat interval: never more than the stop (the stop began at most one interval after the
  * last beat, unless the loop was blocked right before it). A gap without a SIGCONT (a blocked
  * event loop, a slow machine) is never credited, nor one the loop ran on after before a SIGCONT
- * came (a blocked loop, then a short or stray stop: only the stop counts).
+ * came (a blocked loop, then a short or stray stop: only the stop counts). Every stop is
+ * credited, also two back to back with no beat between them (r9 #0: one ended by the SIGCONT
+ * whose dispatch the next one interrupted), see {@link onSigcont}.
  */
 const stopClock = {
   /** The stops credited while the clock runs (process.hrtime ms; `from` = `to` less the credit). */
@@ -259,24 +264,30 @@ function onBeat(): void {
   stopClock.aliveAt = now;
 }
 
+/** Credit the gap `from`..`to` (no beat ran in it) as stopped time, less one heartbeat interval. */
+function creditStop(from: number, to: number): void {
+  const credit = to - from - BEAT_MS;
+  if (credit > 0) stopClock.stops.push({ from: to - credit, to });
+}
+
 /**
  * SIGCONT: kiro-claude continues. Its handler runs in the poll phase, after the timers phase
- * that may already have run a beat (which saw the gap and moved `aliveAt`): the longer of that
- * gap (only the latest beat's: no beat ran since it) and the one since `aliveAt` is the stop.
+ * that may already have run a beat (which saw the gap and moved `aliveAt`). Both that gap (only
+ * the latest beat's: no beat ran since it) and the span since `aliveAt` are credited: the span
+ * is under a heartbeat after a single stop (nothing more is credited), and is a second stop when
+ * kiro-claude was stopped again before this listener ran, by an earlier SIGCONT listener (a
+ * terminal mode change from the background stops it with SIGTTOU) or by another stop back to back
+ * (r9 #0: before, only the longer of the two counted, and a hook that exited 2 during the second
+ * stop was killed as timed out). The listener is prepended ({@link joinStopClock}), so the first
+ * stop is credited before any other listener runs; the sum covers a listener added in front of it.
  */
 function onSigcont(): void {
   const now = nowMs();
-  let span = now - stopClock.aliveAt;
-  let to = now;
   const g = stopClock.gap;
-  if (g && g.to === stopClock.aliveAt && g.to - g.from > span) {
-    span = g.to - g.from;
-    to = g.to;
-  }
+  if (g && g.to === stopClock.aliveAt) creditStop(g.from, g.to);
+  creditStop(stopClock.aliveAt, now);
   stopClock.gap = undefined;
   stopClock.aliveAt = now;
-  const credit = span - BEAT_MS;
-  if (credit > 0) stopClock.stops.push({ from: to - credit, to });
 }
 
 /** Stopped time credited after `since` (a stop that began before it counts from `since` on). */
@@ -292,8 +303,9 @@ function joinStopClock(): void {
   stopClock.gap = undefined;
   stopClock.beat = setInterval(onBeat, BEAT_MS);
   stopClock.beat.unref();
-  // no job control on Windows: nothing stops kiro-claude there
-  if (!isWin) process.on('SIGCONT', onSigcont);
+  // no job control on Windows: nothing stops kiro-claude there. Prepended: it credits the stop
+  // before another SIGCONT listener (the terminal reader's) runs, which might stop it again
+  if (!isWin) process.prependListener('SIGCONT', onSigcont);
 }
 
 function leaveStopClock(): void {
@@ -318,7 +330,12 @@ export interface RunningTimer {
  * `setTimeout` counts the stop, and at SIGCONT libuv runs expired timers before the poll phase
  * that delivers what happened meanwhile (a child's exit, an answer in a pipe). So:
  *  - the expiry is decided one event-loop turn after the timer fired (`setImmediate`): what
- *    arrived during a stop is handled first, and `onExpire` re-checks its own state;
+ *    arrived during a stop is handled first, and `onExpire` re-checks its own state. When that
+ *    turn took longer than a heartbeat (kiro-claude was stopped or blocked again after the timer
+ *    fired, e.g. inside a SIGCONT listener: r9 #0) the decision moves one more turn on, so that
+ *    the poll phase first delivers what was queued meanwhile (that stop's SIGCONT, a child's
+ *    exit, an answer); at most {@link MAX_REDEFERS} times in a row, so a loop blocked in every
+ *    turn still decides;
  *  - stopped time ({@link stopClock}) is not counted: when a stop was credited since the timer
  *    was armed, it is re-armed for the running time left, so a genuinely hung child still expires
  *    after `ms` of running time. Without a stop the expiry is the plain timer's (one turn later).
@@ -341,17 +358,29 @@ export function runningTimeout(ms: number, onExpire: (firedAt: number) => void):
     timer = setTimeout(() => {
       timer = undefined;
       const firedAt = nowMs();
-      immediate = setImmediate(() => {
+      /** When the decision was (last) put off by a turn. */
+      let deferredAt = firedAt;
+      let redefers = 0;
+      const decide = (): void => {
         immediate = undefined;
         if (done) return;
+        const now = nowMs();
+        // no poll phase since it was deferred, and a stop or block in between (r9 #0): one more turn
+        if (now - deferredAt > BEAT_MS && redefers < MAX_REDEFERS) {
+          redefers++;
+          deferredAt = now;
+          immediate = setImmediate(decide);
+          return;
+        }
         const stopped = stoppedSince(start);
         if (stopped > 0) {
-          const left = total - (nowMs() - start - stopped);
+          const left = total - (now - start - stopped);
           if (left >= 1) return arm(left);
         }
         end();
         onExpire(firedAt);
-      });
+      };
+      immediate = setImmediate(decide);
     }, clampTimerMs(delay));
   };
   arm(total);

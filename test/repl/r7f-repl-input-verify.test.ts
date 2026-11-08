@@ -90,6 +90,7 @@ test('r7f verify #2: a Ctrl+Z while a turn runs waits for the next prompt (drawn
   // the next prompt: drawn, then the stop, then the rest of the type-ahead
   mark = log.length;
   p = r.readInput('> ');
+  await tick(); // r9 #0/#1: the terminal is taken back two event-loop turns after the continue
   const after = since(mark);
   const kill = after.indexOf('kill:0:SIGTSTP');
   assert.ok(kill >= 0, `no stop at the next prompt: ${JSON.stringify(after)}`);
@@ -124,6 +125,7 @@ test('r7f verify #2: a stop from elsewhere (SIGCONT) takes the terminal back: ra
   await tick();
   let mark = log.length;
   process.emit('SIGCONT');
+  await tick(); // r9 #0/#1: taken back two event-loop turns later, never inside the SIGCONT dispatch
   let after = since(mark);
   const off = after.indexOf('raw:false');
   const on = after.indexOf('raw:true');
@@ -141,6 +143,7 @@ test('r7f verify #2: a stop from elsewhere (SIGCONT) takes the terminal back: ra
   await tick(300); // a later stop, not the SIGCONT of the one just handled
   mark = log.length;
   process.emit('SIGCONT');
+  await tick();
   after = since(mark);
   assert.ok(after.includes('raw:false') && after.includes('raw:true'), JSON.stringify(after));
   assert.doesNotMatch(outText(after), />/, 'a prompt was drawn over the turn output');
@@ -157,6 +160,7 @@ test('r7f verify #2: SIGCONT right after the reader\'s own Ctrl+Z is not handled
     await tick();
     const mark = log.length;
     process.emit('SIGCONT'); // the stop's own SIGCONT, dispatched after the key handler
+    await tick();
     assert.deepEqual(since(mark), [], 'the continuation was handled twice');
     input.write('\r');
     assert.deepEqual(await p, { kind: 'line', text: 'x' });
@@ -164,6 +168,7 @@ test('r7f verify #2: SIGCONT right after the reader\'s own Ctrl+Z is not handled
     await tick(300);
     const mark2 = log.length;
     process.emit('SIGCONT');
+    await tick(); // r9 #0/#1: two event-loop turns later
     assert.ok(since(mark2).includes('raw:true'), JSON.stringify(since(mark2)));
   }
   // a child owns the terminal ($EDITOR, !cmd): it is the child's; resume() takes it back later
@@ -174,6 +179,7 @@ test('r7f verify #2: SIGCONT right after the reader\'s own Ctrl+Z is not handled
     r.suspend();
     const mark = log.length;
     process.emit('SIGCONT');
+    await tick();
     assert.deepEqual(since(mark), []);
     r.resume();
   }
@@ -186,6 +192,7 @@ test('r7f verify #2: SIGCONT right after the reader\'s own Ctrl+Z is not handled
     muted = true;
     const mark = log.length;
     process.emit('SIGCONT');
+    await tick();
     assert.ok(!since(mark).some((e) => e.startsWith('out:')), JSON.stringify(since(mark)));
   }
   // closed: the reader no longer listens

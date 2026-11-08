@@ -6,11 +6,14 @@
  * 0. preflight (node ≥ 22.12 when building, Python ≥ 3.12, git ≥ 2.36 when fetching, free disk
  *    ≥ 3 GB light / 2.5 GB `--slim` / 4 GB `--full` when fetching or building, Claude found; sign-in
  *    is a warning only) and the path guards (linked worktree; a checkout that is or is inside
- *    crew's npm or pip build cache or the claude-agent-acp bridge prefix `$CS/node`, whatever named
- *    it: `--dir`, KIRO_CLAUDE_CREW_DIR or an earlier setup; temp dir without `--allow-tmp`; `$CS`
+ *    crew's npm or pip build cache or the claude-agent-acp bridge's `$CS/node/node_modules`, or
+ *    that is the bridge prefix `$CS/node` itself, whatever named it: `--dir`, KIRO_CLAUDE_CREW_DIR
+ *    or an earlier setup (build.ts {@link crewDirRefusal}; a directory beside node_modules, such as
+ *    `$CS/node/KiroCrew`, is allowed: npm leaves it alone); temp dir without `--allow-tmp`; `$CS`
  *    inside a probe-hidden dir; a cache that holds a Kiro Crew checkout when a build will run, or
- *    `$CS/node` when the bridge will be installed: build.ts {@link crewDirCheckout}), all before
- *    anything but `run/setup.log` is written;
+ *    `$CS/node/node_modules` that holds one or `$CS/node` that is one when the bridge will be
+ *    installed: build.ts {@link crewDirCheckout}), all before anything but `run/setup.log` is
+ *    written;
  * 1. fetch the pinned KiroCrew (fetch.ts; skipped with `--no-fetch`);
  * 2. build (build.ts; light default, `--full` = `make build`, `--no-build` skips);
  * 3. write the shim (shim.ts; prints the restart hint if the gateway runs and the bytes changed);
@@ -27,7 +30,7 @@ import * as readline from 'node:readline';
 
 import { isSubpath } from '../util/paths.js';
 import { KIRO_CLAUDE_VERSION } from '../version.js';
-import { builtState, buildKiroCrew, checkoutInside, crewDirCheckout, crewDirHolding, detectBuildNode, detectGit, detectPython, fallbackNodeOf, findNpm, installMembersAdapter, membersAdapterInstalled, type ToolInfo } from './build.js';
+import { builtState, buildKiroCrew, checkoutInside, crewDirCheckout, crewDirRefusal, detectBuildNode, detectGit, detectPython, fallbackNodeOf, findNpm, installMembersAdapter, looksLikeCheckout, membersAdapterInstalled, type ToolInfo } from './build.js';
 import { kirocrewFor, loadState, readReady, type CrewCtx } from './context.js';
 import { renderRow, runDoctor } from './doctor.js';
 import { defaultStateEnv } from './env.js';
@@ -137,11 +140,10 @@ async function setupSteps(c: CrewCtx, o: SetupOptions, rep: Report): Promise<num
   if (inLinkedGitWorktree(loc.dir)) {
     rep.fail('preflight', `${loc.dir} is inside a linked git worktree; Kiro Crew treats such checkouts as ephemeral and will not manage ~/.kiro/agents. Use a primary clone of kiro-claude, or pass --dir <path elsewhere>.`);
   }
-  // A checkout in crew's caches or bridge prefix is lost to the build, npm or --purge (r8 #3).
-  const owned = crewDirHolding(loc.dir, paths);
-  if (owned) {
-    rep.fail('preflight', `${loc.dir} is in ${owned.path}, ${owned.what}: ${owned.why}. Put the Kiro Crew checkout elsewhere (--dir <path>, or KIRO_CLAUDE_CREW_DIR).`);
-  }
+  // A checkout in crew's caches or the bridge's node_modules is lost to the build or npm, and npm
+  // writes the bridge into the bridge prefix (r8 #3); a directory beside node_modules is fine (r9 #5).
+  const owned = crewDirRefusal(loc.dir, paths);
+  if (owned) rep.fail('preflight', `${owned}. Put the Kiro Crew checkout elsewhere (--dir <path>, or KIRO_CLAUDE_CREW_DIR).`);
   if (!o.allowTmp && isUnderTmp(loc.dir, sys.tmpdir())) {
     rep.fail('preflight', `${loc.dir} is under the system temp directory (${sys.tmpdir()}); Kiro Crew treats short-lived trees as ephemeral. Pass --allow-tmp to use it anyway.`);
   }
@@ -164,8 +166,8 @@ async function setupSteps(c: CrewCtx, o: SetupOptions, rep: Report): Promise<num
   const b = builtState(loc.dir);
   const alreadyBuilt = b.venv && b.dist && (buildKind !== 'full' || prev?.kirocrew.build === 'full');
   const buildLikely = buildKind !== 'none' && !alreadyBuilt;
-  // The build empties the caches, and npm prunes $CS/node: neither runs over a Kiro Crew checkout
-  // left there, e.g. by an earlier kiro-claude (r8 #3).
+  // The build empties the caches, and npm prunes $CS/node/node_modules and writes into $CS/node:
+  // neither runs over a Kiro Crew checkout left there, e.g. by an earlier kiro-claude (r8 #3).
   const atRisk = (buildLikely ? crewDirCheckout(paths, 'build') : undefined) ?? (members === 'claude' && !membersAdapterInstalled(paths) ? crewDirCheckout(paths, 'members') : undefined);
   if (atRisk) rep.fail('preflight', atRisk);
 
@@ -553,7 +555,8 @@ interface PurgeResult {
   rmdirError?: NodeJS.ErrnoException;
   /**
    * The entries of `$CS` kept because a target in them is or holds a Kiro Crew checkout: `named`
-   * for the one crew.json names, `other` for one found by {@link holdsCheckout}'s search.
+   * for the one crew.json names, `other` for one found by {@link holdsCheckout}'s search. The
+   * bridge prefix, kept whenever it holds anything but the bridge, is labelled the same way.
    */
   keptForCheckout: Map<string, 'named' | 'other'>;
 }
@@ -561,30 +564,35 @@ interface PurgeResult {
 /**
  * `--purge`: removes what crew created in `$CS` — the shim dir (when empty), the run files, the
  * build caches, crew.json leftovers and the private claude-agent-acp prefix (only when its
- * package.json depends on nothing but that adapter) — then `$CS` itself when empty. Unknown
- * entries and a Kiro Crew checkout inside `$CS` are kept: a cache or the bridge prefix that is or
- * holds one ({@link holdsCheckout}: `checkout`, the one crew.json names, or any that looks like
- * one) is not removed (r8 #3). A `$CS` that is a symbolic link is purged through the link (crew's
- * entries of its target only) and the link itself is kept: rmdir refuses it.
+ * package.json depends on nothing but that adapter and it holds nothing but npm's files) — then
+ * `$CS` itself when empty. Unknown entries and a Kiro Crew checkout inside `$CS` are kept: a cache
+ * or the bridge prefix that is or holds one ({@link holdsCheckout}: `checkout`, the one crew.json
+ * names, or any that looks like one) is not removed (r8 #3), and a prefix kept for holding
+ * something else, such as a checkout beside node_modules (r9 #5), is labelled when that is one. A
+ * `$CS` that is a symbolic link is purged through the link (crew's entries of its target only) and
+ * the link itself is kept: rmdir refuses it.
  */
 function purgeStateDir(c: CrewCtx, checkout?: string): PurgeResult {
   const p = c.paths;
   const keptForCheckout = new Map<string, 'named' | 'other'>();
-  /** Removes `target` unless it is or holds a checkout. */
-  const removeTarget = (target: string): void => {
+  /** Records the entry of `$CS` holding `target` when that is or holds a checkout; true then. */
+  const keptFor = (target: string): boolean => {
     const held = holdsCheckout(target, checkout);
-    if (!held) {
-      fs.rmSync(target, { recursive: true, force: true });
-      return;
-    }
+    if (!held) return false;
     const entry = path.relative(p.stateDir, target).split(path.sep)[0]!;
     if (keptForCheckout.get(entry) !== 'named') keptForCheckout.set(entry, held);
+    return true;
+  };
+  /** Removes `target` unless it is or holds a checkout. */
+  const removeTarget = (target: string): void => {
+    if (!keptFor(target)) fs.rmSync(target, { recursive: true, force: true });
   };
   rmdirIfEmpty(p.binDir);
   removeOwnRunFiles(c);
   for (const d of [p.npmCache, p.pipCache]) removeTarget(d);
   rmdirIfEmpty(p.cacheDir);
   if (isOwnMembersPrefix(p.membersPrefix)) removeTarget(p.membersPrefix);
+  else keptFor(p.membersPrefix); // kept anyway: only labelled
   try {
     for (const e of fs.readdirSync(p.stateDir)) {
       if (CREW_JSON_TMP.test(e)) fs.rmSync(path.join(p.stateDir, e), { force: true });
@@ -682,7 +690,8 @@ function entryHolding(child: string, parent: string): { entry: string; itself: b
  * taken right before {@link purgeStateDir}, `result` what that returned, `checkout` the Kiro
  * Crew checkout crew.json names (labelled among the kept entries when it is inside `$CS`:
  * `KiroCrew (the Kiro Crew checkout)`, `cache (holds the Kiro Crew checkout)`); an entry kept
- * because a target in it holds another checkout reads `cache (holds a Kiro Crew checkout)`.
+ * because a target in it holds another checkout reads `cache (holds a Kiro Crew checkout)`, or
+ * `node (a Kiro Crew checkout)` when the entry itself looks like one.
  * - `Purged $CS` only when `$CS` is really gone (lstat fails with ENOENT; a listing would read
  *   through a link at `$CS`);
  * - otherwise `Purged <topmost removed> from $CS`, or `Nothing to purge in $CS` when nothing was
@@ -708,6 +717,7 @@ function reportPurge(c: CrewCtx, before: readonly string[], result: PurgeResult,
   const label = (e: string): string => {
     if (e === holder?.entry) return `${e} (${holder.itself ? 'the' : 'holds the'} Kiro Crew checkout)`;
     const kept = result.keptForCheckout.get(e);
+    if (kept === 'other' && looksLikeCheckout(path.join(cs, e))) return `${e} (a Kiro Crew checkout)`; // e.g. a node/ that is one
     return kept ? `${e} (holds ${kept === 'named' ? 'the' : 'a'} Kiro Crew checkout)` : e;
   };
   const after = (entriesOf(cs) ?? []).map(label);

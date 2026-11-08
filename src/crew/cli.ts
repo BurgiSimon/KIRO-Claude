@@ -67,9 +67,11 @@ Options:
 
 The checkout (--dir, KIRO_CLAUDE_CREW_DIR or the one an earlier setup used) must not be in a
 linked git worktree, nor under the system temp directory without --allow-tmp, nor in crew's
-build caches (cache/npm, cache/pip) or claude-agent-acp bridge (node/) in the crew state
-directory: the build and npm delete what is there. For the same reason setup
-does not build while those caches, or install the bridge while node/, hold a Kiro Crew checkout.
+build caches (cache/npm, cache/pip) in the crew state directory, which every build empties,
+nor in node/node_modules, where npm keeps only packages when it installs the claude-agent-acp
+bridge, nor be node/ itself, where npm installs it (a directory beside node_modules in node/
+is fine). For the same reason setup does not build while those caches hold a Kiro Crew
+checkout, nor install the bridge while node/node_modules holds one or node/ is one.
 `,
   doctor: `Check the Kiro Crew installation
 

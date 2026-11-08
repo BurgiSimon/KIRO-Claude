@@ -317,8 +317,12 @@ export function specRefusals(s: Pick<SpecSummary, 'refused' | 'docs'>): string[]
   return [...new Set([s.refused, ...(Object.keys(SPEC_DOC_FILES) as SpecDocKind[]).map((k) => s.docs[k].refused)].filter((r): r is string => !!r))];
 }
 
-/** A refused document that exists counts as present for the phase and the type (never drafted over as missing). */
-function present(d: SpecDocInfo): boolean {
+/**
+ * The document counts as present for the phase and the type: it has content, or it exists and is
+ * refused (never drafted over as missing). Also what `approve` / `revise --doc` require of the
+ * document they name and of every document before it (workflow, r9 #6).
+ */
+export function present(d: SpecDocInfo): boolean {
   return d.nonEmpty || (d.refused !== undefined && d.exists);
 }
 

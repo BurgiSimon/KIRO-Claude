@@ -177,7 +177,8 @@ describe('r8f crew verify: the bridge install does not run while $CS/node holds 
       fe.makeCheckout(dir, { built: true });
       const r = await setup(fe, ['--dir', dir]);
       assert.equal(r.code, 1, `${r.stdout}\n${r.stderr}`);
-      assert.match(r.stderr, new RegExp(`❌ preflight: ${esc(old)} looks like a Kiro Crew checkout \\(bin/kirocrew or \\.git\\) and is in ${esc(path.join(fe.cs, 'node'))}, crew's claude-agent-acp bridge, where npm removes what is not a package when it installs the bridge\\. Move it out of there first\\.`), r.stderr);
+      // r9 #5: what npm prunes is $CS/node/node_modules, and the message names it.
+      assert.match(r.stderr, new RegExp(`❌ preflight: ${esc(old)} looks like a Kiro Crew checkout \\(bin/kirocrew or \\.git\\) and is in ${esc(path.join(fe.cs, 'node', 'node_modules'))}, crew's claude-agent-acp bridge, where npm removes what is not a package when it installs the bridge\\. Move it out of there first\\.`), r.stderr);
       assert.deepEqual(fe.callsOf('npm'), []);
       assert.equal(fs.existsSync(work), true);
       // --members none needs no bridge: that setup goes on.
@@ -247,7 +248,8 @@ describe('r8f crew verify: the docs describe what a refused setup writes and the
     assert.match(where, /only `run\/setup\.log` is written before/);
     assert.match(where, /looks like a Kiro Crew checkout \(`bin\/kirocrew` or a `\.git`\)/);
     const readme = flat(fs.readFileSync(path.join(repoRoot(), 'README.md'), 'utf8'));
-    assert.match(readme, /nor does it build or install the bridge while one of them holds a Kiro Crew checkout/);
+    // r9 #5: the bridge install waits for node/node_modules or a node/ that is one, not for node/ as a whole.
+    assert.match(readme, /nor does it build while a cache holds a Kiro Crew checkout, or install the bridge while `node\/node_modules` holds one or `node\/` is one/);
   });
 
   it('crew setup --help says setup does not build or install the bridge over a checkout there', async () => {
@@ -255,7 +257,7 @@ describe('r8f crew verify: the docs describe what a refused setup writes and the
     try {
       const s = await crew(fe, ['setup', '--help']);
       assert.equal(s.code, 0);
-      assert.match(flat(s.stdout), /setup does not build while those caches, or install the bridge while node\/, hold a Kiro Crew checkout\./);
+      assert.match(flat(s.stdout), /setup does not build while those caches hold a Kiro Crew checkout, nor install the bridge while node\/node_modules holds one or node\/ is one\./);
     } finally {
       fe.cleanup();
     }

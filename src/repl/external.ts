@@ -3,9 +3,22 @@
  * (01 §5.7, §9: `EDITOR`, fallback `vi`) and `!cmd` shell escapes (01 §4.3 step 4: `bash -c`
  * via util/process `shellInvocation`, inherited stdio, not sent to the model).
  *
- * When the REPL runs on a real terminal (`inherit`), the child gets the TTY (stdio inherited)
- * and the caller suspends the line reader around it. Otherwise (pipes, tests) the child's
- * output is copied to the REPL's output streams and its stdin is closed.
+ * When the REPL reads the keyboard (`inherit`: terminal mode on the process's own stdin), the
+ * child gets that terminal on stdin and the caller suspends the line reader around it, whatever
+ * the REPL's stdout is (`kiro-claude chat | tee log` reads raw keys too, r9 #2). Its output goes
+ * where Q sends it (Q runs both with `Command::status()`, every stream inherited): straight to
+ * the process's own stdout and stderr, a pipe included, so it reaches the screen in order with
+ * what the REPL writes before and after it (the reader's bracketed-paste switches go to stdout
+ * too; the caller first waits until what Node still queues for a pipe is handed to the OS, and
+ * takes the terminal back only in the foreground: repl/core.ts flushedForChild, handBack).
+ * DECISION: not to the controlling terminal (`/dev/tty`), which would keep an editor's
+ * screen out of a piped log but could overtake output still in the pipe, may not exist, and is
+ * not what Q does; an editor may then say its output is not a terminal (vim: a 2 s pause), as
+ * under Q. An output stream that is not the process's own (an embedder's) gets the child's
+ * output copied instead (`inheritStdout` / `inheritStderr`). Nothing is watched while the child
+ * runs: one given the terminal gets Ctrl+C from the terminal itself (cooked mode, kiro-claude's
+ * foreground process group). Otherwise (piped input, tests) the child's stdin is closed (it
+ * never takes the REPL's next input line) and its output is copied to the REPL's output streams.
  */
 
 import { spawn } from 'node:child_process';
@@ -17,8 +30,12 @@ import { shlexSplit } from '../util/shlex.js';
 import type { EditorResult } from './types.js';
 
 export interface ChildIo {
-  /** Give the child the real terminal. */
+  /** Give the child the terminal the REPL reads (stdin inherited; see module doc). */
   inherit: boolean;
+  /** With `inherit`: the child writes to the process's stdout itself (default), else through `out`. */
+  inheritStdout?: boolean;
+  /** With `inherit`: the child writes to the process's stderr itself (default), else through `err`. */
+  inheritStderr?: boolean;
   out: (s: string) => void;
   err: (s: string) => void;
   cwd: string;
@@ -38,7 +55,9 @@ function runChild(file: string, args: string[], io: ChildIo, windowsVerbatimArgu
       child = spawn(file, args, {
         cwd: io.cwd,
         env: io.env,
-        stdio: io.inherit ? 'inherit' : ['ignore', 'pipe', 'pipe'],
+        stdio: io.inherit
+          ? ['inherit', io.inheritStdout === false ? 'pipe' : 'inherit', io.inheritStderr === false ? 'pipe' : 'inherit']
+          : ['ignore', 'pipe', 'pipe'],
         windowsVerbatimArguments,
       });
     } catch (e) {

@@ -168,7 +168,12 @@
  *    dropped `--effort` for a model without that level (a start or respawn on it, an `/agent
  *    swap` to an agent pinning it). A child that got the level (`--effort`, a later `/effort`)
  *    gets no extra line, also after a switch through a model without effort levels: Claude Code
- *    keeps the level across set_model (VERIFIED 2.1.319), r8 #8.
+ *    keeps the level across set_model (VERIFIED 2.1.319), r8 #8. One line per change (r9 #3):
+ *    a level setEffort queued (a turn ran, the child was down, a restored history was pending),
+ *    or a switch made while a turn ran queued, is settled by a later switch's line for that
+ *    record and level (effortLine), so the next prompt line (or `/compact` line) does not
+ *    get it a second time. (A respawn before that line, which starts the child with the level as
+ *    `--effort`, still gets the queued line: one line, R4 #6.)
  *  - A respawn that finishes after `close()` closes its new child and fails ("The session is
  *    closed"): no child outlives its session (ACP terminate during `session/set_mode`).
  *  - `KIRO_CLAUDE_FORCE_MODEL` also pins Claude subagents (`CLAUDE_CODE_SUBAGENT_MODEL[_FORCE]`);
@@ -920,7 +925,8 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
    * record left since (a tangent, a rewind, its parent) never gets it as a line (its child starts
    * with its own saved `--effort`, which holds the level: the effort is session state, saved on
    * the records a tangent returns to, r7 #3). A later setEffort replaces it, also when that one
-   * is written at once.
+   * is written at once. A line that gives the child this level first (the `/model` switch's,
+   * effortAfterSwitch) settles it (effortLine), so Claude Code gets one line per change (r9 #3).
    */
   private pendingEffort: { rec: SessionRecord; level: string } | undefined;
   /**
@@ -2717,10 +2723,18 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     }
   }
 
-  /** A silent `/effort <level>` line; the running child has the level once Claude accepts it (childEffort). */
+  /**
+   * A silent `/effort <level>` line; the running child has the level once Claude accepts it
+   * (childEffort). An accepted line also settles the line queued for this record at that level
+   * (setEffort while a turn ran, then the `/model` switch's own line): Claude Code gets one line
+   * per change (r9 #3).
+   */
   private async effortLine(level: string): Promise<TurnResult> {
     const r = await this.runLocal(`/effort ${level}`);
-    if (!r.isError) this.childEffort = level;
+    if (!r.isError) {
+      this.childEffort = level;
+      if (this.pendingEffort?.rec === this.rec && this.pendingEffort.level === level) this.pendingEffort = undefined;
+    }
     return r;
   }
 
@@ -3969,7 +3983,10 @@ export async function createSession(opts: KiroSessionOptions): Promise<KiroSessi
  * fork's transcript only with its first message) forks its source again, at its own point or the
  * record's last turn ({@link forkPointFor}); otherwise the exported Claude session, when it still
  * exists, is forked at the record's last turn (it may have run on since the export); otherwise a
- * fresh session gets the exported journal as context. An exported restored history still pending
+ * fresh session gets the exported journal as context (no `pendingFork`: a reopen before its first
+ * message resumes its fresh Claude id, which has no transcript unless a local command such as a
+ * refused `/compact` wrote one, and falls back on that history with spawn's warning, r9 #4). An
+ * exported restored history still pending
  * (`pendingHistory`) is kept in every case (instead of the journal's, R4 #1). The record keeps
  * its turns in every case (a reopen does too): the journal is their history when Claude has none.
  * Trust is not carried
