@@ -29,7 +29,9 @@
  *
  * A hung-up terminal also fails reads and writes (EIO): the line reader takes an input error for
  * end of input (repl/input.ts) and cli/main.ts ignores EIO on stdout / stderr, so neither crashes
- * kiro-claude before the close (r5 #1).
+ * kiro-claude before the close (r5 #1). That end of input reaches the REPL a moment before Node
+ * dispatches the hangup's SIGHUP, so the REPL waits for it ({@link ExitSignals.awaitSignal},
+ * bounded by {@link DUPLICATE_SIGNAL_WINDOW_MS}) instead of quitting first (r6 #3).
  */
 
 import * as os from 'node:os';
@@ -78,6 +80,8 @@ export class ExitSignals {
   private disposed = false;
   private grace: NodeJS.Timeout | undefined;
   private dying: Promise<never> | undefined;
+  /** The {@link awaitSignal} calls still waiting. */
+  private readonly waiters = new Set<() => void>();
 
   constructor(
     /** Close everything the front end opened (a session still being created is its own business). */
@@ -121,6 +125,31 @@ export class ExitSignals {
     for (const sig of [...this.listeners.keys()]) this.off(sig);
     if (this.grace) clearTimeout(this.grace);
     this.grace = undefined;
+    this.wake();
+  }
+
+  /**
+   * Resolves at the first signal, at once when one was already received or the listeners are
+   * gone ({@link dispose}), else after `ms`. Its timer keeps the event loop alive meanwhile, so a
+   * signal that is on its way is still dispatched to these listeners. A hung-up terminal ends the
+   * input (EOF / EIO) a moment before Node dispatches the SIGHUP that comes with it: the front end
+   * waits here before it takes that end of input for a quit (repl/core.ts, r6 #3).
+   */
+  awaitSignal(ms: number): Promise<void> {
+    if (this.received || this.disposed) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const done = (): void => {
+        clearTimeout(t);
+        this.waiters.delete(done);
+        resolve();
+      };
+      const t = setTimeout(done, ms);
+      this.waiters.add(done);
+    });
+  }
+
+  private wake(): void {
+    for (const w of [...this.waiters]) w();
   }
 
   /**
@@ -149,6 +178,7 @@ export class ExitSignals {
     for (const st of this.streams) (st as { on?: (e: string, f: () => void) => void } | undefined)?.on?.('error', noop);
     this.startAbort.abort();
     this.grace = setTimeout(() => this.reraise(), SIGNAL_CLOSE_GRACE_MS);
+    this.wake();
     // while the first session is created, the front end calls die() once its creation settles
     if (this.started) void this.die();
   }

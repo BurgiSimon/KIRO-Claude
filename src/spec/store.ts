@@ -19,14 +19,15 @@
  *
  * Every read and write here goes through spec/docfs.ts (review X1; the research is silent on
  * links in spec folders, so this is the safest reading): a document or `.config.kiro` that is a
- * symbolic link (or not a regular file, or behind a link that resolves to nothing, or outside the
- * workspace) is never read; its {@link SpecDocInfo.refused} and the spec's
- * {@link SpecSummary.refused} say why. Such a document counts as present when the phase is
+ * symbolic link (or not a regular file, or behind a link that resolves to nothing or whose target
+ * cannot be accessed, or outside the workspace) is never read; its {@link SpecDocInfo.refused}
+ * and the spec's {@link SpecSummary.refused} say why. Such a document counts as present when the phase is
  * derived (it is never offered for drafting as if it were missing), has no known content
  * (`nonEmpty` false) and is left out of the loaded texts and the context block. A spec folder
- * linked out of the workspace (or dangling) is listed with its reason, and nothing in it is read;
- * a `.kiro` or `.kiro/specs` linked out of the workspace (or dangling) is not enumerated at all
- * ({@link specsDirRefused}: the list commands print why instead).
+ * linked out of the workspace (or dangling, or to a target kiro-claude cannot access: a folder on
+ * the way the user cannot enter) is listed with its reason, and nothing in it is read; such a
+ * `.kiro` or `.kiro/specs` is not enumerated at all ({@link specsDirRefused}: the list commands
+ * print why instead; `kiro-claude spec list` and `status` exit 1).
  */
 
 import { randomUUID } from 'node:crypto';
@@ -74,8 +75,9 @@ export interface SpecDocInfo {
   mtimeMs: number;
   /**
    * Why kiro-claude does not read this document (docfs.specFileRefused): it is a symbolic link,
-   * not a regular file, behind a link that resolves to nothing, or outside the workspace. It may
-   * still exist (`exists`); its content is unknown (`nonEmpty` false).
+   * not a regular file, behind a link that resolves to nothing or whose target cannot be
+   * accessed, or outside the workspace. It may still exist (`exists`); its content is unknown
+   * (`nonEmpty` false).
    */
   refused?: string;
 }
@@ -113,9 +115,10 @@ export function specsDir(ws: Pick<WorkspaceContext, 'workspaceRoot'>): string {
 }
 
 /**
- * Why `.kiro/specs` itself is not used (a `.kiro` or `.kiro/specs` linked out of the workspace
- * or to nothing: docfs), else undefined. {@link listSpecs} then lists nothing (the entries are
- * another folder's) and the list commands print this reason instead.
+ * Why `.kiro/specs` itself is not used (a `.kiro` or `.kiro/specs` linked out of the workspace,
+ * to nothing or to a target that cannot be accessed: docfs), else undefined. {@link listSpecs}
+ * then lists nothing (the entries are another folder's) and the list commands print this reason
+ * instead.
  */
 export function specsDirRefused(ws: Pick<WorkspaceContext, 'workspaceRoot'>): string | undefined {
   return specsRootRefused(ws.workspaceRoot);
@@ -137,8 +140,8 @@ export function normalizeSpecName(raw: string): string {
 
 /**
  * Existing spec folder for `name` (exact, then case-insensitive); never escapes the specs dir.
- * A folder link that resolves to nothing (dangling, a loop) is found too, so the commands can say
- * why it cannot be used ({@link SpecSummary.refused}).
+ * A folder link that cannot be followed (dangling, a loop, a target that cannot be accessed) is
+ * found too, so the commands can say why it cannot be used ({@link SpecSummary.refused}).
  */
 export function resolveSpecDir(ws: Pick<WorkspaceContext, 'workspaceRoot'>, name: string): string | undefined {
   const n = name.trim().replace(/[\\/]+$/, '');
@@ -157,7 +160,12 @@ export function resolveSpecDir(ws: Pick<WorkspaceContext, 'workspaceRoot'>, name
   }
 }
 
-/** `p` is a directory (also through a link), or a symbolic link that resolves to nothing. */
+/**
+ * `p` is a directory (also through a link), or a symbolic link `stat` cannot follow: dangling, a
+ * loop, or a target behind a folder the user cannot enter. Such a link is listed, and
+ * docfs.specFolderRefused gives the reason (DECISION: the research is silent; naming the link
+ * with its true reason is more useful than leaving it out as if there were no spec).
+ */
 function isSpecFolderEntry(p: string): boolean {
   try {
     return fs.statSync(p).isDirectory();
@@ -215,7 +223,8 @@ export function writeSpecConfig(dir: string, cfg: SpecConfig): void {
  * Create `.kiro/specs/<name>/` with its `.config.kiro` (the adapter creates the folder itself, no
  * permission prompt — 03 §1.2). Throws when the name is invalid, the folder already exists, or
  * the folder would not be a usable spec folder (a `.kiro` or `.kiro/specs` that is a link
- * resolving outside the workspace or to nothing: docfs.specFolderRefused).
+ * resolving outside the workspace, to nothing or to a target that cannot be accessed:
+ * docfs.specFolderRefused).
  */
 export function createSpecFolder(
   ws: Pick<WorkspaceContext, 'workspaceRoot'>,
@@ -294,7 +303,8 @@ function present(d: SpecDocInfo): boolean {
 
 /** Summary of one spec folder (never throws). */
 export function summarizeSpecDir(dir: string): SpecSummary {
-  // a folder linked out of the workspace (or to nothing): nothing in it is read
+  // a folder linked out of the workspace (or to nothing, or to a target that cannot be
+  // accessed): nothing in it is read
   const folderWhy = specFolderRefused(dir);
   const config = folderWhy ? null : readSpecConfig(dir);
   const configWhy = folderWhy ? undefined : specFileRefused(path.join(dir, CONFIG_FILE));
@@ -339,7 +349,7 @@ export function summarizeSpec(ws: Pick<WorkspaceContext, 'workspaceRoot'>, name:
 
 /**
  * Every spec folder under `.kiro/specs` (hidden folders skipped), sorted by name; also a folder
- * link that resolves to nothing (listed with its {@link SpecSummary.refused} reason). Nothing when
+ * link that cannot be followed (listed with its {@link SpecSummary.refused} reason). Nothing when
  * `.kiro/specs` itself is refused ({@link specsDirRefused}): its entries are not read.
  */
 export function listSpecs(ws: Pick<WorkspaceContext, 'workspaceRoot'>): SpecSummary[] {

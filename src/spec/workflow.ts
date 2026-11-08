@@ -64,7 +64,8 @@
  *    continuation that comes after a press under the next press (r5 P1); a cancelled
  *    continuation start gives the chat its own session back with a notice.
  *  - Spec files are read and written only through spec/docfs.ts (review X1): a document that is a
- *    symbolic link, not a regular file, behind a link that resolves to nothing, or outside the
+ *    symbolic link, not a regular file, behind a link that resolves to nothing or to a target that
+ *    cannot be accessed, or outside the
  *    workspace is never read or written by the workflow itself (the tasks.md repair, box updates,
  *    re-lint, sync diff, task context). Such a "refused" document is never drafted (`✗ Cannot
  *    draft …`); its checkpoint names the reason and offers no Approve (headless: the flow ends with

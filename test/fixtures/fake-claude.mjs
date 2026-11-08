@@ -1397,8 +1397,22 @@ function main() {
         }
         emit({ type: 'system', subtype: 'status', status: 'compacting', session_id: sessionId, uuid: uuid() });
         if (!(await sleep(Number(env.FAKE_CLAUDE_COMPACT_MS || 5), t.signal))) {
-          emit({ type: 'system', subtype: 'status', status: null, compact_result: 'failed', session_id: sessionId, uuid: uuid() });
-          return emitResult(t, { subtype: 'error_during_execution', is_error: true, terminal_reason: 'aborted_streaming', result: '' });
+          // interrupted while it compacts: real claude 2.1.319 (VERIFIED, haiku, r6) answers with a
+          // failed status that carries the abort as its compact_error, system/init, a synthetic
+          // assistant frame "Compaction canceled." with local_command_source (no local_command_run
+          // or local_command_outcome), then a SUCCESS result with local_command "compact",
+          // num_turns 0 and no terminal_reason; the line then reports `cancelled`. No boundary or
+          // summary (the transcript entries runTurn records for it are UNVERIFIED)
+          const text = 'Compaction canceled.';
+          emit({ type: 'system', subtype: 'status', status: null, compact_result: 'failed', compact_error: 'API Error: Request was aborted.', session_id: sessionId, uuid: uuid() });
+          emit(initFrame(t.uuids));
+          emit({
+            type: 'assistant',
+            message: { id: uuid(), container: null, model: '<synthetic>', role: 'assistant', stop_reason: 'end_turn', stop_sequence: null, type: 'message', usage: zeroUsage(), content: [{ type: 'text', text }], context_management: null },
+            parent_tool_use_id: null, local_command_source: `<local-command-stdout>${text}</local-command-stdout>`, session_id: sessionId,
+            uuid: uuid(), timestamp: now(),
+          });
+          return emitResult(t, { result: '', local_command: 'compact', stop_reason: null, num_turns: 0, terminal_reason: undefined });
         }
         const pre = 18000 + contextTokens;
         contextTokens = Math.round(contextTokens / 4);

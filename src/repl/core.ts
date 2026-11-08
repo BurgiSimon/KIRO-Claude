@@ -8,7 +8,8 @@
  * close kept (`KiroSession.resumeId`; none for a chat that never had a message) (exit 0;
  * 1 when the session could not start or Claude reported an auth failure). SIGHUP / SIGTERM (a
  * closed terminal included: two SIGHUPs within a millisecond count as one, and the hung-up
- * terminal's EIO ends the input, r5 #1), and Ctrl+C while the session starts or during the final
+ * terminal's EOF / EIO ends the input, r5 #1, which is no quit: the REPL waits for the SIGHUP that
+ * follows it, r6 #3), and Ctrl+C while the session starts or during the final
  * close after `/quit` (r5 #6), close it before kiro-claude dies of the signal
  * ({@link ExitSignals}): every session the REPL and its spec runtime opened that is still open,
  * the user's chat first (during a `/spec` flow the current session is a phase or task session;
@@ -18,7 +19,9 @@
  * is aborted; nothing more is printed (no prompt, no turn error, no notice, nothing a command
  * prints through ReplHost.print, no output of a `!cmd` still running, and a spinner animating at
  * the signal is cleared; only the resume hint of a `/quit` whose close the signal came
- * into), and input typed during the grace is neither sent nor run (r5 g2). The same silence holds
+ * into), and input typed during the grace is neither sent nor run (r5 g2) nor answers a question
+ * already waiting (ask / confirm / choose get no answer, an approval prompt still open, a `/spec`
+ * phase session's, is cancelled; r6 #2). The same silence holds
  * while kiro-claude dies of a signal the lifecycle forwarder owns (no REPL handlers, r5 g3).
  *
  * Input handling order (01 §4.3): empty ⇒ re-prompt; `/…` ⇒ built-in command, else a file
@@ -105,7 +108,7 @@ import { classifyApprovalInput } from './approval.js';
 import { CANCELLED, untilCancelled } from './commands/cancellable.js';
 import { builtinCommands } from './commands/index.js';
 import { PLAN_EXECUTE_PROMPT, PLAN_EXECUTE_QUESTION, looksLikePlan } from './commands/plan.js';
-import { ExitSignals, anySignal } from './exitSignals.js';
+import { DUPLICATE_SIGNAL_WINDOW_MS, ExitSignals, anySignal } from './exitSignals.js';
 import { openEditor, runShellCommand } from './external.js';
 import { LineReader, appendHistoryFile, historyFilePath, loadHistoryFile, sanitizeUnicodeTags } from './input.js';
 import { BUSY_MESSAGE, TIPS, approvalQuestion, colorPrompt, exitHint, formatGreeting, resumeHint } from './prompt.js';
@@ -369,9 +372,17 @@ export class Repl implements ReplContext {
     this.write(text.endsWith('\n') ? text : `${text}\n`);
   }
 
+  /**
+   * After a fatal signal ({@link silent}) a question gets no answer (undefined, like Ctrl+C), also
+   * one already waiting when the signal came: a line typed during the grace answers nothing, so the
+   * command asking (`/spec new`'s name, a `[y/n]`, a menu) stops without acting on it (r6 #2; the
+   * muted line-mode reader still hands the line over).
+   */
   async readAnswer(prompt: string = c.yellow('> ')): Promise<string | undefined> {
     this.spinner.stop();
+    if (this.silent) return undefined;
     const r = await this.reader.read(prompt);
+    if (this.silent) return undefined;
     this.renderer.freshLine();
     if (r.kind !== 'line') return undefined;
     return sanitizeUnicodeTags(r.text).trim();
@@ -590,11 +601,15 @@ export class Repl implements ReplContext {
       for (;;) {
         // a command typed here (`/chat save-via-script …`, `!cmd`) may have outlived the request:
         // a Ctrl+C during it interrupted the turn, so the question is not asked again
-        if (signal.aborted || this.quitting) return { kind: 'cancelled' };
+        if (signal.aborted || this.quitting || this.silent) return { kind: 'cancelled' };
         this.write(`\n${approvalQuestion()}\n\n`);
         let again = false;
         while (!again) {
           const r = await this.reader.read(this.promptString(), { signal, discardTypeahead: true });
+          // a fatal signal: a line typed during the grace is no answer (nor a command or `!cmd` to
+          // run). The request of a session closed after the user's chat (a `/spec` phase or task
+          // session) is still open meanwhile; it is cancelled, never allowed (r6 #2)
+          if (this.silent) return { kind: 'cancelled' };
           this.renderer.freshLine();
           if (r.kind === 'aborted') return { kind: 'cancelled' };
           if (r.kind !== 'line') {
@@ -1365,6 +1380,11 @@ export class Repl implements ReplContext {
       // the final close: a Ctrl+C (line mode, `kill -INT`) now closes first like SIGTERM, then the
       // signal ends the process (ExitSignals.closing, r5 #6)
       exits?.closing();
+      // the terminal hung up: its EOF / EIO ended the input a moment before Node dispatches the
+      // SIGHUP that comes with it. Wait for that signal (bounded) rather than quit first: a session
+      // whose close already settled (a forced stop's) would let this finish, remove the listeners
+      // and exit 0 before it (r6 #3). Never for a Ctrl+D (a key) or the end of piped input.
+      if (exits && !exits.received && this.reader.hungUp) await exits.awaitSignal(DUPLICATE_SIGNAL_WINDOW_MS);
       // a SIGHUP / SIGTERM is closing the session: the signal ends the process (the terminal may be gone)
       if (exits?.received) await exits.die();
       const s = this.current;

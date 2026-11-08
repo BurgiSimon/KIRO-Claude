@@ -6,7 +6,10 @@
  * {@link specFolderRefusal}):
  *  - a symbolic link AT a document (or `.config.kiro`) is never followed, also one to another
  *    document of the folder; anything there that is not a regular file is refused too;
- *  - a symbolic link above it that resolves to nothing (dangling, a loop) is refused;
+ *  - a symbolic link above it that resolves to nothing (dangling, a loop) is refused, and so is
+ *    one whose target cannot be accessed (realpath fails with EACCES or EPERM: a folder on the
+ *    way the user cannot enter), with that reason and an advice of its own
+ *    ({@link SPEC_LINK_ACCESS_RULE}: replacing the link or moving the folder would not help);
  *  - nothing whose real path is outside the workspace is read or written;
  *  - a `.kiro`, `.kiro/specs` or feature folder that is a symbolic link resolving inside the
  *    workspace keeps working.
@@ -22,16 +25,23 @@
  */
 
 import * as path from 'node:path';
-import { specFileRefusal, specFolderRefusal } from '../policy/specwrite.js';
+import { isLinkAccessRefusal, specFileRefusal, specFolderRefusal } from '../policy/specwrite.js';
 import { readRegularFileNoFollow, writeFileAtomic } from '../util/fsx.js';
 
-/** What a refusal message adds after the reason. */
+/** What a refusal message adds after the reason (any reason but {@link SPEC_LINK_ACCESS_RULE}'s). */
 export const SPEC_LINK_RULE =
   'kiro-claude reads and writes spec documents only as regular files inside the workspace and never follows a symbolic link at one (replace it with a regular file, or move the spec folder into the workspace)';
 
+/**
+ * What a refusal message adds after a reason that a symbolic link's target cannot be accessed
+ * (policy/specwrite.isLinkAccessRefusal), instead of {@link SPEC_LINK_RULE}.
+ */
+export const SPEC_LINK_ACCESS_RULE =
+  'kiro-claude uses spec files behind a symbolic link only when it can resolve the link and check that it leads inside the workspace';
+
 /** The user-visible message for a refused spec file or folder (`why`: the refusal reason). */
 export function specRefusalText(why: string): string {
-  return `${why}: ${SPEC_LINK_RULE}`;
+  return `${why}: ${isLinkAccessRefusal(why) ? SPEC_LINK_ACCESS_RULE : SPEC_LINK_RULE}`;
 }
 
 /** Thrown by {@link readSpecFile} / {@link writeSpecFile} for a refused file; `message` is {@link specRefusalText}. */
@@ -62,7 +72,8 @@ export function specFolderRefused(dir: string): string | undefined {
 
 /**
  * Why kiro-claude must not use `<workspaceRoot>/.kiro/specs` itself (specwrite.specFolderRefusal:
- * a `.kiro` or `.kiro/specs` linked out of the workspace or to nothing), else undefined. Such a
+ * a `.kiro` or `.kiro/specs` linked out of the workspace, to nothing or to a target that cannot
+ * be accessed), else undefined. Such a
  * folder is not even listed: its entries are another folder's.
  */
 export function specsRootRefused(workspaceRoot: string): string | undefined {

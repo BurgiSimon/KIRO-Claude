@@ -97,7 +97,14 @@ Flags with an effect: `--session-id`, `--resume`, `--fork-session`, `--resume-se
   (`system/status compacting` → `compact_boundary` (`compact_metadata.preserved_segment` /
   `preserved_messages` when it keeps a message verbatim, `logical_parent_uuid`) → synthetic summary
   user frame → `<local-command-stdout>Compacted </local-command-stdout>` replay → result
-  `local_command:"compact"`, same id; see Persistence for what it writes and keeps; a session with
+  `local_command:"compact"`, same id; see Persistence for what it writes and keeps; interrupted
+  while it compacts (it takes `FAKE_CLAUDE_COMPACT_MS`), it answers as the real 2.1.319 does
+  (VERIFIED, haiku): `system/status` `{status:null, compact_result:"failed",
+  compact_error:"API Error: Request was aborted."}`, `system/init`, a synthetic assistant frame
+  `Compaction canceled.` with `local_command_source:"<local-command-stdout>…</local-command-stdout>"`
+  and no `local_command_run` or `local_command_outcome`, then a result that says
+  `subtype:"success"`, `is_error:false`, `result:""`, `local_command:"compact"`, `num_turns:0`, no
+  `terminal_reason`, and the line's `command_lifecycle` `cancelled`; no boundary or summary; a session with
   no message of the conversation — a new one, one after `/clear`, a fresh session after a
   fallback — is refused as by the real 2.1.319 (VERIFIED, no model call): `system/init`, one
   synthetic assistant frame with the text `Error: No messages to compact`,
@@ -243,7 +250,8 @@ at the `Compacted` entry or later holds the compacted conversation; a fork at th
 summary. What is kept: the last assistant message when the conversation has two user turns or more,
 nothing after a single turn (what the real claude kept in those probes; its rule may depend on more);
 `FAKE_CLAUDE_COMPACT_PRESERVE=none` keeps nothing, `=last` always the last assistant message. An
-interrupted `/compact` writes only the command entries; a refused one (no messages) the command
+interrupted `/compact` writes the command entries and a `system`/`local_command` entry with an empty
+`<local-command-stdout>` (what the real 2.1.319 writes then is UNVERIFIED); a refused one (no messages) the command
 entries and a `system`/`local_command` `<local-command-stderr>Error: No messages to compact…`
 entry, so that session then has a transcript too (one refused for "Not enough messages" the
 command entries and a `<local-command-stdout>Not enough messages to compact.…` entry). `/clear` and `/help` write nothing (the real

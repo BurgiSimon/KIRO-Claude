@@ -25,7 +25,8 @@
  * `status`, `view` and task runs work in a tangent.
  *
  * A spec document (or `.config.kiro`) that is a symbolic link, not a regular file, behind a link
- * that resolves to nothing or outside the workspace is never read or written by kiro-claude
+ * that resolves to nothing, to a target that cannot be accessed or outside the workspace is never
+ * read or written by kiro-claude
  * (spec/docfs.ts, review X1): `list` / `status` show the phase `refused` and why, `status <name>`
  * marks the document, `view` of it prints the reason instead, and the flows refuse or stop with
  * it (spec/workflow.ts); `run` without a scope refuses such a spec before asking one. A

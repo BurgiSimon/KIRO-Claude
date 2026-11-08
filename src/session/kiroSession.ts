@@ -130,7 +130,8 @@
  *    compaction kept it verbatim (the last answer of a chat with two turns or more, VERIFIED
  *    2.1.319), else the journal cut at turn N is restored as history.
  *  - Rewind cuts the journal before the next turn's `Prompt` (by message id), so steers and
- *    `/clear` markers do not shift it.
+ *    `/clear` markers do not shift it, and drops the compactions that followed turn N (for every
+ *    N, r6 #1): the history a fallback restores is turn N's own, not a later summary of it.
  *  - `--trust-all-tools` is per invocation: resuming without it clears `trust.trustAll`.
  *  - `/clear` resets the message count with the turns (K4): the saved conversation is the cleared
  *    one, which has no messages (Q/Kiro save the current history). The record stays in the index
@@ -142,7 +143,10 @@
  *    agent on the records the tangent returns to (they share the trust object). So is plan mode
  *    (Kiro's plan mode is the planner agent): `/plan` on or off inside a tangent is saved at once
  *    on the records the tangent returns to, and leaving the tangent (`/tangent`, tail, merge, a
- *    `/spec new` leaving an empty one) keeps the state the user last set (r5 #0).
+ *    `/spec new` leaving an empty one) keeps the state the user last set (r5 #0). The agent and
+ *    every trust change (`/tools trust`, `untrust`, `reset`, `trust-all`) are saved at once on
+ *    those records too, so a crash inside a tangent never resumes main with a revoked tool
+ *    trusted or on the agent the user left (r6 #0).
  *  - A respawn that finishes after `close()` closes its new child and fails ("The session is
  *    closed"): no child outlives its session (ACP terminate during `session/set_mode`).
  *  - `KIRO_CLAUDE_FORCE_MODEL` also pins Claude subagents (`CLAUDE_CODE_SUBAGENT_MODEL[_FORCE]`);
@@ -169,7 +173,8 @@
  *    record (a nested tangent's merge or tail: part of its history), settled like a prompt line's
  *    (r5 #4). A `/tangent tail` carries the tangent's own last exchange: the one it had when a
  *    tangent nested in it was entered, after the return from that one; turn N's (from the
- *    journal) after a `/rewind N` inside it, never a turn rewound away. A carry queued on the
+ *    journal, also when an automatic compaction ran inside turn N, r6 #5) after a `/rewind N`
+ *    inside it, never a turn rewound away. A carry queued on the
  *    tangent stays on its record with a tail, as with a plain `/tangent` (a reopen delivers it).
  *  - While kiro-claude dies of a forwarded fatal signal (claude/lifecycle `dyingSignal()`, r5 H2)
  *    a respawn starts nothing and says nothing: spawn() refuses before any launch file or warning,
@@ -461,7 +466,8 @@ interface TurnState {
   /**
    * A `/compact` turn whose compaction Claude reported failed (`system/status`
    * `compact_result: 'failed'`): the synthetic frame with the reason that follows is not an
-   * answer either (VERIFIED 2.1.319, "Not enough messages to compact.", r5 #8 verifier).
+   * answer either (VERIFIED 2.1.319, "Not enough messages to compact.", r5 #8 verifier; an
+   * interrupted one's "Compaction canceled.", r6 #4).
    */
   compactRefused?: boolean;
 }
@@ -563,6 +569,33 @@ export function mergeTurnResults(prev: TurnResult, next: TurnResult): TurnResult
   if (usage) out.usage = usage;
   if (prev.numTurns !== undefined || next.numTurns !== undefined) out.numTurns = (prev.numTurns ?? 0) + (next.numTurns ?? 0);
   return out;
+}
+
+/**
+ * Claude's internal codes for a compaction that failed, as sentences. 2.1.319 (binary strings)
+ * reports an automatic compaction's failure with the code (`too_few_groups`, `exhausted`,
+ * `media_unstrippable`; its TUI shows `Could not compact · try /compact`), and a typed `/compact`
+ * with its text for it ("Not enough messages to compact.", "Compaction failed · conversation
+ * could not be reduced below the context limit", "Compaction failed · attached media exceeds
+ * size limits").
+ */
+const COMPACT_ERROR_TEXT: ReadonlyMap<string, string> = new Map([
+  ['too_few_groups', 'Not enough messages to compact.'],
+  ['exhausted', 'The conversation could not be reduced below the context limit.'],
+  ['conversation could not be reduced below the context limit', 'The conversation could not be reduced below the context limit.'],
+  ['media_unstrippable', 'Attached media exceeds size limits.'],
+  ['attached media exceeds size limits', 'Attached media exceeds size limits.'],
+]);
+
+/**
+ * The reason of a compaction Claude reports failed (`system/status` `compact_error`), readable:
+ * an internal code or a text of Claude's for one as its sentence ({@link COMPACT_ERROR_TEXT}),
+ * and without Claude's own `Compaction failed ·` before it (the front ends print `Compaction
+ * failed: <reason>`).
+ */
+function compactErrorText(raw: unknown): string {
+  const why = (typeof raw === 'string' ? raw.trim() : '').replace(/^compaction failed\s*[·:]\s*/i, '');
+  return COMPACT_ERROR_TEXT.get(why) ?? why;
 }
 
 /**
@@ -1774,6 +1807,23 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     }
   }
 
+  /**
+   * Save this session's trust (and its agent, whose per-tool trust it holds) on the current record
+   * AND on every record of the tangent stack, at once. Per-tool trust and the agent are session
+   * state, not part of a tangent's checkpoint (Q 06 §1.1, §6.4), like plan mode: a crash inside a
+   * tangent (no clean close; `chat --resume` opens main) must not resume the main conversation
+   * with a tool the user revoked inside the tangent trusted again, or on the agent the user left
+   * (r6 #0). Trust-all goes with it as everywhere: it is per invocation, a resume without
+   * `--trust-all-tools` clears it (build).
+   */
+  private persistTrust(): void {
+    this.persist();
+    for (const f of this.tangentStack) {
+      f.rec.trust = this.trustState;
+      this.writeStacked(f.rec);
+    }
+  }
+
   /** Save a record of the tangent stack (its lock is ours; it shares this session's trust). */
   private writeStacked(rec: SessionRecord): void {
     if (this.finalized) return;
@@ -1897,11 +1947,13 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
           // published (r5x X2, in any turn: an automatic one inside a prompt turn goes on) and the
           // next one is reported from its start. A `/compact` Claude refused (VERIFIED 2.1.319: a
           // session holding only local-command entries, "Not enough messages to compact.", under
-          // a result that says success) fails with that reason (toTurnResult; an interrupted one
-          // is cancelled all the same)
-          const why = typeof f.compact_error === 'string' ? f.compact_error.trim() : '';
+          // a result that says success) fails with that reason (toTurnResult). One the user
+          // interrupted is cancelled, not refused: Claude reports the abort as its failure
+          // (VERIFIED 2.1.319: `API Error: Request was aborted.`, then a success result with
+          // `local_command`, r6 #4); its "Compaction canceled." frame is no answer either
+          const why = compactErrorText(f.compact_error);
           if (t && t.kind === 'compact') {
-            t.localCommandError ??= why || 'Compaction failed';
+            if (this.turnAbort?.signal.aborted !== true) t.localCommandError ??= why || 'Compaction failed';
             t.compactRefused = true;
           }
           this.endCompaction(why, t);
@@ -1931,16 +1983,17 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
 
   /**
    * The end of a compaction reported `started` that did not compact (r5x X2): `compaction_failed`
-   * with Claude's reason, as a turn's error words it (`localFailureText`: a `/compact` refused
-   * while a restored history is pending says why, as the turn's error does), else `Compaction
-   * cancelled` when the turn was interrupted, else `fallback`. Nothing when none is open, so
-   * every `started` gets one end.
+   * `Compaction cancelled` (`cancelled`) when the turn was interrupted, whatever Claude gives as
+   * the reason (2.1.319 reports the abort as `API Error: Request was aborted.`, r6 #4), else with
+   * Claude's reason, as a turn's error words it (`localFailureText`: a `/compact` refused while a
+   * restored history is pending says why, as the turn's error does), else `fallback`. Nothing
+   * when none is open, so every `started` gets one end.
    */
   private endCompaction(why: string, t: TurnState | undefined, fallback = 'Compaction failed'): void {
     if (!this.compacting) return;
     this.compacting = false;
     const cancelled = this.turnAbort?.signal.aborted === true;
-    const reason = why ? (t ? this.localFailureText(t, why) : why) : cancelled ? 'Compaction cancelled' : fallback;
+    const reason = cancelled ? 'Compaction cancelled' : why ? (t ? this.localFailureText(t, why) : why) : fallback;
     this.publish({ type: 'compaction_failed', reason, ...(cancelled ? { cancelled: true } : {}) });
   }
 
@@ -2299,7 +2352,12 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     const terminal = typeof result.terminal_reason === 'string' ? result.terminal_reason : '';
     const cancelled = aborted || result.synthetic === true || terminal === 'aborted_tools' || terminal === 'aborted_streaming' || terminal === 'cancelled';
     let stopReason: TurnResult['stopReason'];
-    if (typeof result.local_command === 'string' && result.local_command) stopReason = 'local_command';
+    // a `/compact` the user interrupted before Claude compacted (no boundary): cancelled, also
+    // under the success result with `local_command` Claude answers it with (VERIFIED 2.1.319,
+    // r6 #4), and no local-command failure. One whose boundary came first did compact
+    const compactCancelled = t.kind === 'compact' && aborted && !t.compactPending && t.compactSummary === undefined;
+    if (compactCancelled) stopReason = 'cancelled';
+    else if (typeof result.local_command === 'string' && result.local_command) stopReason = 'local_command';
     else if (cancelled) stopReason = 'cancelled';
     else if (result.subtype === 'error_max_turns' || terminal === 'max_turns') stopReason = 'max_turns';
     else if (result.stop_reason === 'refusal') stopReason = 'refusal';
@@ -2940,8 +2998,13 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     this.rec.agent = target.name;
     // the agent is session state, not part of a tangent's checkpoint (Q, 06 §6.4): the
     // conversations a tangent returns to run on it too, and their records (which share this
-    // trust, whose per-tool part is the active agent's) must name it
-    for (const f of this.tangentStack) f.rec.agent = target.name;
+    // trust, whose per-tool part is the active agent's) must name it, saved now (a crash inside
+    // the tangent must not resume main on the agent the user left, r6 #0)
+    for (const f of this.tangentStack) {
+      f.rec.agent = target.name;
+      f.rec.trust = this.trustState;
+      this.writeStacked(f.rec);
+    }
     for (const w of target.warnings) this.uiNotice('warn', w.message, true);
     if (target.model && target.model.trim() !== '') {
       const m = kiroToClaudeModel(target.model, this.liveModels);
@@ -3333,9 +3396,10 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     let lock: SessionLock | undefined;
     try {
       lock = this.store.acquireLock(rec.sessionId);
-      // cut before the next turn's Prompt (steer prompts and /clear markers do not shift it);
-      // rewinding to the last turn drops trailing compactions (the journal keeps turn N's own
-      // history; Claude's fork at its answer is compacted when the compaction kept that answer)
+      // cut before the next turn's Prompt (steer prompts and /clear markers do not shift it),
+      // without the compactions that followed turn N, for any N (the journal keeps turn N's own
+      // history, r6 #1; Claude's fork at its answer is compacted when the compaction kept that
+      // answer)
       copyJournalThroughTurn(this.store.dir, old.sessionId, rec.sessionId, turns, turn - 1);
     } catch (e) {
       lock?.release();
@@ -3455,24 +3519,27 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     return out;
   }
 
+  // trust is session state shared with the conversations a tangent returns to: every change is
+  // saved on all their records at once (persistTrust, r6 #0)
+
   trustTools(names: string[]): void {
     this.gate.trustTools(names);
-    this.persist();
+    this.persistTrust();
   }
 
   untrustTools(names: string[]): void {
     this.gate.untrustTools(names);
-    this.persist();
+    this.persistTrust();
   }
 
   setTrustAll(on: boolean): void {
     this.gate.setTrustAll(on);
-    this.persist();
+    this.persistTrust();
   }
 
   resetTrust(): void {
     this.gate.resetTrust();
-    this.persist();
+    this.persistTrust();
   }
 
   // ── info ──

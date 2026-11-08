@@ -630,7 +630,8 @@ export interface WriteStatusResult {
 /**
  * Re-read tasks.md, set the box of `id`, write atomically (03 §1.6.4). Throws when the file or
  * the id is gone, and docfs.SpecFileRefusedError when tasks.md is refused (a symbolic link, not a
- * regular file, behind a link that resolves to nothing, outside the workspace: its target is
+ * regular file, behind a link that resolves to nothing or cannot be accessed, outside the
+ * workspace: its target is
  * neither read nor written).
  */
 export function writeTaskStatus(file: string, id: string, box: TaskBox, opts: { expectHash?: string } = {}): WriteStatusResult {

@@ -111,29 +111,36 @@ tasks). Approval is a menu choice; the model never moves on by itself.
 * **Symbolic links.** The phase-document allowance is anchored to the spec folder
   (`policy/specwrite.ts`). A phase never writes through a symbolic link at the document: not a
   document that is itself a link (a dangling one included), nor a path with a link above it that
-  resolves to nothing, nor a path with `..` right after a link; and the document's real path must
-  stay inside the workspace. A `.kiro`, `.kiro/specs` or feature folder that is a symbolic link
-  resolving inside the workspace keeps working. A refused write gets the spec-phase denial with
-  the reason in parentheses, in plan mode too. kiro-claude's own reads and writes of spec files
-  follow the same rules (`spec/docfs.ts`): the listing and status, `view`, the task context, a
+  resolves to nothing or whose target cannot be accessed, nor a path with `..` right after a link;
+  and the document's real path must stay inside the workspace. A link whose target is behind a
+  folder the user cannot enter (realpath fails with EACCES or EPERM) cannot be checked, so it is
+  refused too, with its own reason (`the target of the symbolic link <link> cannot be accessed
+  (permission denied)`), never as a dangling link and without the advice to replace the link or
+  move the folder (a dangling link or a loop is ENOENT, ENOTDIR or ELOOP). A `.kiro`,
+  `.kiro/specs` or feature folder that is a symbolic link resolving inside the workspace keeps
+  working. A refused write gets the spec-phase denial with the reason in parentheses, in plan
+  mode too. kiro-claude's own reads and writes of spec files follow the same rules
+  (`spec/docfs.ts`): the listing and status, `view`, the task context, a
   `#spec:<name>` reference in chat (each refused document or folder is a notice instead), the
   `tasks.md` repair after a turn, the box updates of a run and `.config.kiro` never go through a
-  link at a document, through a link above it that resolves to nothing, or outside the workspace
-  (reads use `O_NOFOLLOW`; writes rename over the path itself, never a link's target). Such a
-  document is marked `refused` with the reason: `list` and `status` show the phase `refused` and
-  say why, `view` prints the reason instead of the text, and it is never drafted over as if it
-  were missing. Its checkpoint offers no Approve and `approve` refuses it (a headless flow ends
-  with an error there); a revision turn still runs and the gate denies its write. The same holds
+  link at a document, through a link above it that resolves to nothing or whose target cannot be
+  accessed, or outside the workspace (reads use `O_NOFOLLOW`; writes rename over the path itself,
+  never a link's target). Such a document is marked `refused` with the reason: `list` and `status`
+  show the phase `refused` and say why, `view` prints the reason instead of the text, and it is
+  never drafted over as if it were missing. Its checkpoint offers no Approve and `approve` refuses
+  it (a headless flow ends with an error there); a revision turn still runs and the gate denies
+  its write. The same holds
   for every phase of a spec with any refused file, also an input document (`requirements.md`
   under review of the design) or `.config.kiro` (the spec's type and workflow are then unknown):
   each checkpoint names every reason and offers no Approve, and no phase is drafted from it.
   `run` and `sync` (whose turn also builds on requirements and design) of a spec with a refused
   file, `analyze` with a refused requirements document, and `new` under a `.kiro/specs` that is
-  linked out of the workspace (or dangling) are refused with the reason. Such a `.kiro/specs` is
-  not enumerated either: `list` and `status` print why instead. A task whose spec file becomes a
-  link during the run (before it starts, or while its session starts) fails with the reason, and
-  the link's target is left alone. A link swapped into a folder between the check and the I/O is
-  not ruled out (the same window as the gate's).
+  linked out of the workspace (or dangling, or to a target that cannot be accessed) are refused
+  with the reason. Such a `.kiro/specs` is not enumerated either: `list` and `status` print why
+  instead (`kiro-claude spec list` exits 1); a feature folder linked like that is listed as
+  `refused`. A task whose spec file becomes a link during the run (before it starts, or while its
+  session starts) fails with the reason, and the link's target is left alone. A link swapped
+  into a folder between the check and the I/O is not ruled out (the same window as the gate's).
 * **Tangents.** A spec command that runs spec turns (`/spec new`, `approve`, `revise`, `analyze`,
   `sync`, and resuming a spec that still has a document to draft or review) is refused inside a
   tangent: the continuation it hands over would replace the tangent, and `/tangent` could no
@@ -187,10 +194,17 @@ journal); Claude Code keeps its own transcript, which kiro-claude resumes and fo
   way the chat leaves a tangent (`/tangent`, `tail`, `merge`, `/tangent root`, or the spec
   command's automatic exit), it keeps the plan mode the user last set, and a change made inside a
   tangent is written to the records under it at once, so a quit or a crash inside the tangent
-  cannot lose it. A `tail` carries the tangent's own last exchange: also after a return from a
-  tangent nested in it (the exchange it had before), and after a `/rewind N` inside it turn N's,
-  never a turn rewound away. What a nested tangent's `merge` or `tail` left for its parent
-  reaches the main conversation when that parent is merged (it goes into the merge summary);
+  cannot lose it. The agent (`/agent swap`) and tool trust (`/tools trust`, `untrust`, `reset`,
+  `trust-all`) are session state too, written to those records at once the same way: after a
+  crash inside a tangent, `chat --resume` (which opens the main conversation; after a `/rewind`
+  inside the tangent it can open the rewound one, a record of its own that holds them too) never
+  runs a tool revoked inside the tangent as trusted, nor resumes on the agent the user left
+  (trust-all is per invocation anyway: a resume without `--trust-all-tools` clears it). A `tail` carries the
+  tangent's own last exchange: also after a return from a tangent nested in it (the exchange it
+  had before), and after a `/rewind N` inside it turn N's (also when Claude Code compacted
+  automatically during that turn), never a turn rewound away. What a nested tangent's `merge`
+  or `tail` left for its parent reaches the main conversation when that parent is merged (it goes
+  into the merge summary);
   after a plain `/tangent` or a `tail` out of the parent it stays on the parent's record.
   In a chat that has no message yet `/tangent` is refused (`Can't branch an empty chat.`); a
   session that entered a tangent without one all the same (through the session API, after local
@@ -199,20 +213,28 @@ journal); Claude Code keeps its own transcript, which kiro-claude resumes and fo
   the original conversation. An untouched copy (a `/spec` continuation with no message of its
   own) is dropped only when its parent record still holds every one of its turns. After a
   `/compact` Claude Code keeps the conversation from its summary on: a rewind to the turn the
-  compaction followed forks at the compaction, but one to an earlier turn cannot fork there, so it
-  starts a new conversation with the saved history up to turn N as context and says so (`The
-  conversation was compacted after turn N, …`).
+  compaction followed forks the compacted conversation at that turn's answer when Claude Code kept
+  the answer verbatim (the last answer of a chat with two turns or more). Otherwise (a single turn
+  before the compaction), and for an earlier turn, it starts a new conversation with the saved
+  history up to turn N as context (turn N's own prompts and answers, not a summary written after
+  them) and says so (`The conversation was compacted after turn N, …`).
 * **Compaction.** `/compact` runs Claude Code's own compaction. With nothing to compact (a session
   with no messages, or one holding only local commands such as `/effort`), Claude Code refuses
   under a result that says success; kiro-claude reports the refusal as an error with Claude
   Code's reason (`No messages to compact`, `Not enough messages to compact.`) and prints no
   success line. Over ACP, `commands/execute compact` answers `{success:false}` with that reason
-  and the compaction status is `failed`.
+  and the compaction status is `failed`. A `/compact` interrupted while Claude Code compacts
+  (Ctrl+C, an ACP cancel) is cancelled, not an error, although Claude Code reports the abort as
+  `API Error: Request was aborted.` under a result that says success: the chat prints `Compaction
+  cancelled.` and over ACP the `failed` status says `Compaction cancelled`.
 * **A compaction that does not compact.** Claude Code reports one it started and did not finish
   (refused, failed, interrupted) as a failed status with a reason and no boundary, also for an
   automatic compaction inside a prompt turn, after which the turn goes on. The session publishes
   the end of every compaction it reported started: `finished`, or `compaction_failed` with
-  Claude's reason. One Claude never ends is ended at Claude's next output (Claude streams nothing
+  Claude's reason, as a sentence for Claude Code's internal codes (`too_few_groups`: `Not enough
+  messages to compact.`; `exhausted`: `The conversation could not be reduced below the context
+  limit.`; `media_unstrippable`: `Attached media exceeds size limits.`) and without Claude's own
+  `Compaction failed ·` before it. One Claude never ends is ended at Claude's next output (Claude streams nothing
   while it compacts), so its end comes before the answer, or when the turn ends. The chat closes
   `Summarizing the conversation history...` with one plain line, `Compaction failed: <reason>`
   (`Compaction cancelled.` after Ctrl+C), and the answer follows; a refused `/compact` prints
@@ -297,7 +319,14 @@ Both front ends use `ExitSignals` (`repl/exitSignals.ts`) on POSIX:
   supervisor may signal both the process and its group.
 * After the signal kiro-claude prints nothing more. The REPL shows no prompt, no turn error, no
   notice and nothing a command prints, drops the output of a `!cmd` still running, clears a
-  spinner, and neither sends nor runs input typed during the grace; the one exception is the
+  spinner, and neither sends nor runs input typed during the grace. Nor does such input answer a
+  question that was already waiting: a command's question (`/spec new`'s name, a `[y/n]`, a menu)
+  gets no answer, so the command stops without acting, and an approval prompt still open (a
+  `/spec` phase session's, closed after the chat) is cancelled. A process SIGINT (`kill -INT`) or
+  a terminal resize during the grace draws nothing either (no fresh line, no redrawn prompt; the
+  terminal reader lets readline redraw its prompt line at a resize only while a read is active and
+  no child owns the terminal, so a resize while an answer streams never draws a stale prompt over
+  it). The one exception is the
   resume hint of a `/quit` whose close the signal came into. Headless prints nothing more (notices
   included) and returns no status. The same silence holds while kiro-claude dies of a signal the
   lifecycle forwarder owns (an embedder that turned these handlers off).
@@ -305,6 +334,11 @@ Both front ends use `ExitSignals` (`repl/exitSignals.ts`) on POSIX:
   for the end of input, EIO on stdout and stderr is ignored (headless interrupts its turn, since
   the answer cannot be delivered, and exits 1 unless the signal ends it first), and a half-typed
   line in the terminal is dropped, not sent (piped input keeps a last line without a newline).
+  In the interactive terminal that end of input is not a quit: it reaches the REPL a moment
+  before Node dispatches the hangup's SIGHUP, so the REPL waits for the signal (up to 500 ms,
+  `ExitSignals.awaitSignal`) and then closes and dies of it like any SIGHUP, with no resume hint.
+  Without the wait a chat whose session had already closed (after a forced stop) exited 0 before
+  the signal. Ctrl+D (a key in raw mode) and the end of piped input quit at once.
 * Headless: at a signal during the turn the children still running (`claude`, hook commands) get
   SIGTERM and, 1 s later, SIGKILL with their surviving group members, as under the lifecycle
   forwarder; the session is marked closed first, so nothing respawns Claude Code or sends the
@@ -473,7 +507,18 @@ launcher, the identity stub (only if kiro-claude created it), `crew.json`, and t
 logs under `run/` (`gateway.out`, `gateway.err`, `setup.log`, `ready.json`, `token`,
 `crashed.json`). `--purge` also removes the private claude-agent-acp bridge (only while it holds
 nothing else), the npm and pip build caches, and then the crew state directory itself when it is
-empty. KiroCrew's data home and its checkout are kept.
+empty. KiroCrew's data home and its checkout are kept. Without `crew.json` (after an earlier
+plain uninstall) a plain uninstall exits 1 ("not set up yet"), but `--purge` runs just the purge,
+by the same ownership rules: the bridge only while it holds nothing else, the caches, the run
+files above, an empty `bin/` and `run/`, `crew.json` temp files, then the state directory when
+empty. Unknown entries and a checkout inside are kept, and it prints what it removed (also crew's
+files inside a folder it keeps, such as `cache/npm`) and what it kept (exit 0). It refuses, removing
+nothing (exit 1), while `run/ready.json` names a gateway that may still run (its pid is alive and
+neither its boot nor its start time proves it another process, or the file cannot be read or
+names no pid), since
+`crew stop` cannot stop that gateway without `crew.json`. A `crew.json` that is there but corrupt
+or cannot be read (a symbolic link loop, a state directory that is a file) exits 1 either way with
+its error, removing nothing.
 
 ## Compatibility probe
 

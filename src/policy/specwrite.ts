@@ -20,6 +20,11 @@
  *  - A subject with a symbolic link above it that resolves to nothing (a dangling folder link, a
  *    chain whose last hop dangles, a loop) is refused: realpathDeep would resolve it lexically,
  *    as a folder inside the workspace, wherever the link points ({@link unresolvedLinkAbove}).
+ *    So is one with a link above it whose target cannot be accessed (realpath fails with EACCES
+ *    or EPERM: the target is behind a folder the user cannot enter), with that reason, not
+ *    "dangling": nothing can tell where such a link leads, and the lexical fallback could place
+ *    an outside target inside the workspace. DECISION (the research is silent): refuse rather
+ *    than let the I/O error surface later, since the gate must never allow what it cannot check.
  *  - A subject whose path as written (the tool's `file_path` / `notebook_path`) has a `..` right
  *    after a symbolic link is refused: the OS and a lexical normalization disagree on where it
  *    lands.
@@ -43,9 +48,10 @@
  * kiro-claude's OWN reads and writes of spec files (review X1: listing, status, view, the task
  * context, the tasks.md repair, box updates, `.config.kiro`) follow the same subject rules:
  * {@link specFileRefusal} for a document or `.config.kiro` (a link at it, anything there that is
- * not a regular file, a link above it that resolves to nothing, a real path outside the
- * workspace) and {@link specFolderRefusal} for a spec folder or `.kiro/specs` (a link at the
- * folder is followed when it resolves inside the workspace). src/spec/docfs.ts applies them.
+ * not a regular file, a link above it that resolves to nothing or whose target cannot be
+ * accessed, a real path outside the workspace) and {@link specFolderRefusal} for a spec folder
+ * or `.kiro/specs` (a link at the folder is followed when it resolves inside the workspace).
+ * src/spec/docfs.ts applies them, and words its advice by {@link isLinkAccessRefusal}.
  */
 
 import * as fs from 'node:fs';
@@ -72,26 +78,48 @@ function isLink(p: string): boolean {
 }
 
 /**
- * The symbolic link above `p` (its folder or an ancestor of it) that resolves to nothing, a
- * dangling link or a loop; undefined when every link above `p` resolves. realpathDeep cannot see
- * such a link: it resolves the deepest ancestor it can and appends the rest LEXICALLY, as if the
- * link were a plain folder inside the workspace.
+ * A symbolic link that realpath cannot resolve, with realpath's error code at it: ENOENT, ENOTDIR
+ * or ELOOP mean the link resolves to nothing (dangling, or a loop); EACCES or EPERM that its
+ * target cannot be accessed (a folder on the way the user cannot enter); any other code that it
+ * cannot be resolved either. Each is refused: none can be checked against the workspace.
  */
-export function unresolvedLinkAbove(p: string): string | undefined {
+export interface UnresolvedLink {
+  link: string;
+  code: string | undefined;
+}
+
+/** realpath error codes at a link that mean it resolves to nothing (dangling, or a loop). */
+const DANGLING_CODES: ReadonlySet<string> = new Set(['ENOENT', 'ENOTDIR', 'ELOOP']);
+
+function errCode(e: unknown): string | undefined {
+  return typeof e === 'object' && e !== null && 'code' in e ? String((e as { code: unknown }).code) : undefined;
+}
+
+/**
+ * The symbolic link above `p` (its folder or an ancestor of it) that realpath cannot resolve: a
+ * dangling link, a loop, or a link whose target cannot be accessed ({@link UnresolvedLink});
+ * undefined when every link above `p` resolves. realpathDeep cannot see such a link: it resolves
+ * the deepest ancestor it can and appends the rest LEXICALLY, as if the link were a plain folder
+ * inside the workspace.
+ */
+export function unresolvedLinkAbove(p: string): UnresolvedLink | undefined {
   return unresolvedLinkFrom(path.dirname(path.resolve(p)));
 }
 
 /** Like {@link unresolvedLinkAbove}, starting at `start` itself (a folder that may be the link). */
-function unresolvedLinkFrom(start: string): string | undefined {
+function unresolvedLinkFrom(start: string): UnresolvedLink | undefined {
   let cur = start;
   for (;;) {
+    let code: string | undefined;
     try {
       fs.realpathSync.native(cur);
       return undefined;
-    } catch {
-      // missing, or a dangling link / loop on the way
+    } catch (e) {
+      // missing, or a link on the way that resolves to nothing or cannot be accessed
+      code = errCode(e);
     }
-    if (isLink(cur)) return cur;
+    // the first link from the bottom: lstat reached it, so realpath failed on its own target
+    if (isLink(cur)) return { link: cur, code };
     const parent = path.dirname(cur);
     if (parent === cur) return undefined;
     cur = parent;
@@ -121,9 +149,24 @@ export function dotDotAfterLink(raw: string, cwd: string, env: NodeJS.ProcessEnv
   return undefined;
 }
 
-/** `p` reaches the symbolic link `link` that resolves to nothing. */
-function danglingWhy(p: string, link: string): string {
-  return `${p}: the symbolic link ${link} resolves to nothing (dangling, or a loop)`;
+/**
+ * `p` reaches the symbolic link `u.link` that realpath cannot resolve: it resolves to nothing
+ * (dangling, or a loop), or its target cannot be accessed (permission denied, or another error).
+ */
+function unresolvedWhy(p: string, u: UnresolvedLink): string {
+  if (u.code !== undefined && DANGLING_CODES.has(u.code)) return `${p}: the symbolic link ${u.link} resolves to nothing (dangling, or a loop)`;
+  const what = u.code === 'EACCES' || u.code === 'EPERM' ? 'permission denied' : (u.code ?? 'unknown error');
+  return `${p}: the target of the symbolic link ${u.link} cannot be accessed (${what})`;
+}
+
+/**
+ * `why` (a reason of {@link specFileRefusal}, {@link specFolderRefusal} or checkSpecWrite) says
+ * that a symbolic link's target cannot be accessed, not that the link dangles or leaves the
+ * workspace: the link may well be fine, so replacing it or moving the folder is no remedy. The
+ * paths in it may hold any character a file name may, a newline included (`s` flag).
+ */
+export function isLinkAccessRefusal(why: string): boolean {
+  return /: the target of the symbolic link .+ cannot be accessed \([^()]+\)$/s.test(why);
 }
 
 /** `p` (canonical `c`) is outside the workspace `base`. */
@@ -131,9 +174,9 @@ function outsideWhy(p: string, c: string, base: string): string {
   return `${p}${c === p ? ' is' : ` resolves to ${c},`} outside the workspace ${base}`;
 }
 
-/** Dangling link `unresolved` on the way to `p`, else `p`'s real path outside `base`. */
-function placeRefusal(p: string, unresolved: string | undefined, base: string): string | undefined {
-  if (unresolved) return danglingWhy(p, unresolved);
+/** Unresolvable link `unresolved` on the way to `p`, else `p`'s real path outside `base`. */
+function placeRefusal(p: string, unresolved: UnresolvedLink | undefined, base: string): string | undefined {
+  if (unresolved) return unresolvedWhy(p, unresolved);
   const c = realpathDeep(p);
   return isSubpath(c, realpathDeep(base)) ? undefined : outsideWhy(p, c, base);
 }
@@ -143,7 +186,8 @@ function placeRefusal(p: string, unresolved: string | undefined, base: string): 
  * spec folder in the workspace `workspaceRoot` (module doc, review X1); undefined when it may,
  * also when `file` does not exist yet (and may be created). Refused: a symbolic link at `file`
  * (also one to another document of the folder), anything at `file` that is not a regular file,
- * a symbolic link above it that resolves to nothing, a real path outside the workspace.
+ * a symbolic link above it that resolves to nothing or whose target cannot be accessed, a real
+ * path outside the workspace.
  */
 export function specFileRefusal(file: string, workspaceRoot: string): string | undefined {
   const p = path.resolve(file);
@@ -160,8 +204,9 @@ export function specFileRefusal(file: string, workspaceRoot: string): string | u
 
 /**
  * Why kiro-claude itself must not use the spec folder `dir` (or `.kiro/specs`) of the workspace
- * `workspaceRoot`: a symbolic link at it or above it that resolves to nothing, or a real path
- * outside the workspace. A folder that is a link resolving inside the workspace may be used.
+ * `workspaceRoot`: a symbolic link at it or above it that resolves to nothing or whose target
+ * cannot be accessed, or a real path outside the workspace. A folder that is a link resolving
+ * inside the workspace may be used.
  */
 export function specFolderRefusal(dir: string, workspaceRoot: string): string | undefined {
   const p = path.resolve(dir);
@@ -200,7 +245,7 @@ export function checkSpecWrite(
     const linked = isLink(lexS);
     const unresolved = linked ? undefined : unresolvedLinkAbove(lexS);
     if (linked) why = `${lexS} is a symbolic link`;
-    else if (unresolved) why = danglingWhy(lexS, unresolved);
+    else if (unresolved) why = unresolvedWhy(lexS, unresolved);
     else {
       const raw = single ? rawPathOf(call, s) : s;
       const dd = single ? dotDotAfterLink(raw, cwd, ws.env) : undefined;

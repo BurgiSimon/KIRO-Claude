@@ -129,7 +129,7 @@ cancelled): SessionEnd hooks run, the conversation's record is saved and its loc
 kiro-claude exits with the signal (a shell shows 128 + the signal number, e.g. 143 for SIGTERM)
 and ends any child process still running. A second signal ends it at once, unless it is the same
 signal within half a second of the first (closing a terminal tab can send SIGHUP twice). After
-the signal nothing more is printed and nothing you type is run. Details:
+the signal nothing more is printed, and nothing you type is run or taken as an answer. Details:
 [Ctrl+C and signals](docs/ARCHITECTURE.md#ctrlc-and-signals) and
 [Signals and child processes](docs/ARCHITECTURE.md#signals-and-child-processes).
 
@@ -157,7 +157,9 @@ documents in `.kiro/specs/<feature>/`.
   `refused` and say why, `view` prints the reason instead of the text, `run`, `sync` and
   `analyze` refuse to use it, `#spec:<name>` in chat leaves it out with a notice, and no phase of
   that spec is approved or drafted (its checkpoints say why). A `.kiro`, `.kiro/specs` or feature folder that is a symbolic link works when it
-  resolves inside the workspace; one that points outside it is refused the same way.
+  resolves inside the workspace; one that points outside it, or that cannot be followed (dangling,
+  or into a folder you cannot enter: the reason then says `cannot be accessed (permission
+  denied)`), is refused the same way.
 * Ctrl+C stops a run before its next task and interrupts the running one; the next Ctrl+C kills
   the PostTaskExec hooks of a task it interrupted. In `kiro-claude spec run` that second Ctrl+C
   lets the run print its summary; without such a hook it exits at once.
@@ -274,7 +276,9 @@ be freed. See [KiroCrew](docs/ARCHITECTURE.md#kirocrew-persistent-pipeline-on-cl
 removes what setup added: the launcher, the identity stub (only if kiro-claude created it),
 `crew.json`, and the run files and logs under `run/` (`crashed.json` included). `--purge` also
 removes the private claude-agent-acp bridge and the build caches, then the crew state directory
-itself when it is empty. Your KiroCrew data and the checkout are kept.
+itself when it is empty. Your KiroCrew data and the checkout are kept. `--purge` also works after
+an earlier plain `crew uninstall`: it then removes just these leftovers, and refuses while
+`run/ready.json` names a gateway that may still be running.
 
 ## Differences from Kiro CLI
 

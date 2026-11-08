@@ -23,7 +23,7 @@ import * as readline from 'node:readline';
 
 import { KIRO_CLAUDE_VERSION } from '../version.js';
 import { builtState, buildKiroCrew, detectBuildNode, detectGit, detectPython, fallbackNodeOf, findNpm, installMembersAdapter, type ToolInfo } from './build.js';
-import { kirocrewFor, loadState, type CrewCtx } from './context.js';
+import { kirocrewFor, loadState, readReady, type CrewCtx } from './context.js';
 import { renderRow, runDoctor } from './doctor.js';
 import { defaultStateEnv } from './env.js';
 import { CrewStepError, fetchKiroCrew, gitHead } from './fetch.js';
@@ -427,8 +427,13 @@ export async function crewUnstub(c: CrewCtx): Promise<number> {
  * value is still the one setup wrote); remove the shim (only if it carries our header) and our
  * stub. `--purge` also removes what crew created under `$CS`, and `$CS` itself when that leaves it
  * empty (see {@link purgeStateDir}). The KiroCrew data home and the checkout are never removed.
+ * Without crew.json (a plain uninstall ran earlier) only `--purge` goes on, and does just the
+ * purge ({@link purgeLeftovers}); a plain uninstall says setup has not run. A crew.json that is
+ * there but corrupt or unreadable (a symbolic link loop, a state dir that is a file) fails either
+ * way with its error (exit 1), removing nothing.
  */
 export async function crewUninstall(c: CrewCtx, o: { purge?: boolean } = {}): Promise<number> {
+  if (o.purge && stateFileAbsent(c)) return purgeLeftovers(c);
   const state = loadState(c);
   if (!state) return 1;
   const stopCode = await crewStop(c, {});
@@ -489,6 +494,19 @@ export async function crewUninstall(c: CrewCtx, o: { purge?: boolean } = {}): Pr
   return 0;
 }
 
+/**
+ * crew.json is absent: {@link readState} finds no file (ENOENT, which also covers a dangling link
+ * and a missing `$CS`). One that is there but cannot be read or parsed is not absent (loadState
+ * then prints why).
+ */
+function stateFileAbsent(c: CrewCtx): boolean {
+  try {
+    return readState(c.paths.stateFile) === undefined;
+  } catch {
+    return false;
+  }
+}
+
 function isSubpathOf(child: string, parent: string): boolean {
   const rel = path.relative(path.resolve(parent), path.resolve(child));
   return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
@@ -524,12 +542,111 @@ function purgeStateDir(c: CrewCtx): void {
   if (isOwnMembersPrefix(p.membersPrefix)) fs.rmSync(p.membersPrefix, { recursive: true, force: true });
   try {
     for (const e of fs.readdirSync(p.stateDir)) {
-      if (/^\.crew\.json\..*\.tmp$/.test(e)) fs.rmSync(path.join(p.stateDir, e), { force: true });
+      if (CREW_JSON_TMP.test(e)) fs.rmSync(path.join(p.stateDir, e), { force: true });
     }
   } catch {
     // gone
   }
   rmdirIfEmpty(p.stateDir);
+}
+
+/** The temp files of crew.json's atomic writes. */
+const CREW_JSON_TMP = /^\.crew\.json\..*\.tmp$/;
+
+function entriesOf(dir: string): string[] | undefined {
+  try {
+    return fs.readdirSync(dir).sort();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The paths under `$CS` that {@link purgeStateDir} may remove and that exist now (not following a
+ * link), relative to `$CS`: what the purge's report compares before and after, so a file of
+ * crew's removed from a folder that is kept (cache/npm next to an unknown entry) is named too.
+ */
+function purgeablePaths(c: CrewCtx): string[] {
+  const p = c.paths;
+  const tmp = (entriesOf(p.stateDir) ?? []).filter((e) => CREW_JSON_TMP.test(e)).map((e) => path.join(p.stateDir, e));
+  const all = [p.binDir, p.runDir, p.gatewayOut, p.gatewayErr, p.readyFile, p.tokenFile, p.crashedFile, p.setupLog, p.cacheDir, p.npmCache, p.pipCache, p.membersPrefix, ...tmp];
+  return all
+    .filter((f) => {
+      try {
+        fs.lstatSync(f);
+        return true;
+      } catch {
+        return false;
+      }
+    })
+    .map((f) => path.relative(p.stateDir, f));
+}
+
+/** `removed` without the paths inside a removed folder (`run`, not also `run/setup.log`), sorted. */
+function topmost(removed: readonly string[]): string[] {
+  return removed.filter((r) => !removed.some((d) => d !== r && r.startsWith(d + path.sep))).sort();
+}
+
+/**
+ * How `run/ready.json` names a gateway that may still run, or undefined when there is no such file
+ * or it provably names none: its pid is gone, or now names another process (the record's boot or
+ * start time reads back different). A record that cannot be read or names no pid may still name one.
+ */
+function readyGatewayMayRun(c: CrewCtx): string | undefined {
+  const file = c.paths.readyFile;
+  if (!fs.existsSync(file)) return undefined;
+  const rec = readReady(c.paths);
+  if (!rec) return `${file} cannot be read`;
+  if (rec.pid === undefined) return `${file} names no pid`;
+  const { sys } = c.deps;
+  if (!sys.isAlive(rec.pid)) return undefined;
+  if (rec.startTime !== undefined) {
+    const boot = rec.bootId !== undefined ? sys.bootId() : undefined;
+    if (boot !== undefined && boot !== rec.bootId) return undefined; // recorded before a reboot
+    const st = sys.startTime(rec.pid);
+    if (st !== undefined && st !== rec.startTime) return undefined; // the pid names another process now
+  }
+  return `pid ${rec.pid}, recorded in ${file}`;
+}
+
+/**
+ * `crew uninstall --purge` without crew.json, e.g. after a plain `crew uninstall`: no gateway to
+ * stop, no config to restore, no shim or stub to verify, so only the purge runs, by the same
+ * ownership rules ({@link purgeStateDir}). It refuses (exit 1, nothing removed) while
+ * `run/ready.json` names a gateway that may still run: without crew.json `crew stop` cannot stop
+ * it, and its members use the bridge. Prints what was removed (also crew's files inside a folder
+ * that is kept, such as cache/npm) and what was kept; exit 0. A `$CS` that is there but cannot be
+ * read fails (exit 1); one that does not exist leaves nothing to purge (exit 0).
+ */
+function purgeLeftovers(c: CrewCtx): number {
+  const cs = c.paths.stateDir;
+  try {
+    fs.readdirSync(cs);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
+      c.out(`Nothing to purge: ${cs} does not exist.`);
+      return 0;
+    }
+    c.err(`kiro-claude: cannot read ${cs}: ${(e as Error).message}`);
+    return 1;
+  }
+  const running = readyGatewayMayRun(c);
+  if (running) {
+    c.err(`kiro-claude: a Kiro Crew gateway may still be running (${running}); not purging.`);
+    c.err(`   Without ${c.paths.stateFile}, kiro-claude crew stop cannot stop it. Stop that gateway (or, if none runs, remove ${c.paths.readyFile}), then run: kiro-claude crew uninstall --purge`);
+    return 1;
+  }
+  c.out(`No ${path.basename(c.paths.stateFile)} in ${cs}; purging what an earlier uninstall or setup left there.`);
+  const before = purgeablePaths(c);
+  purgeStateDir(c);
+  const left = purgeablePaths(c);
+  const after = entriesOf(cs);
+  const removed = topmost(before.filter((e) => !left.includes(e)));
+  if (!after?.length) c.out(`Purged ${cs}`);
+  else if (removed.length) c.out(`Purged ${removed.join(', ')} from ${cs}; kept ${after.join(', ')}`);
+  else c.out(`Nothing to purge in ${cs}; kept ${after.join(', ')}`);
+  c.out("Kiro Crew's data home and any Kiro Crew checkout were kept.");
+  return 0;
 }
 
 function isOwnMembersPrefix(prefix: string): boolean {

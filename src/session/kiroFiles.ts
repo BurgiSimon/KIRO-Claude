@@ -372,11 +372,19 @@ export function compactedAfterTurn(records: readonly JournalRecord[], turns: rea
   return i >= 0 && records.slice(i + 1).some((r) => r.kind === 'Compaction');
 }
 
+/** A `/clear` marker: a `Compaction` record with an empty snapshot (KiroSession.clear). */
+function isClearMarker(r: JournalRecord): boolean {
+  return r.kind === 'Compaction' && Array.isArray(r.data.messages_snapshot) && r.data.messages_snapshot.length === 0;
+}
+
 /**
  * The exchange of the turn whose `Prompt` has the message id `userUuid`: that prompt's text and
  * the text of the turn's last assistant message (steer prompts inside the turn skipped; the
- * turn ends at the next prompt of `turnIds`, or at the end). What a `/tangent tail` carries of a
- * tangent rewound to that turn (KiroSession.rewind). Undefined when no `Prompt` names the turn.
+ * turn ends at the next prompt of `turnIds`, or at the end). An automatic compaction inside the
+ * turn (its `Compaction` record comes before the turn's answer, r6 #5) does not end it, nor does
+ * a `/compact` after it (it adds no answer); a `/clear` marker does. What a `/tangent tail`
+ * carries of a tangent rewound to that turn (KiroSession.rewind). Undefined when no `Prompt`
+ * names the turn.
  */
 export function turnExchange(records: readonly JournalRecord[], userUuid: string, turnIds: ReadonlySet<string> = new Set()): { user: string; assistant: string } | undefined {
   const i = records.findIndex((r) => r.kind === 'Prompt' && r.data.message_id === userUuid);
@@ -384,7 +392,7 @@ export function turnExchange(records: readonly JournalRecord[], userUuid: string
   let assistant = '';
   for (const r of records.slice(i + 1)) {
     if (r.kind === 'Prompt' && typeof r.data.message_id === 'string' && turnIds.has(r.data.message_id)) break;
-    if (r.kind === 'Compaction') break;
+    if (isClearMarker(r)) break;
     if (r.kind !== 'AssistantMessage') continue;
     const text = blocksText(r.data.content);
     if (text !== '') assistant = text;
@@ -408,15 +416,20 @@ export function copyJournal(dir: string, fromSid: string, toSid: string, opts: {
 /**
  * Copy the journal of a conversation forked at turn `index` (0-based) of `turns` (`/rewind`, or
  * a fork at a rewind point, `KiroSessionOptions.fork.at`): the records before the next turn's
- * `Prompt` (by message id, so steers and `/clear` markers do not shift the cut); at the last turn
- * every record but trailing compactions (the turn's own, uncompacted history). Nothing is written
+ * `Prompt` (by message id, so steers and `/clear` markers do not shift the cut), at the last turn
+ * every record, and in both cases without the compactions that followed the turn: they summarize
+ * turns the journal holds verbatim before them, and a history restored from the cut starts at its
+ * last compaction (journalHistoryText), so a trailing one would leave only a summary written
+ * after turn N (Claude Code writes it without the messages it keeps verbatim, turn N's answer
+ * among them, r6 #1). A compaction inside a turn (an automatic one, before the turn's answer) is
+ * kept; a `/clear` marker cannot trail a turn (`/clear` resets the turn list). Nothing is written
  * when there is nothing to copy. Returns the number of records copied.
  */
 export function copyJournalThroughTurn(dir: string, fromSid: string, toSid: string, turns: readonly { userUuid: string }[], index: number): number {
   const next = turns[index + 1];
   let records = readJournal(dir, fromSid);
   if (next) records = journalBeforeMessage(records, next.userUuid);
-  else while (records.length && records[records.length - 1]!.kind === 'Compaction') records.pop();
+  while (records.length && records[records.length - 1]!.kind === 'Compaction') records.pop();
   if (records.length) writeJournalRecords(dir, toSid, records);
   return records.length;
 }

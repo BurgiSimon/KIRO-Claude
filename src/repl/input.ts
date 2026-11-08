@@ -27,10 +27,14 @@
  * In both modes an error on the input (a hung-up terminal: EIO from `setRawMode` or a read) is
  * end of input: every pending read gets `eof`, never an unhandled 'error' (r5 #1); in terminal
  * mode a half-typed line at the input's end (the terminal went away) is dropped, not delivered
- * as a line (line mode keeps a last line without a newline: piped text). While the
+ * as a line (line mode keeps a last line without a newline: piped text), and
+ * {@link LineReader.hungUp} says the terminal hung up (its SIGHUP follows, r6 #3). While the
  * `muted` option says so (the REPL after a fatal signal) the reader writes nothing of its own:
- * no prompt, no echo, nothing printed above the prompt; in terminal mode keys typed meanwhile
- * are dropped (readline does not echo them either).
+ * no prompt, no echo, nothing printed above the prompt, no fresh line for a Ctrl+C (a process
+ * SIGINT); in terminal mode keys typed meanwhile are dropped (readline does not echo them either).
+ * readline's own redraw of the prompt line at a terminal resize happens only for an active read
+ * of a reader neither muted nor suspended: never over a turn's output (no read active), into a
+ * child's screen, or after a fatal signal (r6 verification).
  *
  * Reads nest (a stack): an approval prompt or `ask()` raised while the idle prompt is shown
  * takes the next line; when it finishes the previous prompt is shown again.
@@ -145,7 +149,7 @@ export class LineReader extends EventEmitter {
   private readonly stack: PendingRead[] = [];
   private readonly queue: string[] = [];
   private ended = false;
-  /** Terminal mode: the input ended (the terminal hung up). */
+  /** Terminal mode: the input ended or failed (the terminal hung up). */
   private inputEnded = false;
   private closed = false;
   private pasting = false;
@@ -159,6 +163,8 @@ export class LineReader extends EventEmitter {
   private readonly muted: () => boolean;
   private readonly historySize: number;
   private readonly fallbackHistory: string[] = [];
+  /** Terminal mode: removes the guarded stand-ins of readline's 'resize' listeners ({@link guardResize}). */
+  private unguardResize: (() => void) | undefined;
 
   constructor(opts: LineReaderOptions) {
     super();
@@ -178,7 +184,10 @@ export class LineReader extends EventEmitter {
         prompt: '',
       };
       if (opts.completer) ifOpts.completer = opts.completer;
+      const out = opts.output as unknown as Partial<EventEmitter>;
+      const resizeBefore = new Set(out.listeners?.('resize') ?? []);
       this.rl = readline.createInterface(ifOpts);
+      this.guardResize(out, resizeBefore);
       const hist = this.rlHistory();
       if (hist && opts.history) {
         hist.length = 0;
@@ -204,16 +213,31 @@ export class LineReader extends EventEmitter {
       this.rl = readline.createInterface({ input: opts.input, terminal: false, crlfDelay: Infinity });
       this.rl.on('line', (line: string) => this.onPipeLine(line));
     }
-    this.rl.on('close', () => this.onClose());
+    this.rl.on('close', () => {
+      this.unguardResize?.();
+      this.onClose();
+    });
     // A failing input is its end: a hung-up terminal fails `setRawMode(false)` with EIO while
     // readline closes on the input's end, and readline re-emits the input's errors here (r5 #1).
     // Without a listener that 'error' would be thrown before the REPL could close the session.
-    this.rl.on('error', () => this.onClose());
+    this.rl.on('error', () => {
+      if (this.terminal) this.inputEnded = true;
+      this.onClose();
+    });
   }
 
   /** Whether a read is waiting for input. */
   get reading(): boolean {
     return this.stack.length > 0;
+  }
+
+  /**
+   * Terminal mode: the input ended or failed, i.e. the terminal hung up (in raw mode Ctrl+D is a
+   * key, never an end of input), so its SIGHUP is on its way (repl/core.ts waits for it, r6 #3).
+   * Always false in line mode, where the end of input is the end of the piped text.
+   */
+  get hungUp(): boolean {
+    return this.terminal && this.inputEnded;
   }
 
   // ───────────────────────────── reads ─────────────────────────────
@@ -431,6 +455,32 @@ export class LineReader extends EventEmitter {
     }
   }
 
+  /**
+   * readline redraws its prompt and line at every resize of the terminal (its `output` 'resize'
+   * listener), whether or not a prompt is shown. Its listeners (those added since `before`) are
+   * replaced by stand-ins that redraw only for an active read of a reader neither muted (a fatal
+   * signal: nothing more is printed) nor suspended (a child owns the terminal); while no read is
+   * active (a turn streams) the redraw erased the current line of the output and drew the last
+   * prompt over it. The stand-ins are removed when the interface closes.
+   */
+  private guardResize(out: Partial<EventEmitter>, before: ReadonlySet<unknown>): void {
+    if (typeof out.listeners !== 'function' || typeof out.removeListener !== 'function' || typeof out.on !== 'function') return;
+    const offs: (() => void)[] = [];
+    for (const l of out.listeners('resize') as ((...args: unknown[]) => void)[]) {
+      if (before.has(l)) continue;
+      out.removeListener('resize', l);
+      const guarded = (...args: unknown[]): void => {
+        if (this.closed || this.suspended || this.muted() || !this.top()) return;
+        l.apply(out, args);
+      };
+      out.on('resize', guarded);
+      offs.push(() => out.removeListener?.('resize', guarded));
+    }
+    this.unguardResize = () => {
+      for (const off of offs.splice(0)) off();
+    };
+  }
+
   private installKeyHook(): void {
     const r = this.rl as unknown as { _ttyWrite?: (s: string | undefined, key: Key | undefined) => void };
     if (typeof r._ttyWrite !== 'function') return;
@@ -510,7 +560,14 @@ export class LineReader extends EventEmitter {
       else this.queue.push('\u0003');
       return;
     }
-    if (this.terminal) this.acceptLineDisplay();
+    if (this.terminal) {
+      // muted (a process SIGINT during a fatal signal's grace): the line is forgotten, nothing written
+      if (this.muted()) {
+        const r = this.rl as unknown as { line: string; cursor: number };
+        r.line = '';
+        r.cursor = 0;
+      } else this.acceptLineDisplay();
+    }
     this.finish(t, { kind: 'interrupt' });
   }
 
