@@ -10,12 +10,13 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { expandHashRefs, readTextForRef } from '../../src/context/refs.js';
+import { removeOnExit } from '../tmpdirs.js';
 import { tmpWorkspace, write } from './helpers.js';
 
 const posix = process.platform !== 'win32';
 
 function outsideDir(): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'kc-specref-out-'));
+  return removeOnExit(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-specref-out-')));
 }
 
 describe('#spec:<name> and symbolic links (r5x X1)', { skip: !posix }, () => {

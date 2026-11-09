@@ -25,6 +25,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { fakeClaudePath, fakeEnv } from '../claude/helpers.js';
+import { removeOnExit } from '../tmpdirs.js';
 
 const ARGS = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose'];
 
@@ -44,7 +45,7 @@ interface Box {
 }
 
 function box(): Box {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-r5s-fake-')));
+  const root = removeOnExit(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-r5s-fake-'))));
   const cwd = path.join(root, 'proj');
   const config = path.join(root, 'claude-config');
   fs.mkdirSync(cwd, { recursive: true });

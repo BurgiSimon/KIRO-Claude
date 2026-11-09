@@ -26,9 +26,10 @@ import {
   writeJournalRecords,
 } from '../../src/session/kiroFiles.js';
 import { SessionStore } from '../../src/session/store.js';
+import { removeOnExit } from '../tmpdirs.js';
 
 function tmp(): string {
-  return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-kirofiles-')));
+  return removeOnExit(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-kirofiles-'))));
 }
 
 const TS = '2026-11-06T10:00:00.000Z';

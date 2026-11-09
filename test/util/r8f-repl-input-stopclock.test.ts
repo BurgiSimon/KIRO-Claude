@@ -96,7 +96,8 @@ ${body}
 `,
   );
   // the driver's cwd is not the repository: the fake claude is named explicitly
-  const env = { ...process.env, KIRO_CLAUDE_FAKE: fakeClaudePath() };
+  // TMPDIR: the child is SIGKILLed at the end, so its own temp-dir cleanup never runs
+  const env = { ...process.env, TMPDIR: tmp, KIRO_CLAUDE_FAKE: fakeClaudePath() };
   const child = spawn(process.execPath, [file], { cwd: dir, env, stdio: ['pipe', 'pipe', 'pipe'] });
   let out = '';
   let err = '';

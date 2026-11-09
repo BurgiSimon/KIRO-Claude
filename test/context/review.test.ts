@@ -45,6 +45,7 @@ import { buildModelList, claudeToKiroModelId, formatModelList, kiroToClaudeModel
 import { SessionStore, previewText } from '../../src/session/store.js';
 import type { ModelInfo } from '../../src/claude/protocol.js';
 import type { SteeringFile } from '../../src/types.js';
+import { removeOnExit } from '../tmpdirs.js';
 import { agent, steering, tmpWorkspace, write } from './helpers.js';
 
 const HOOK_INTRO =
@@ -303,7 +304,7 @@ describe('review: buildSystemPrompt edge cases', () => {
   });
 
   it('systemPromptFilePath rejects ids that could escape the runtime dir', () => {
-    const env = { XDG_RUNTIME_DIR: fs.mkdtempSync(path.join(os.tmpdir(), 'kc-rt-')) };
+    const env = { XDG_RUNTIME_DIR: removeOnExit(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-rt-'))) };
     for (const bad of ['', '..', '../x', 'a/b', 'a\\b', '.hidden', 'a..b', ' x']) {
       assert.throws(() => systemPromptFilePath(bad, env), /Invalid session id/, bad);
     }
@@ -797,7 +798,7 @@ describe('review: models', () => {
 
 describe('review: session store', () => {
   function mk() {
-    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-review-store-')));
+    const root = removeOnExit(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-review-store-'))));
     const cwd = path.join(root, 'proj');
     fs.mkdirSync(cwd);
     return { root, cwd, s: new SessionStore(path.join(root, 'sessions')) };

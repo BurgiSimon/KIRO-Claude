@@ -159,7 +159,7 @@ function crashInTangent(sb: Sandbox, mode: 'untrust' | 'agent' | 'trustall'): { 
     process.kill(process.pid, 'SIGKILL');
   `;
   const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], {
-    env: { ...sb.env, KIRO_CLAUDE_FAKE: fakeClaudePath(), R6F_CFG: JSON.stringify({ cwd: sb.cwd, mode, outFile }) },
+    env: { ...sb.env, TMPDIR: sb.root, KIRO_CLAUDE_FAKE: fakeClaudePath(), R6F_CFG: JSON.stringify({ cwd: sb.cwd, mode, outFile }) },
     encoding: 'utf8',
     timeout: 60_000,
   });

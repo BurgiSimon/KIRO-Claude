@@ -46,6 +46,7 @@ import {
 import { ErrorCodes } from '../../src/acp/jsonrpc.js';
 import { buildModelList } from '../../src/models/models.js';
 import type { TurnResult } from '../../src/types.js';
+import { removeOnExit } from '../tmpdirs.js';
 
 const CWD = '/work';
 
@@ -440,7 +441,7 @@ test('small helpers', () => {
 });
 
 test('live fs probes: existing file gives the old text; the title stays Creating', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kc-acp-map-'));
+  const dir = removeOnExit(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-acp-map-')));
   const f = path.join(dir, 'a.txt');
   fs.writeFileSync(f, 'before');
   const call = toKiroCall('Write', { file_path: f, content: 'after' }, { cwd: dir, toolUseId: 't' });

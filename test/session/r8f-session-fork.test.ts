@@ -179,7 +179,7 @@ function crashDuringForkStart(sb: Sandbox, kind: CrashKind): { chatClaude: strin
     process.kill(process.pid, 'SIGKILL');
   `;
   const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], {
-    env: { ...sb.env, KIRO_CLAUDE_FAKE: fakeClaudePath(), R8F_CFG: JSON.stringify({ cwd: sb.cwd, root: sb.root, sessionsDir: sb.sessionsDir, outFile, kind }) },
+    env: { ...sb.env, TMPDIR: sb.root, KIRO_CLAUDE_FAKE: fakeClaudePath(), R8F_CFG: JSON.stringify({ cwd: sb.cwd, root: sb.root, sessionsDir: sb.sessionsDir, outFile, kind }) },
     encoding: 'utf8',
     timeout: 60_000,
   });

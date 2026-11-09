@@ -203,7 +203,7 @@ function crashDuringRewind(sb: Sandbox, inTangent: boolean): { mainId: string; r
     process.kill(process.pid, 'SIGKILL');
   `;
   const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], {
-    env: { ...sb.env, KIRO_CLAUDE_FAKE: fakeClaudePath(), R7F_CFG: JSON.stringify({ cwd: sb.cwd, sessionsDir: sb.sessionsDir, inTangent, outFile }) },
+    env: { ...sb.env, TMPDIR: sb.root, KIRO_CLAUDE_FAKE: fakeClaudePath(), R7F_CFG: JSON.stringify({ cwd: sb.cwd, sessionsDir: sb.sessionsDir, inTangent, outFile }) },
     encoding: 'utf8',
     timeout: 60_000,
   });

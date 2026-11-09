@@ -3,6 +3,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { removeOnExit } from '../tmpdirs.js';
 import type {
   AgentSpawnHookResult,
   HookRunContext,
@@ -28,7 +29,7 @@ export interface TempWs {
 
 /** Temp workspace: `<tmp>/home` (HOME, with `.kiro`), `<tmp>/home/proj` (cwd + workspace root with `.kiro/`). */
 export function makeWs(opts: { cwdSub?: string; kiroHome?: string } = {}): TempWs {
-  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-policy-')));
+  const base = removeOnExit(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-policy-'))));
   const home = path.join(base, 'home');
   const root = path.join(home, 'proj');
   fs.mkdirSync(path.join(root, '.kiro'), { recursive: true });

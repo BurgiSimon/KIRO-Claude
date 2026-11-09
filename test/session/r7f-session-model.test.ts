@@ -231,7 +231,7 @@ function crashInTangent(sb: Sandbox, change: 'swap' | 'model' | 'effort'): { mai
     process.kill(process.pid, 'SIGKILL');
   `;
   const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], {
-    env: { ...sb.env, KIRO_CLAUDE_FAKE: fakeClaudePath(), R7F_CFG: JSON.stringify({ cwd: sb.cwd, change, outFile }) },
+    env: { ...sb.env, TMPDIR: sb.root, KIRO_CLAUDE_FAKE: fakeClaudePath(), R7F_CFG: JSON.stringify({ cwd: sb.cwd, change, outFile }) },
     encoding: 'utf8',
     timeout: 60_000,
   });

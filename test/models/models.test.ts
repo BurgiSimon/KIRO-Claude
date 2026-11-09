@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import type { ModelInfo } from '../../src/claude/protocol.js';
+import { removeOnExit } from '../tmpdirs.js';
 import {
   STATIC_MODELS,
   buildModelList,
@@ -291,7 +292,7 @@ describe('models: formatModelList (--list-models)', () => {
 
 describe('models: model cache', () => {
   function env(): NodeJS.ProcessEnv {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'kc-models-'));
+    const tmp = removeOnExit(fs.mkdtempSync(path.join(os.tmpdir(), 'kc-models-')));
     return { HOME: path.join(tmp, 'home'), XDG_CACHE_HOME: path.join(tmp, 'cache') };
   }
   it('path honors XDG_CACHE_HOME (absolute only), else ~/.cache', () => {
