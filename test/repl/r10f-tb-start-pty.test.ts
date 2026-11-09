@@ -12,6 +12,10 @@
  * SessionEnd) until `fg`, which then drew the greeting and the prompt before it died. Now the first
  * prompt waits off the terminal for the foreground, and what the chat writes to the terminal while
  * it starts in the background waits too (with `stty tostop` such a write stopped it the same way).
+ * Since r11 #2 the chat stops by itself while it waits there, like a background job that reads its
+ * terminal ('Stopped (tty input)', at the default action of its own SIGTTIN, not inside a
+ * restarting ioctl), so the "waits off the terminal" checks expect that stop (before r11 they
+ * asserted it kept running, which under `sudo` never came up after `fg`).
  *
  * Each kill checks: exit status 143, the lock released, SessionEnd ran, nothing printed after the
  * signal. Controls: Ctrl+Z while starting then `fg`, and `chat &` then `fg`, work.
@@ -211,14 +215,18 @@ async function stopWhileStarting(t: Term, pid: number): Promise<void> {
   await sleep(3500);
 }
 
-/** The chat stays in the background without stopping, and draws nothing, for `ms`. */
-async function runsOffTheTerminal(t: Term, pid: number, mark: number, ms = 1500): Promise<void> {
-  const end = Date.now() + ms;
-  while (Date.now() < end) {
-    const st = procState(pid);
-    assert.ok(st === 'S' || st === 'R', `the chat stopped in the background (state ${st})`);
-    await sleep(50);
-  }
+/**
+ * In the background the chat waits off the terminal and draws nothing. Since r11 #2 it stops there
+ * by itself, as a background job that reads its terminal does (its own SIGTTIN at the default
+ * action: `jobs -l` says 'Stopped (tty input)'), never inside a restarting tcsetattr or write
+ * (SIGTTOU, 'Stopped (tty output)'), which r10 #1 was about: `kill %1` must still close it.
+ */
+async function stopsOffTheTerminal(t: Term, pid: number, mark: number): Promise<void> {
+  await waitUntil(() => procState(pid) === 'T', `the chat stops by itself in the background (state ${procState(pid)})`, 10_000);
+  const m = t.screen().length;
+  t.write('jobs -l\r');
+  await t.waitFor(/jobs -l\r?\n[\s\S]*\[1\][+-]? +\d+ +\S[\s\S]*BASH\$ $/, 'the job list', m, 10_000);
+  assert.match(t.screen().slice(m), /\[1\][+-]? +\d+ +Stopped \(tty input\)/, t.screen().slice(m));
   assert.doesNotMatch(t.screen().slice(mark).replace(/BASH\$ /g, ''), DRAWN, 'drawn from the background');
 }
 
@@ -272,7 +280,7 @@ test('r10f #1: Ctrl+Z while the chat starts, then `kill %1`: it closes and dies 
   }
 });
 
-test('r10f #1: Ctrl+Z while the chat starts, then `bg`: it runs on off the terminal (not stopped again, nothing drawn); `kill %1` closes it', { skip, timeout: 120_000 }, async () => {
+test('r10f #1: Ctrl+Z while the chat starts, then `bg`: it waits off the terminal (stopped again by itself since r11 #2, nothing drawn); `kill %1` closes it', { skip, timeout: 120_000 }, async () => {
   const { r, t, ended } = setup();
   try {
     const pid = await startChat(t, r);
@@ -280,7 +288,7 @@ test('r10f #1: Ctrl+Z while the chat starts, then `bg`: it runs on off the termi
     const mark = t.screen().length;
     t.write('bg\r');
     await t.waitFor(/BASH\$ $/, 'bash prompt after bg', mark);
-    await runsOffTheTerminal(t, pid, mark);
+    await stopsOffTheTerminal(t, pid, mark);
     await killedCleanly(t, r, pid, ended);
   } finally {
     await t.dispose();
@@ -300,7 +308,7 @@ test('r10f #1 control: Ctrl+Z while the chat starts, then `fg`: the greeting and
   }
 });
 
-test('r10f #1: Ctrl+Z while the chat starts, `bg`, then `fg` (no SIGCONT): the prompt comes up and it works', { skip, timeout: 120_000 }, async () => {
+test('r10f #1: Ctrl+Z while the chat starts, `bg`, then `fg` (of the job stopped again by itself, r11 #2): the prompt comes up and it works', { skip, timeout: 120_000 }, async () => {
   const { r, t } = setup();
   try {
     const pid = await startChat(t, r);
@@ -308,7 +316,7 @@ test('r10f #1: Ctrl+Z while the chat starts, `bg`, then `fg` (no SIGCONT): the p
     let mark = t.screen().length;
     t.write('bg\r');
     await t.waitFor(/BASH\$ $/, 'bash prompt after bg', mark);
-    await runsOffTheTerminal(t, pid, mark, 800);
+    await stopsOffTheTerminal(t, pid, mark);
     mark = t.screen().length;
     t.write('fg\r');
     await works(t, r, pid, mark);
@@ -323,7 +331,7 @@ test('r10f #1: `kiro-claude chat &`, then `kill %1`: it closes and dies of SIGTE
     const mark = t.screen().length;
     const pid = await startChat(t, r, '', true);
     await sleep(3500); // started, waiting for the foreground
-    await runsOffTheTerminal(t, pid, mark, 500);
+    await stopsOffTheTerminal(t, pid, mark);
     await killedCleanly(t, r, pid, ended);
   } finally {
     await t.dispose();
@@ -343,13 +351,13 @@ test('r10f #1 control: `kiro-claude chat &`, then `fg`: the greeting and the pro
   }
 });
 
-test('r10f #1: `stty tostop`, `kiro-claude chat &` with a notice while it starts: it is not stopped by that write; `kill %1` closes it, the notice never printed', { skip, timeout: 120_000 }, async () => {
+test('r10f #1: `stty tostop`, `kiro-claude chat &` with a notice while it starts: it is not stopped by that write (only by its own stop for the terminal, r11 #2); `kill %1` closes it, the notice never printed', { skip, timeout: 120_000 }, async () => {
   const { r, t, ended } = setup(true);
   try {
     const mark = t.screen().length;
     const pid = await startChat(t, r, 'stty tostop; ', true);
     await sleep(3500); // the SessionStart hook failed meanwhile: its notice is held
-    await runsOffTheTerminal(t, pid, mark, 500);
+    await stopsOffTheTerminal(t, pid, mark);
     assert.doesNotMatch(t.screen().slice(mark), /START-WARNING/, 'the notice was written from the background');
     await killedCleanly(t, r, pid, ended);
   } finally {

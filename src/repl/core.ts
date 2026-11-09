@@ -6,7 +6,9 @@
  * SessionUI) → in terminal mode, off the terminal until kiro-claude is in its foreground (stopped
  * while it started and continued in the background, or `kiro-claude chat &`: the line reader's
  * raw-mode switch from the background stopped it with SIGTTOU, and `kill %1` never closed it; what
- * it writes to the terminal from the background meanwhile is held; r10 #1, {@link Repl.run}) →
+ * it writes to the terminal from the background meanwhile is held; r10 #1, {@link Repl.run}; it
+ * stops itself meanwhile like a background job that reads its terminal, so `fg` continues it, also
+ * under `sudo` with `use_pty`, r11 #2) →
  * greeting → optional initial input → read/dispatch loop → on exit close the
  * session and print `To resume this session: <prog> chat --resume-id <id>` for the record the
  * close kept (`KiroSession.resumeId`; none for a chat that never had a message) (exit 0;
@@ -122,7 +124,7 @@ import { builtinCommands } from './commands/index.js';
 import { PLAN_EXECUTE_PROMPT, PLAN_EXECUTE_QUESTION, looksLikePlan } from './commands/plan.js';
 import { DUPLICATE_SIGNAL_WINDOW_MS, ExitSignals, anySignal, holdTerminalOutput } from './exitSignals.js';
 import { openEditor, runShellCommand } from './external.js';
-import { FOREGROUND_POLL_MS, LineReader, appendHistoryFile, historyFilePath, loadHistoryFile, sanitizeUnicodeTags, terminalInForeground } from './input.js';
+import { LineReader, appendHistoryFile, historyFilePath, loadHistoryFile, sanitizeUnicodeTags, stopForTerminal, terminalInForeground, waitForForeground } from './input.js';
 import { BUSY_MESSAGE, TIPS, approvalQuestion, colorPrompt, exitHint, formatGreeting, resumeHint } from './prompt.js';
 import { CommandRegistry, formatCommandHelp } from './registry.js';
 import { Spinner, TurnRenderer } from './render.js';
@@ -699,12 +701,18 @@ export class Repl implements ReplContext {
    * there. That tcsetattr from the background stopped the chat again at once (SIGTTOU), and
    * `kill %1` (SIGTERM, then SIGCONT) then never closed it, as at the prompt (r9 #1; r9 #2
    * verification: `kiro-claude chat | tee log` hands the terminal over too since #2). So, like
-   * the reader after a stop, the chat runs on off the terminal until it is in the foreground again
-   * ({@link awaitForeground}). A
+   * the reader after a stop, the chat waits off the terminal until it is in the foreground again
+   * ({@link awaitForeground}), and stops meanwhile like a background job that reads its terminal
+   * ('Stopped (tty input)', r11 #1/#2), so the shell gets the terminal and `fg` continues it. That
+   * also covers a job-control child that died holding the terminal (`!bash -i`, then `kill -9 $$`
+   * in it): its dead process group stayed the terminal's foreground, the shell blocked on the
+   * chat's job, keyboard signals reached nobody, and the chat polled for good (r11 #1). A
    * fatal signal meanwhile (`kill %1`) leaves the terminal alone: its close runs at once, and the
    * reader is not resumed (the terminal stays as the child left it). The child's guard
-   * ({@link guardChild}) is released first, before resume()'s mode change: the output it held is
-   * written then (in the foreground), or dropped after a fatal signal. When the child ended in
+   * ({@link guardChild}) is released only after that wait, before resume()'s mode change: the
+   * output it held (`Self exited with status: signal: 9 (SIGKILL)`) is written then, in the
+   * foreground after `fg`, or dropped after a fatal signal; the stop is SIGTTIN, which the guard
+   * does not catch (it catches SIGTTOU). When the child ended in
    * the background, the keys the terminal queued meanwhile (typed after `fg` before this wait
    * noticed it) are read as typed in its cooked mode (LineReader.resume(true), r10 #2); after a
    * child that ended in the foreground a newline typed during it stays a soft newline, as in Q.
@@ -721,18 +729,31 @@ export class Repl implements ReplContext {
   }
 
   /**
-   * Off the terminal, wait until kiro-claude is in its terminal's foreground: `fg` (bash sends no
-   * SIGCONT to a job it knows to be running), asked every FOREGROUND_POLL_MS (r10 #2: until the
-   * terminal is taken back it is in the shell's cooked mode; at 250 ms a line typed right after
-   * `fg` was echoed by the terminal and its Return taken for a soft newline). False once a fatal
-   * signal is in ({@link silent}): its close runs, nothing of the terminal is taken.
+   * Off the terminal, wait until kiro-claude is in its terminal's foreground (input.ts
+   * waitForForeground): asked every FOREGROUND_POLL_MS (r10 #2: until the terminal is taken back
+   * it is in the shell's cooked mode; at 250 ms a line typed right after `fg` was echoed by the
+   * terminal and its Return taken for a soft newline), and after each look that still finds it in
+   * the background it stops like a background job that reads its terminal ('Stopped (tty input)',
+   * input.ts stopForTerminal, r11 #1/#2), so the shell takes the terminal back and `fg` continues
+   * it: under `sudo` with `use_pty` the polling alone never came up after `fg` (sudo hands its
+   * inner pty over only once it is continued itself), and a `!cmd` child that died holding the
+   * terminal (`!bash -i`, then SIGKILL) left the shell blocked on the chat's job for good. The
+   * signals that came with the continue are dispatched before the next look (`kill %1` closes the
+   * chat). In an orphaned process group the kernel discards the stop and the poll goes on alone.
+   * A stop that comes back at once while still in the background is followed by a SIGTSTP
+   * (input.ts TerminalStops): under `sudo` with `use_pty`, after such a dead child, sudo in the
+   * foreground resumed the chat at once each time, the inner pty still on the dead group, and the
+   * shell never got its terminal back; sudo answers a SIGTSTP by suspending itself (r11
+   * verification). False once a fatal signal is in ({@link silent}): its close runs, nothing of
+   * the terminal is taken.
    */
   private async awaitForeground(): Promise<boolean> {
-    while (!terminalInForeground(this.ctx.stdin)) {
-      if (this.silent) return false;
-      await new Promise((r) => setTimeout(r, FOREGROUND_POLL_MS));
-    }
-    return !this.silent;
+    const stdin = this.ctx.stdin;
+    return waitForForeground(
+      () => terminalInForeground(stdin),
+      () => this.silent,
+      (signal) => stopForTerminal(stdin, signal),
+    );
   }
 
   // ───────────────────────────── SessionUI ─────────────────────────────
@@ -1542,9 +1563,13 @@ export class Repl implements ReplContext {
     // inside that ioctl, restarted after every continue, so its SIGTERM was never handled and it
     // kept its lock until `fg` (r10 #1; Claude Code's answer to initialize, queued during the stop,
     // is read before the signal that came with the continue). So it waits off the terminal until
-    // `fg`, and a fatal signal meanwhile closes it at once, nothing drawn. (Keys typed after `fg`
+    // `fg`, stopped like a background job that reads its terminal ('Stopped (tty input)', r11 #2:
+    // under `sudo` with `use_pty` the polling alone never came up after `fg`), and a fatal signal
+    // meanwhile closes it at once, nothing drawn (awaitForeground). (Keys typed after `fg`
     // before the wait noticed it are queued in the shell's cooked mode: the reader reads them as
-    // typed there, LineReaderOptions.cooked, r10 #2.)
+    // typed there, LineReaderOptions.cooked, r10 #2. Decided here, once: a `fg` that came while
+    // the start still ran, also after a stop during it, makes it a start in the foreground, where
+    // a newline typed before the prompt stays a soft newline, as README says, r11 #3.)
     const waited = this.terminal && !terminalInForeground(this.ctx.stdin);
     if (this.terminal && !(await this.awaitForeground())) {
       startOutput(false);
@@ -1591,7 +1616,9 @@ export class Repl implements ReplContext {
       // the terminal hung up: its EOF / EIO ended the input a moment before Node dispatches the
       // SIGHUP that comes with it. Wait for that signal (bounded) rather than quit first: a session
       // whose close already settled (a forced stop's) would let this finish, remove the listeners
-      // and exit 0 before it (r6 #3). Never for a Ctrl+D (a key) or the end of piped input.
+      // and exit 0 before it (r6 #3). Never for a Ctrl+D (a key) or the end of piped input, nor
+      // for canonical mode's end of file read right after a stop from elsewhere (a Ctrl+D typed
+      // in the shell: no SIGHUP comes for it; LineReader.hungUp, r11 #0).
       if (exits && !exits.received && this.reader.hungUp) await exits.awaitSignal(DUPLICATE_SIGNAL_WINDOW_MS);
       // a SIGHUP / SIGTERM is closing the session: the signal ends the process (the terminal may be gone)
       if (exits?.received) await exits.die();

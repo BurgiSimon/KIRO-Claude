@@ -14,9 +14,11 @@
  *    SIGTERM listener ran ('Stopped (tty output)', lock held, no SessionEnd) until `fg`, which then
  *    drew '> ' before it died. Now it closes and dies of SIGTERM (143) at once, printing nothing.
  *    The same for `kill -STOP`, then `kill -TERM` and `kill -CONT` from elsewhere.
- *  - the background (the documented gap changes): after Ctrl+Z and `bg` the chat keeps running in
- *    the background, off the terminal (before, it stopped again with SIGTTOU), and `fg` takes it
- *    back (bash sends no SIGCONT to a job it knows to be running).
+ *  - the background (the documented gap changes): after Ctrl+Z and `bg` the chat stays off the
+ *    terminal (before, it set raw mode from there and SIGTTOU stopped it inside that ioctl), and
+ *    `fg` takes it back. Since r11 #2 it stops again by itself there once it needs the terminal,
+ *    like a background job that reads it ('Stopped (tty input)'; between r9 and r11 it ran on, and
+ *    under `sudo` that never came up after `fg`), so `fg` continues it with a SIGCONT.
  *  - #8: while `!cat` owns the terminal bracketed paste is off; at the next prompt on again.
  */
 import { test } from 'node:test';
@@ -332,7 +334,7 @@ test('r9f #1: kill -STOP, then kill -TERM and kill -CONT from elsewhere: the cha
   await killStopped('stop');
 });
 
-test('r9f: Ctrl+Z, then `bg`: the chat runs on in the background, off the terminal; `fg` takes it back', { skip, timeout: 90_000 }, async () => {
+test('r9f: Ctrl+Z, then `bg`: the chat stays off the terminal (stopped again by itself, r11 #2); `fg` takes it back', { skip, timeout: 90_000 }, async () => {
   const r = mkRoot(SCRIPT);
   removeOnExit(r.root);
   const t = underBash(r);
@@ -347,12 +349,14 @@ test('r9f: Ctrl+Z, then `bg`: the chat runs on in the background, off the termin
     t.write('bg\r');
     await t.waitFor(/BASH\$ $/, 'bash prompt after bg', mark + 3);
     await sleep(800);
-    assert.notEqual(procState(pid), 'T', 'the chat stopped again in the background');
+    // stopped again by itself (r11 #2: its own SIGTTIN, 'Stopped (tty input)'), never by a mode
+    // change from the background (SIGTTOU, 'Stopped (tty output)')
+    assert.equal(procState(pid), 'T', 'the chat did not stop again in the background once it needed the terminal');
     // nothing of the chat's own is drawn over the shell meanwhile; typing at bash works
-    t.write('echo SHELL-OK\r');
-    await t.waitFor(/SHELL-OK[\s\S]*BASH\$ $/, 'bash runs a command', mark);
+    t.write('echo SHELL-OK; jobs -l\r');
+    await t.waitFor(/SHELL-OK[\s\S]*\[1\][\s\S]*BASH\$ $/, 'bash runs a command', mark);
+    assert.match(t.screen().slice(mark), /\[1\][+-]? +\d+ +Stopped \(tty input\)/, t.screen().slice(mark));
     assert.doesNotMatch(t.screen().slice(mark), /> half/, 'the chat drew its prompt in the background');
-    assert.notEqual(procState(pid), 'T', 'the chat stopped (it read the terminal in the background: SIGTTIN)');
     mark = t.screen().length;
     t.write('fg\r');
     await t.waitFor(/> half$/, 'the prompt and the half-typed line are back', mark, 10_000);

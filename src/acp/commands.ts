@@ -5,8 +5,10 @@
  * This module holds the pure parts (parsing, result payloads, texts); the server runs them
  * against the live session. Result shapes are the ones KiroCrew reads:
  *  - `mcp`   ⇒ `{"success":true,"message":"N MCP servers","data":{"servers":[{"name","status":
- *              "running"|"failed"|"loading"|"disabled","toolCount"}]}}` (Claude `connected` ⇒
- *              `running`, `pending` ⇒ `loading`, `needs-auth` ⇒ `failed`)
+ *              "running"|"failed"|"loading"|"disabled","toolCount","error"}]}}` (Claude
+ *              `connected` ⇒ `running`, `pending` ⇒ `loading`, `needs-auth` ⇒ `failed`; the
+ *              session's `stopped`, no Claude Code child to start it until the next prompt, ⇒
+ *              `failed` with that reason as `error`, r11 #4)
  *  - `tools` ⇒ `{"success":true,"message":"N tools","data":{"tools":[{"name":"<kiro name>",
  *              "source":"builtin"|"mcp:<server>"}]}}`
  *  - `effort`⇒ `{"success":true,"message":"Effort set to <level>"}` (captured kiro-cli text)

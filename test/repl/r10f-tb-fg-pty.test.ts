@@ -4,7 +4,9 @@
  *
  * After Ctrl+Z and `bg` (and after a `!cmd` that ends in the background after Ctrl+Z and `bg`:
  * Repl.handBack), bash's `fg` of the RUNNING chat sends no SIGCONT, so the chat took the terminal
- * back only at its next foreground poll, up to 250 ms later. Until then the terminal is in the
+ * back only at its next foreground poll, up to 250 ms later. (Since r11 #2 the chat stops again by
+ * itself once it needs the terminal there, so `fg` continues it with a SIGCONT; the window between
+ * `fg` and the retake, where the terminal is still cooked, is the same.) Until then the terminal is in the
  * shell's cooked mode: a line typed in that window was echoed by the terminal and its Return
  * queued as LF, which the reader read as Ctrl+J (a soft newline): not submitted; a Ctrl+D (a NUL
  * placeholder in canonical mode) was dropped. Now the chat asks every 20 ms while in the background,
@@ -183,7 +185,12 @@ async function startChat(t: Term): Promise<number> {
   return t.chatPid();
 }
 
-/** Ctrl+Z (at the prompt, or in a running `!cmd`), then `bg`: the chat runs on in the background. */
+/**
+ * Ctrl+Z (at the prompt, or in a running `!cmd`), then `bg`: the chat continues in the background
+ * and, once it needs the terminal (its prompt, or the hand-back after the child), stops again by
+ * itself like a background job that reads its terminal (r11 #2; before, it ran on there and `fg`
+ * sent no SIGCONT). Waited for here, so that `fg` below continues the stopped job.
+ */
 async function stopAndBg(t: Term, pid: number): Promise<void> {
   let mark = t.screen().length;
   t.write('\x1a');
@@ -191,7 +198,8 @@ async function stopAndBg(t: Term, pid: number): Promise<void> {
   mark = t.screen().length;
   t.write('bg\r');
   await t.waitFor(/BASH\$ $/, 'bash prompt after bg', mark);
-  await waitUntil(() => procState(pid) === 'S' || procState(pid) === 'R', 'running in the background', 5000);
+  await sleep(100);
+  await waitUntil(() => procState(pid) === 'T', 'stopped again in the background once it needs the terminal', 8000);
 }
 
 /** `line` is answered exactly once after `mark`, and the next prompt is up. */

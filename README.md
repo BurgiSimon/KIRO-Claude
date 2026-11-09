@@ -125,13 +125,27 @@ In chat:
   -STOP` from elsewhere, however often) does not count against their timeouts, and a hook that
   finished meanwhile counts with its exit status (a blocking preToolUse hook still blocks).
   Continued in the background (`bg`, or `kill -CONT` while the shell has the terminal), the chat
-  keeps running but stays off the terminal (no prompt, nothing read) until `fg` (on Linux;
-  elsewhere it stops again until `fg`). The same holds for a chat stopped
-  while it is still starting, and for `kiro-claude chat &`: it starts off the terminal and shows
-  its greeting and prompt (and what it had to say while starting) once you `fg` it; a first INPUT
-  waits for that too. What you type right after `fg`, before the chat has the terminal back,
-  counts as typed: Enter submits, Ctrl+D is Ctrl+D (also after a `!cmd` that ended in the
-  background meanwhile); an approval prompt takes its answer only from an Enter typed at its
+  stops again as soon as it needs the terminal, like any terminal program and like Kiro CLI: the
+  shell reports it `Stopped` (`jobs -l`: `Stopped (tty input)`) and `fg` brings it back. A turn
+  still running then (after a `kill -STOP` from elsewhere during it, and `bg`) goes on in the
+  background, its output written there, and the chat stops at the prompt that follows it (or at
+  an approval). `kill %1` or closing the terminal closes a chat stopped this way at once. This
+  works through wrappers and pipelines (`npx`, `kiro-claude chat | tee log`) and under `sudo`,
+  also with `use_pty` (on Linux; elsewhere the chat stops again at once, also while a turn runs).
+  The same holds for a chat stopped
+  while it is still starting, and for `kiro-claude chat &`: it starts off the terminal, stops
+  before its greeting, and shows its greeting and prompt (and what it had to say while starting)
+  once you `fg` it; a first INPUT waits for that too. In a background job that no shell can bring
+  back (`bash -mc 'kiro-claude chat & …'` once that shell has exited) the chat cannot stop: it
+  waits off the terminal, its lock held, until a signal or the end of the terminal session; one
+  that had stopped before that shell exited is closed as at a hangup. What you type right after
+  `fg`, before the chat has the terminal back, counts as typed (Enter submits, Ctrl+D is Ctrl+D)
+  after Ctrl+Z, after a `kill -TSTP` or `kill -STOP` from elsewhere (with what you typed in the
+  shell before `fg`), after a `!cmd` that ended in the background meanwhile, and once a start in
+  the background has finished (the chat has stopped itself since: the shell reports it
+  `Stopped`); a `fg` while the chat is still starting brings it up as a chat starting in the
+  foreground, where an Enter typed before its prompt stays a new line. An approval prompt takes
+  its answer only from an Enter typed at its
   question. Lines typed while the chat starts in the foreground, or while a `!cmd` runs that does
   not read them, keep their Enter as a new line, as in Kiro CLI: a paste there stays one input and
   none of its lines runs before you press Enter.
@@ -142,9 +156,15 @@ In chat:
   they run, also when the chat's output is piped (`kiro-claude chat | tee session.log`): what you
   type, Ctrl+C and Ctrl+Z are theirs. As in Kiro CLI, their output goes where the chat's goes (into
   that log too). A Ctrl+C for a `!cmd` there also ends the `tee` (`tee -i` ignores it). One that
-  ends after Ctrl+Z and `bg` leaves the chat running in the background, off the terminal, until
-  `fg` (a `kill %1` closes it). After Ctrl+Z inside one of them, `kill %1` closes the chat too,
-  also when the program resets the terminal as it dies (vim does). What the chat itself would
+  ends after Ctrl+Z and `bg` leaves the chat stopped in the background (it needs the terminal
+  back) until `fg` (a `kill %1` closes it). So does one that dies holding the terminal (`!bash`,
+  then `kill -9 $$` in it): the shell gets the terminal back and reports the chat `Stopped`;
+  after `fg` the chat says how the program ended and shows its prompt. Under `sudo` with
+  `use_pty` the shell gets the terminal back too, but the chat cannot come back (sudo hands its
+  own terminal to the dead program at every `fg`, and the chat stops again): `kill %1` closes
+  it. After Ctrl+Z inside one
+  of them, `kill %1` closes the chat too, also when the program resets the terminal as it dies
+  (vim does). What the chat itself would
   print on the terminal while such a program has it waits until the program is done.
 
 `chat --no-interactive`: the first Ctrl+C interrupts the answer (exit status 130), a second one
@@ -161,8 +181,9 @@ A chat suspended with Ctrl+Z (or `kill -STOP`), also inside `$EDITOR` or a `!cmd
 still starting, closes the same way without
 `fg` when the signal comes with a continue: `kill %1` in its shell sends SIGTERM, then SIGCONT;
 from elsewhere, follow `kill <pid>` with `kill -CONT <pid>`. A plain `kill <pid>` takes effect
-only once the chat is continued (until then it keeps its session lock). One running in the
-background (after `bg`, or `kiro-claude chat &`) closes at `kill %1` or `kill <pid>` alike.
+only once the chat is continued (until then it keeps its session lock). That includes a chat
+that stopped itself in the background because it needs the terminal (after `bg`, or
+`kiro-claude chat &`); one still running there (a turn) closes at `kill %1` or `kill <pid>` alike.
 A second signal ends it at once, unless it comes
 within half a second of the first and is the same signal, or the other of SIGHUP and SIGTERM
 (closing a terminal tab can send SIGHUP twice; closing the terminal of a chat stopped with Ctrl+Z
@@ -301,8 +322,11 @@ A model, effort or mode change (`session/set_model`, `session/set_config_option`
 `session/set_mode`) answers what the session then reports: a change the session kept is answered
 as applied, with its `config_option_update` or `current_mode_update`, even when Claude Code did not
 confirm it (a `set_model` it never answered, a child that died); the next Claude Code child starts
-with it. `Invalid model ID` is only for a model id that is not offered or that Claude Code refused,
-and then nothing changes. See
+with it. Until then, after a mode change whose Claude Code restart failed, the `tools` and `mcp`
+commands answer at once for the new agent: its MCP servers show `failed` with the reason "Claude
+Code is not running; the next prompt starts it". That prompt then sends their
+`_kiro.dev/mcp/server_initialized` (or `server_init_failure`). `Invalid model ID` is only for a
+model id that is not offered or that Claude Code refused, and then nothing changes. See
 [Model, effort and mode changes](docs/ARCHITECTURE.md#model-effort-and-mode-changes-acp).
 
 ## KiroCrew on Claude Code

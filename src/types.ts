@@ -793,7 +793,10 @@ export interface KiroSession extends EventEmitter {
    */
   resumeId?(): string | undefined;
 
-  /** Tool listing for /tools. */
+  /**
+   * Tool listing for /tools: the tools of the agent and configuration the session runs, also
+   * while no Claude Code child runs (a restart that failed: the agent switched to, r11 #4).
+   */
   toolListing(): ToolListingEntry[];
   trustTools(names: string[]): void;
   untrustTools(names: string[]): void;
@@ -801,6 +804,12 @@ export interface KiroSession extends EventEmitter {
   resetTrust(): void;
 
   usage(): Promise<UsageReport>;
+  /**
+   * /mcp: the agent's MCP servers, with Claude Code's status (`connected`, `failed`,
+   * `needs-auth`, `pending`, …) or `disabled`; `pending` only while a child runs or is starting,
+   * and `stopped` (its `error` says why) while none does, until the next prompt starts one
+   * (r11 #4).
+   */
   mcpStatus(): Promise<McpStatusEntry[]>;
   todos(): TodoItem[];
   hooks(): readonly KiroHook[];

@@ -33,10 +33,14 @@
  *    CLI's `already in use` / `No conversation found` start errors, and a lost transcript is
  *    replaced by the `<sid>.jsonl` journal as context (08a §4.2); so is a fork at a message the
  *    source transcript does not hold (`No message found with message.uuid`: a `/rewind` to a
- *    turn saved before such a fallback). A fork made by `create({ fork })` (a spec-phase session
- *    or continuation) gets a copy of its parent's journal, cut at a rewind point `at`, like a
- *    tangent / rewind does, so that fallback restores the parent's history (S1), and its record
- *    carries the parent's turns and message count, cut the same way (K1): `/tangent`, `/rewind N`
+ *    turn saved before such a fallback). A respawn that still fails leaves no child: the session
+ *    keeps what changed (the agent, a context rule) and the next line starts Claude Code; until
+ *    then `toolListing()`, `mcpStatus()` and `contextReport()` describe the launch tried, and the
+ *    MCP servers are `stopped`, as after a crash, never `pending` (r11 #4). A fork made by
+ *    `create({ fork })` (a spec-phase session or continuation) gets a copy of its parent's
+ *    journal, cut at a rewind point `at`, like a tangent / rewind does, so that fallback restores
+ *    the parent's history (S1), and its record carries the parent's turns and message count, cut
+ *    the same way (K1): `/tangent`, `/rewind N`
  *    and a reopen's pin see the conversation it continues (VERIFIED with claude 2.1.319: a
  *    `--fork-session` transcript keeps its source's message uuids, and a fork of it at one of them
  *    cuts there). Closed before anything of its own (a line of the user's sent to Claude, a
@@ -365,6 +369,9 @@ export const TOOL_OUTPUT_MAX_CHARS = 4000;
 
 /** Max time a new turn waits for a still-running CLI turn (e.g. a late steer) to finish. */
 const WAIT_IDLE_MS = 120_000;
+
+/** `mcpStatus()` error of a `stopped` server: no Claude Code child runs or starts (r11 #4). */
+const MCP_NOT_RUNNING = 'Claude Code is not running; the next prompt starts it';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -897,7 +904,14 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
   private binary: ClaudeBinary | undefined;
   private caps: ClaudeCapabilities | undefined;
   private proc: ClaudeProcess | undefined;
+  /**
+   * The launch of the running child, of the child starting, or (no child: a start that failed)
+   * of the last start tried, which the next spawn builds again: what `toolListing()`,
+   * `mcpStatus()` and `contextReport()` describe (r11 #4).
+   */
   private launch: LaunchResult | undefined;
+  /** restart() / ensureProcess() replacing the child (closeProc, then spawn) while > 0 (mcpStatus). */
+  private respawning = 0;
   private liveModels: ModelInfo[] | undefined;
   private initialMode: LaunchMode;
   private historyKnown: boolean;
@@ -1624,6 +1638,9 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     this.reloadConfig();
     const launch = this.buildLaunchFor(mode);
     for (const w of launch.warnings) this.uiNotice('warn', w, true);
+    // no child runs (closeProc ran first): the listings describe this launch, also when its start
+    // fails (an agent swap's restart that failed: the agent switched to, not the one left, r11 #4)
+    if (!this.proc) this.launch = launch;
     let proc: ClaudeProcess;
     try {
       proc = await ClaudeProcess.start({
@@ -1755,15 +1772,20 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
   private async restart(opts: { mode?: LaunchMode } = {}): Promise<void> {
     if (!this.startPromise) return;
     await this.startPromise;
-    await this.closeProc();
-    const mode = opts.mode ?? this.defaultMode();
-    if (dyingSignal()) {
-      this.deferredMode = mode;
-      if (mode.kind === 'fork') this.setPendingFork(mode);
-      this.persist();
-      return;
+    this.respawning++;
+    try {
+      await this.closeProc();
+      const mode = opts.mode ?? this.defaultMode();
+      if (dyingSignal()) {
+        this.deferredMode = mode;
+        if (mode.kind === 'fork') this.setPendingFork(mode);
+        this.persist();
+        return;
+      }
+      await this.spawn(mode);
+    } finally {
+      this.respawning--;
     }
-    await this.spawn(mode);
     this.persist();
   }
 
@@ -1776,8 +1798,13 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     await this.start();
     if (this.proc && this.proc.running) return;
     if (this.proc && !dyingSignal()) this.uiNotice('warn', 'Claude Code exited unexpectedly; restarting it.');
-    await this.closeProc();
-    await this.spawn(this.defaultMode());
+    this.respawning++;
+    try {
+      await this.closeProc();
+      await this.spawn(this.defaultMode());
+    } finally {
+      this.respawning--;
+    }
     this.persist();
   }
 
@@ -3048,7 +3075,8 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
    * with it. An unknown agent, a busy session or hooks that were cancelled throw with nothing
    * changed. A restart that fails is rethrown with the switch kept and saved (the next line
    * starts Claude Code with the agent); callers that report the outcome (the ACP server, r10 #4)
-   * read `agent` afterwards.
+   * read `agent` afterwards. Until that line, no child runs: `toolListing()`, `mcpStatus()` and
+   * `contextReport()` describe the agent switched to, its MCP servers `stopped` (r11 #4).
    */
   async swapAgent(name: string): Promise<void> {
     await this.start();
@@ -3679,6 +3707,11 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
 
   // ── tools / trust ──
 
+  /**
+   * KiroSession.toolListing: the running child's `init.tools`; before its first turn, or with no
+   * child (a restart that failed), the launch's built-ins plus the MCP tools of this child's last
+   * `mcp_status` (none without a child).
+   */
   toolListing(): ToolListingEntry[] {
     const init = this.proc?.lastInit;
     let names: string[];
@@ -3763,6 +3796,11 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     return report;
   }
 
+  /**
+   * KiroSession.mcpStatus: Claude Code's `mcp_status` (Kiro server names), then the launch's
+   * servers it did not list: `pending` while a child runs (no answer yet) or is starting,
+   * `stopped` (with the reason) while none runs or starts, and the disabled ones.
+   */
   async mcpStatus(): Promise<McpStatusEntry[]> {
     await this.start();
     let st: McpStatus | undefined;
@@ -3800,7 +3838,15 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         ...(typeof s.error === 'string' ? { error: s.error } : {}),
       });
     }
-    for (const s of this.launch?.mcpServers ?? []) if (!seen.has(s.name)) out.push({ name: s.name, status: st ? 'unknown' : 'pending' }), seen.add(s.name);
+    // with no child running or starting (a restart that failed, a child that died, a restart
+    // during a fatal signal) nothing starts the servers before the next line starts Claude Code:
+    // `stopped`, never `pending`, which callers wait for (the ACP `mcp` / `tools` commands, r11 #4)
+    const idle = !this.proc?.running && this.respawning === 0;
+    for (const s of this.launch?.mcpServers ?? []) {
+      if (seen.has(s.name)) continue;
+      seen.add(s.name);
+      out.push(st ? { name: s.name, status: 'unknown' } : idle ? { name: s.name, status: 'stopped', error: MCP_NOT_RUNNING } : { name: s.name, status: 'pending' });
+    }
     for (const s of this.launch?.allMcpServers ?? []) if (s.disabled && !seen.has(s.name)) out.push({ name: s.name, status: 'disabled' }), seen.add(s.name);
     return out;
   }

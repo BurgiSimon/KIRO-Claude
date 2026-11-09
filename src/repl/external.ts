@@ -10,7 +10,9 @@
  * the process's own stdout and stderr, a pipe included, so it reaches the screen in order with
  * what the REPL writes before and after it (the reader's bracketed-paste switches go to stdout
  * too; the caller first waits until what Node still queues for a pipe is handed to the OS, and
- * takes the terminal back only in the foreground: repl/core.ts flushedForChild, handBack).
+ * takes the terminal back only in the foreground, stopping itself meanwhile like a background job
+ * that reads its terminal, also after a job-control child that died holding it: repl/core.ts
+ * flushedForChild, handBack, r11 #1).
  * DECISION: not to the controlling terminal (`/dev/tty`), which would keep an editor's
  * screen out of a piped log but could overtake output still in the pipe, may not exist, and is
  * not what Q does; an editor may then say its output is not a terminal (vim: a 2 s pause), as

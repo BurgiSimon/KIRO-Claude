@@ -49,7 +49,10 @@
  * signal that stop is dropped; otherwise kiro-claude stops itself as before. Meanwhile kiro-claude
  * changes no terminal mode and holds its own terminal output ({@link holdTerminalOutput}, which
  * the REPL also uses while it starts in the background, r10 #1), because a caught SIGTTOU makes
- * such a call of its own from the background restart forever.
+ * such a call of its own from the background restart forever. SIGTTIN is never caught: when the
+ * REPL needs the terminal and is in the background (its hand-back after the child included, with
+ * this guard still up) it stops itself with SIGTTIN at its default action (repl/input.ts
+ * stopForTerminal, r11 #1/#2; SIGTSTP after a stop that came back at once, never caught either).
  *
  * A chat that never had a message and is left anyway (the grace ran out, a second signal, SIGKILL,
  * a crash) is dropped by the session index (store.ts `list`); any other record left stays listed,

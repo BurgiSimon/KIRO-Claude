@@ -11,8 +11,11 @@
  * `kill %1` (bash: SIGTERM, then SIGCONT) never closed it: the restarted tcsetattr stopped it again
  * before its SIGTERM listener ran (lock held, no SessionEnd) until `fg` or SIGKILL, the same
  * defect as r9 #1 at the prompt. Now the terminal is taken back only in the foreground: the chat
- * runs on in the background, off the terminal, until `fg`, and a fatal signal meanwhile closes it.
- * Plain terminal and `| cat` alike.
+ * stays off the terminal in the background until `fg`, and a fatal signal meanwhile closes it.
+ * Plain terminal and `| cat` alike. Since r11 #2 it stops again by itself there, like a background
+ * job that reads its terminal (its own SIGTTIN to its process group, `| cat` included: `jobs -l`
+ * says 'Stopped (tty input)', not the 'Stopped (tty output)' of a restarting tcsetattr); between r9
+ * and r11 it ran on, and under `sudo` that never came up after `fg`.
  *
  * The hand-over: with stdout piped the child writes to that pipe itself, which the fix says keeps
  * its output "in order with what the chat writes before and after". Node queues what a pipe does
@@ -261,23 +264,37 @@ async function childEndsInBackground(piped: boolean, via: 'bang' | 'editor'): Pr
   fs.writeFileSync(path.join(r.ws, 'go'), '');
   await t.waitFor(/CHILD-DONE/, 'the child ends in the background', mark, 15_000);
   await waitUntil(() => childCommands(pid).length === 0, 'the child has exited', 10_000);
-  // a hand-back that touches the terminal from the background stops the chat (SIGTTOU) at once
+  // the hand-back stops the chat by itself once the child ended (r11 #2: its own SIGTTIN); one that
+  // touched the terminal from the background would have stopped it with SIGTTOU at once
   const t0 = Date.now();
   while (procState(pid) !== 'T' && Date.now() - t0 < 1500) await sleep(20);
   return { r, t, pid, ended };
 }
 
+/** The chat stopped again by itself in the background (r11 #2): `jobs -l` names its own SIGTTIN. */
+async function stoppedForTerminal(t: Term, pid: number): Promise<void> {
+  assert.equal(procState(pid), 'T', 'the chat did not stop again in the background once the child ended');
+  const mark = t.screen().length;
+  t.write('jobs -l\r');
+  await t.waitFor(/jobs -l\r?\n[\s\S]*\[1\][\s\S]*BASH\$ $/, 'the job list', mark, 5000);
+  assert.match(t.screen().slice(mark), /\[1\][+-]? +\d+ +Stopped \(tty input\)/, t.screen().slice(mark));
+}
+
 async function thenKill(piped: boolean, via: 'bang' | 'editor'): Promise<void> {
   const { r, t, pid, ended } = await childEndsInBackground(piped, via);
   try {
-    assert.notEqual(procState(pid), 'T', 'the chat stopped again in the background when the child ended (SIGTTOU)');
+    await stoppedForTerminal(t, pid);
     const mark = t.screen().length;
     const t0 = Date.now();
-    t.write('kill %1; wait %1; echo "EXIT=$?"\r');
-    await t.waitFor(/EXIT=\d+/, 'the job ends', mark, 10_000);
-    assert.match(t.screen().slice(mark), /EXIT=143/, t.screen().slice(mark));
+    // the job is stopped (r11 #2): bash's kill sends SIGTERM, then SIGCONT, and marks the job
+    // running only once that continue reaches it, so an immediate `wait %1` can find it still
+    // stopped (148/149; as in r9f-stop-input-pty.test.ts): wait for the chat to be gone first
+    t.write('kill %1\r');
     await waitUntil(() => procState(pid) === 'gone', `the chat ends (state ${procState(pid)})`, 10_000);
     assert.ok(Date.now() - t0 < 8000, `the chat ended after ${Date.now() - t0} ms`);
+    t.write('wait %1; echo "EXIT=$?"\r');
+    await t.waitFor(/EXIT=\d+/, 'the job ends', mark, 10_000);
+    assert.match(t.screen().slice(mark), /EXIT=143/, t.screen().slice(mark));
     assert.deepEqual(r.locks(), [], 'the session lock is left');
     await waitUntil(() => fs.existsSync(ended) && fs.readFileSync(ended, 'utf8').trim() !== '', 'the SessionEnd hook ran', 5000);
     await sleep(300);
@@ -292,12 +309,9 @@ async function thenKill(piped: boolean, via: 'bang' | 'editor'): Promise<void> {
 async function thenFg(piped: boolean, via: 'bang' | 'editor'): Promise<void> {
   const { t, pid } = await childEndsInBackground(piped, via);
   try {
-    assert.notEqual(procState(pid), 'T', 'the chat stopped again in the background when the child ended (SIGTTOU)');
+    await stoppedForTerminal(t, pid);
     let mark = t.screen().length;
-    t.write('jobs\r');
-    await t.waitFor(/Running[\s\S]*BASH\$ $/, 'bash lists the job as running', mark, 5000);
-    mark = t.screen().length;
-    // bash sends no SIGCONT to a job it knows to be running: the chat sees the foreground itself
+    // bash continues the stopped job (SIGCONT) and gives it the terminal
     t.write('fg\r');
     if (via === 'editor') {
       await t.waitFor(/ANSWER to edited in the background[\s\S]*> $/, "the editor's text is submitted after fg", mark, 15_000);
@@ -326,7 +340,7 @@ test('r9f-v: /editor in `kiro-claude chat | cat`, Ctrl+Z, `bg`, the editor ends 
   await thenKill(true, 'editor');
 });
 
-test('r9f-v: `!cmd` in `kiro-claude chat | cat`, Ctrl+Z, `bg`, the child ends: the chat runs on in the background; `fg` takes the terminal back', { skip, timeout: 90_000 }, async () => {
+test('r9f-v: `!cmd` in `kiro-claude chat | cat`, Ctrl+Z, `bg`, the child ends: the chat stays off the terminal (stopped again by itself, r11 #2); `fg` takes the terminal back', { skip, timeout: 90_000 }, async () => {
   await thenFg(true, 'bang');
 });
 

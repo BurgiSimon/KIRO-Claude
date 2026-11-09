@@ -56,7 +56,9 @@
  * where kiro-cli does otherwise: `/compact` answers `end_turn` first and then sends the
  * compaction status frames (05 §4.5.4); `session/new|load` answers first and then reports MCP
  * servers, a `_kiro.dev/metadata` and `available_commands_update` (08b §4.4); `_session/steer`
- * answers `{queued:true}` before its `AgentExecutionUserMessageQueued` notification.
+ * answers `{queued:true}` before its `AgentExecutionUserMessageQueued` notification. MCP servers
+ * a report found with no Claude Code child (`stopped`: a restart that failed) are reported by the
+ * turn that starts the next child, in the background, as they connect (r11 #4).
  *
  * Compaction status (05 §4.5.4, §7.11; r5x X2): a manual `/compact` sends `started`, then
  * `completed{summary}` or `failed` with the reason. An automatic compaction inside a prompt turn
@@ -594,6 +596,14 @@ class AcpSessionState {
   /** Ids for subagent events that carry no tool use id. */
   subagentSeq = 0;
   readonly mcpReported = new Set<string>();
+  /**
+   * The last MCP report saw servers that no Claude Code child runs (`stopped`: a restart that
+   * failed, a child that died), so it neither waited for them nor reported them: the next turn
+   * that starts a child reports them ({@link AcpServer.reportStartedMcp}, r11 #4).
+   */
+  mcpUnstarted = false;
+  /** That report, while it runs (one at a time). */
+  mcpStartReport: Promise<void> | undefined;
   todos: TodoItem[] = [];
   manualCompaction = false;
   /**
@@ -1084,7 +1094,9 @@ export class AcpServer {
 
   /**
    * `_kiro.dev/mcp/server_initialized` / `server_init_failure` once per server as soon as
-   * Claude reports it connected / failed (08 KC-ACP-04); polls while servers are pending. With
+   * Claude reports it connected / failed (08 KC-ACP-04); polls while servers are pending (a
+   * `stopped` server, with no child to start it, is neither waited for nor reported here: the
+   * turn that starts the next child reports it, {@link reportStartedMcp}). With
    * `signal` (a command's, C3) an abort ends the wait at once with {@link OpCancelledError}, and
    * an answer that arrives after it reports nothing.
    */
@@ -1101,8 +1113,13 @@ export class AcpServer {
         return last;
       }
       this.learnMcpNames(st, last);
+      st.mcpUnstarted = last.some((s) => s.status === 'stopped');
       let pending = false;
       for (const s of last) {
+        // no Claude Code child runs or starts (a restart that failed, a child that died): nothing
+        // starts this server before the next prompt, so no wait and no report; the next child's
+        // own connect or failure is the one reported, by the turn that starts it (r11 #4)
+        if (s.status === 'stopped') continue;
         const k = kiroMcpStatus(s.status);
         if (k === 'loading') {
           pending = true;
@@ -1120,6 +1137,26 @@ export class AcpServer {
       await sleepUnless(this.timings.mcpPollMs, signal);
       if (signal?.aborted) throw new OpCancelledError();
     }
+  }
+
+  /**
+   * The MCP report for the child a turn started ({@link drain}) while the last report found
+   * servers that no child ran (`stopped`, {@link AcpSessionState.mcpUnstarted}: a restart that
+   * failed after a mode change, a child that died): in the background, like the report after
+   * `session/new`, so each server's `server_initialized` / `server_init_failure` follows as soon as
+   * Claude reports it (KC-ACP-04), not only at the next `mcp` command. A start that failed again
+   * leaves them `stopped`: nothing is waited for, and the next turn tries again (r11 #4).
+   */
+  private reportStartedMcp(st: AcpSessionState): void {
+    if (st.closed || st.mcpStartReport) return;
+    st.mcpStartReport = this.reportMcp(st)
+      .then(
+        () => undefined,
+        (e: unknown) => this.log.debug('acp: MCP report for a started child failed:', e),
+      )
+      .finally(() => {
+        st.mcpStartReport = undefined;
+      });
   }
 
   /** Learn the exact Claude ⇄ Kiro MCP server pair of a call the session mapped itself. */
@@ -2204,8 +2241,17 @@ export class AcpServer {
   }
 
   private async drain(st: AcpSessionState, turn: TurnCtx, gen: AsyncGenerator<SessionEvent, TurnResult>): Promise<TurnResult> {
+    let first = true;
     for (;;) {
-      const r = await gen.next();
+      let r: IteratorResult<SessionEvent, TurnResult>;
+      try {
+        r = await gen.next();
+      } finally {
+        // the turn's first event (or its end) comes after the session started Claude Code for
+        // it: servers the last report found with no child are reported now (r11 #4)
+        if (first && st.mcpUnstarted) this.reportStartedMcp(st);
+        first = false;
+      }
       if (r.done) return r.value;
       try {
         this.onEvent(st, turn, r.value);

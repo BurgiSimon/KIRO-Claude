@@ -11,7 +11,10 @@
  *    it: the restarted tcsetattr stopped it again before its SIGTERM listener ran (r9 #1);
  *  - a `!cmd` that ended after Ctrl+Z and `bg` handed the terminal back from the background
  *    (Repl.handBack) with the same result: stopped for good, lock held, no SessionEnd until `fg`.
- * Now both run on in the background, off the terminal, and `kill %1` closes them at once.
+ * Now both stay off the terminal in the background, and `kill %1` closes them at once. Since r11 #2
+ * they stop again by themselves there once they need the terminal, like a background job that reads
+ * it (its own SIGTTIN at the default action: `jobs -l` says 'Stopped (tty input)', not the 'Stopped
+ * (tty output)' of a restarting tcsetattr), which `kill %1` (SIGTERM, then SIGCONT) still closes.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -195,8 +198,21 @@ async function startChat(t: Term): Promise<number> {
 }
 
 /**
- * `kill %1` of the chat, running in the background (bash sends SIGTERM only): it closes (the lock
- * released, SessionEnd run) and dies of SIGTERM within the documented time, printing nothing.
+ * The chat stopped again by itself in the background (r11 #2): state T, and bash's `jobs -l` names
+ * its own SIGTTIN ('Stopped (tty input)'), not a SIGTTOU from touching the terminal.
+ */
+async function stoppedForTerminal(t: Term, pid: number): Promise<void> {
+  await waitUntil(() => procState(pid) === 'T', `the chat stops by itself in the background (state ${procState(pid)})`, 10_000);
+  const mark = t.screen().length;
+  t.write('jobs -l\r');
+  await t.waitFor(/jobs -l\r?\n[\s\S]*\[1\][\s\S]*BASH\$ $/, 'the job list', mark, 10_000);
+  assert.match(t.screen().slice(mark), /\[1\][+-]? +\d+ +Stopped \(tty input\)/, t.screen().slice(mark));
+}
+
+/**
+ * `kill %1` of the chat in the background (stopped by itself: bash sends SIGTERM, then SIGCONT): it
+ * closes (the lock released, SessionEnd run) and dies of SIGTERM within the documented time,
+ * printing nothing.
  */
 async function killRunningJob(t: Term, r: Root, pid: number, ended: string): Promise<void> {
   const mark = t.screen().length;
@@ -213,7 +229,7 @@ async function killRunningJob(t: Term, r: Root, pid: number, ended: string): Pro
   assert.doesNotMatch(t.screen().slice(mark).replace(/BASH\$ /g, ''), /> /, 'the chat drew its prompt after the signal');
 }
 
-test('r9f-v: `chat < /dev/tty`, Ctrl+Z, `bg`: the chat runs on in the background, off the terminal; `fg` takes it back; `kill %1` closes it', { skip, timeout: 120_000 }, async () => {
+test('r9f-v: `chat < /dev/tty`, Ctrl+Z, `bg`: the chat stays off the terminal (stopped again by itself, r11 #2); `fg` takes it back; `kill %1` closes it', { skip, timeout: 120_000 }, async () => {
   const r = mkRoot(SCRIPT);
   removeOnExit(r.root);
   const ended = path.join(r.root, 'ended.jsonl');
@@ -230,7 +246,7 @@ test('r9f-v: `chat < /dev/tty`, Ctrl+Z, `bg`: the chat runs on in the background
     t.write('bg\r');
     await t.waitFor(/BASH\$ $/, 'bash prompt after bg', mark + 3);
     await sleep(800);
-    assert.notEqual(procState(pid), 'T', 'the chat stopped again in the background (it set raw mode on /dev/tty: SIGTTOU)');
+    await stoppedForTerminal(t, pid);
     t.write('echo SHELL-OK\r');
     await t.waitFor(/SHELL-OK[\s\S]*BASH\$ $/, 'bash runs a command', mark);
     assert.doesNotMatch(t.screen().slice(mark), /> half/, 'the chat drew its prompt in the background');
@@ -247,14 +263,14 @@ test('r9f-v: `chat < /dev/tty`, Ctrl+Z, `bg`: the chat runs on in the background
     t.write('bg\r');
     await t.waitFor(/BASH\$ $/, 'bash prompt after bg', mark + 3);
     await sleep(500);
-    assert.notEqual(procState(pid), 'T', 'the chat stopped again in the background');
+    await stoppedForTerminal(t, pid);
     await killRunningJob(t, r, pid, ended);
   } finally {
     await t.dispose();
   }
 });
 
-test('r9f-v: `chat < /dev/tty`, a `!cmd` ends after Ctrl+Z and `bg`: the chat runs on off the terminal and `kill %1` closes it', { skip, timeout: 120_000 }, async () => {
+test('r9f-v: `chat < /dev/tty`, a `!cmd` ends after Ctrl+Z and `bg`: the chat stays off the terminal (stopped again by itself, r11 #2) and `kill %1` closes it', { skip, timeout: 120_000 }, async () => {
   const r = mkRoot(SCRIPT);
   removeOnExit(r.root);
   const ended = path.join(r.root, 'ended.jsonl');
@@ -274,7 +290,7 @@ test('r9f-v: `chat < /dev/tty`, a `!cmd` ends after Ctrl+Z and `bg`: the chat ru
     await t.waitFor(/BASH\$ $/, 'bash prompt after bg', mark + 3);
     await waitUntil(() => fs.existsSync(done), 'the child ends in the background', 10_000);
     await sleep(800);
-    assert.notEqual(procState(pid), 'T', 'the chat stopped again in the background (it took /dev/tty back: SIGTTOU)');
+    await stoppedForTerminal(t, pid);
     await killRunningJob(t, r, pid, ended);
   } finally {
     await t.dispose();
