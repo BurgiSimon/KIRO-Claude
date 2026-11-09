@@ -30,6 +30,7 @@ import * as path from 'node:path';
 import { builtBin } from '../cli/helpers.js';
 import { mkRoot, sleep, type Root } from '../headless/r5f-signals-helpers.js';
 import { removeOnExit } from '../tmpdirs.js';
+import { stoppedJobState } from './r11f-ta-pty-helpers.js';
 
 const PTY_DRIVER = String.raw`
 import os, pty, sys, select, signal, struct, fcntl, termios, time
@@ -353,9 +354,10 @@ test('r9f: Ctrl+Z, then `bg`: the chat stays off the terminal (stopped again by 
     // change from the background (SIGTTOU, 'Stopped (tty output)')
     assert.equal(procState(pid), 'T', 'the chat did not stop again in the background once it needed the terminal');
     // nothing of the chat's own is drawn over the shell meanwhile; typing at bash works
-    t.write('echo SHELL-OK; jobs -l\r');
-    await t.waitFor(/SHELL-OK[\s\S]*\[1\][\s\S]*BASH\$ $/, 'bash runs a command', mark);
-    assert.match(t.screen().slice(mark), /\[1\][+-]? +\d+ +Stopped \(tty input\)/, t.screen().slice(mark));
+    t.write('echo SHELL-OK\r');
+    await t.waitFor(/SHELL-OK[\s\S]*BASH\$ $/, 'bash runs a command', mark);
+    // (bash may not count the job stopped yet: `jobs -l` is asked until it does, r12g T1)
+    assert.equal(await stoppedJobState(t), 'Stopped (tty input)', t.screen().slice(mark));
     assert.doesNotMatch(t.screen().slice(mark), /> half/, 'the chat drew its prompt in the background');
     mark = t.screen().length;
     t.write('fg\r');

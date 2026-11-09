@@ -14,7 +14,10 @@
  *    fatal for non-interactive sessions, exit 4), the model (`--model` > saved > agent `model` >
  *    `chat.defaultModel` > `auto`; an invalid explicit id is fatal, others warn and fall back)
  *    and the effort (`--effort` > saved >
- *    `chat.modelDefaults.<model>.output_config.effort`), takes the session lock and starts. Any
+ *    `chat.modelDefaults.<model>.output_config.effort`), takes the session lock and starts. A saved
+ *    record is read again once the lock is taken; when another process saved it meanwhile (a
+ *    hung-up holder the lock continued saves at its close, store.ts) all of the above is resolved
+ *    again from that record under the lock (r12g S1). Any
  *    failure (lock, spawn, `initialize` timeout or error, auth) releases the lock, removes a
  *    record this call created and the runtime dir; ClaudeProcess kills a child it started.
  *  - {@link KiroSessionImpl.start}: SessionStart (agentSpawn) hooks run BEFORE the child is
@@ -1108,14 +1111,18 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
 
   // ── construction ──
 
-  /** Resolve record, agent, model and effort, take the lock and start (see module doc). */
+  /** Resolve record, agent, model and effort, take the lock (record re-read under it) and start (see module doc). */
   static create(opts: KiroSessionInternalOptions, preset?: Preset): Promise<KiroSessionImpl> {
     // the creator's start signal (startSignal.ts), read once: nothing of the session runs inside it
     const startSignal = opts.startSignal ?? currentStartSignal();
     return outsideStartSignal(() => KiroSessionImpl.build(opts, preset, startSignal));
   }
 
-  private static async build(opts: KiroSessionInternalOptions, preset: Preset | undefined, startSignal: AbortSignal | undefined): Promise<KiroSessionImpl> {
+  /**
+   * `held`: the session's lock, already taken by a first pass of this build whose record changed
+   * while the lock was taken (r12g S1, below): this pass reads the record under it.
+   */
+  private static async build(opts: KiroSessionInternalOptions, preset: Preset | undefined, startSignal: AbortSignal | undefined, held?: SessionLock): Promise<KiroSessionImpl> {
     const ws = opts.ws;
     const env = opts.env ?? ws.env;
     const settings = opts.settings ?? openSettings(ws);
@@ -1149,6 +1156,8 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
         } else mode = rec.turns.length > 0 || rec.messageCount > 0 ? { kind: 'resume' } : { kind: 'new' };
       }
     }
+    // the saved record as read here, before its lock is taken (compared under the lock, r12g S1)
+    const readBeforeLock = rec && !preset ? JSON.stringify(rec) : undefined;
     // A record copied under a new id by someone else (KiroCrew peer transfer, 08a §4.2) still
     // names the original's Claude session: fork it (or start fresh) so the two never share one
     // Claude transcript. Persisted only once the child is up (as every saved record), so a failed
@@ -1284,7 +1293,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       fresh = true;
     }
     try {
-      lock = store.acquireLock(rec.sessionId);
+      lock = held ?? store.acquireLock(rec.sessionId);
       // the parent's journal is this fork's history too, as for a tangent / rewind (S1): when the
       // fork source has no transcript (the parent fell back to a fresh Claude session and has not
       // spoken since, or it is gone) the fork restores it from here (spawn's fallback) instead of
@@ -1296,6 +1305,27 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       // journal); a preset (import) record is removed by its caller
       if (fresh && !preset) removeRecordFiles(store, rec.sessionId);
       throw e;
+    }
+    // r12g S1: the saved record as it is now that its lock is ours. Another process may have saved
+    // it since it was read above: above all a hung-up holder that acquireLock continued
+    // (SessionLock.continuedHolder), which saved at its close the turn it was running (settled as
+    // interrupted), a line Claude never read put back, its title, message count, trust and plan
+    // mode; or a holder that closed between that read and the lock. Then the launch mode, agent,
+    // model, effort and trust are all derived again, from this record, by a second pass under the
+    // lock already held (by id, so `--resume` stays on this session), and nothing of the copy read
+    // above is kept: the trust is what the holder saved, never the copy's. A record gone meanwhile
+    // (a chat that never had a message drops its record at its close) keeps the copy read above.
+    if (!held && readBeforeLock !== undefined && !opts.fork) {
+      const now = store.read(rec.sessionId);
+      if (now && JSON.stringify(now) !== readBeforeLock) {
+        log.debug(`session ${rec.sessionId}: its record changed while the lock was taken${lock?.continuedHolder ? ' (a continued hung-up holder closed)' : ''}; reading it again`);
+        try {
+          return await KiroSessionImpl.build({ ...opts, resume: { sessionId: rec.sessionId } }, preset, startSignal, lock);
+        } catch (e) {
+          lock?.release();
+          throw e;
+        }
+      }
     }
     if (!created) {
       // the saved per-tool trust belongs to the saved agent (`--agent` may name another one)

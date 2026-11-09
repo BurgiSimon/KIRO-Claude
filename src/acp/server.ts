@@ -122,6 +122,7 @@ import type {
   ModelEntry,
   PromptInput,
   SessionEvent,
+  SessionRecord,
   SessionUI,
   SubcommandRunner,
   TodoItem,
@@ -136,7 +137,7 @@ import { agentDirs, loadAgents, selectAgent, type LoadAgentsResult } from '../co
 import { claudeServerName } from '../config/mcp.js';
 import { expandPrompt, findPrompt, loadPrompts, parsePromptInvocation } from '../config/prompts.js';
 import { buildModelList } from '../models/models.js';
-import { SessionStore, isSafeSessionId, sessionsDir } from '../session/store.js';
+import { SessionStore, isSafeSessionId, sessionsDir, type SessionLock } from '../session/store.js';
 import { isSessionStartCancelled, withStartSignal } from '../session/startSignal.js';
 import { toKiroCall } from '../policy/toolmap.js';
 import { findClaudeBinary } from '../claude/binary.js';
@@ -1228,10 +1229,35 @@ export class AcpServer {
     }
   }
 
+  /**
+   * A load that starts a child. The record's agent, model and effort become the session's options,
+   * so they are read under the session's lock (r12g S1): it is taken first if it can be had (a
+   * hung-up holder is continued and waited for, session/store.ts "Hung-up holder", and what it saved
+   * at its close is read here; with no lock on disk, no other process can open, change and close
+   * the session between this read and the session's start, r12g verify), and kept until the
+   * session has taken it itself (it replaces a lock of this process in one step), so the closing
+   * holder cannot take it back meanwhile. A lock still held answers as before, from the start.
+   */
   private async loadFresh(sessionId: string, ws: WorkspaceContext, p: Record<string, unknown>, request: AbortSignal): Promise<unknown> {
-    const dir = sessionsDir(ws);
-    const rec = new SessionStore(dir).read(sessionId);
-    if (!rec) throw internalError('Session not found');
+    const store = new SessionStore(sessionsDir(ws));
+    let pre: SessionLock | undefined;
+    if (store.read(sessionId)) {
+      try {
+        pre = store.acquireLock(sessionId);
+      } catch {
+        // still held: the session's own start below answers with the error, as before
+      }
+    }
+    try {
+      const rec = store.read(sessionId);
+      if (!rec) throw internalError('Session not found');
+      return await this.loadFreshFrom(sessionId, ws, p, request, rec);
+    } finally {
+      pre?.release();
+    }
+  }
+
+  private async loadFreshFrom(sessionId: string, ws: WorkspaceContext, p: Record<string, unknown>, request: AbortSignal, rec: SessionRecord): Promise<unknown> {
     const { servers, warnings } = acpMcpServersToConfigs(p.mcpServers);
     for (const w of warnings) this.log.warn(`acp: ${w}`);
     // the process --agent wins (KiroCrew's Guard A2 compares currentModeId with it); else the stored agent

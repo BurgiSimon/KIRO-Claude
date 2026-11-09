@@ -81,12 +81,19 @@
  *        output still written there) until its prompt. The foreground test is Linux's
  *        /proc/self/stat ({@link terminalInForeground}; in a PID namespace with its own /proc and
  *        no job-control shell, where the job's IDs read 0, a short-lived `stty` child that the
- *        kernel stops in the background, r12 #2, {@link probeForeground}); elsewhere (DECISION, no
+ *        kernel stops in the background, r12 #2, {@link probeForeground}: one answer per terminal,
+ *        a background one reused until the signals that came with a continue were dispatched, and
+ *        none asked once a fatal signal is in, r12g T2); elsewhere (DECISION, no
  *        portable tcgetpgrp without a native module) it takes the foreground: after `bg` the chat
  *        stops again (SIGTTOU) at the retake until `fg`, as before, while the deferral still lets a
- *        fatal signal win. An input that was the controlling terminal when the reader went away
- *        and is not any more (the terminal session ended; no SIGHUP reaches an orphaned group that
- *        is not stopped) ends as at a hangup at the retake, nothing touched (r12 #4,
+ *        fatal signal win. While /proc cannot be read (out of file descriptors or memory) it cannot
+ *        be told, which is not the foreground: the reader stays away and looks again (r12g T3); a
+ *        /proc that cannot be read for good (none mounted: a chroot, a minimal container) is as
+ *        elsewhere, the foreground taken for granted (r12g verification). An
+ *        input that was the controlling terminal when the reader went away and positively is not
+ *        any more (the terminal session ended; no SIGHUP reaches an orphaned group that is not
+ *        stopped; "cannot tell" is no answer, r12g T3) ends as at a hangup at the retake, nothing
+ *        touched, and nothing more is drawn or switched there (r12 #4, r12g T4,
  *        {@link LineReader.endAsHungUp}). {@link LineReader.close} in the background (away, or not in the
  *        foreground) changes no mode and writes nothing either (r10 #3: readline's close() turned
  *        raw mode off from there, and SIGTTOU stopped kiro-claude until `fg`);
@@ -122,7 +129,11 @@
  *        interrupts, as it would have at once. Not when its question was on the screen before the
  *        input was held (a stall or a stop at an open approval, a self-stop in the background
  *        after the question was written there): those keys were typed at it and are read as such,
- *        the cooked ones as above (no answer without an Enter typed at its question).
+ *        the cooked ones as above (no answer without an Enter typed at its question). Nor for the
+ *        approval's read again after an empty Enter (`questionShown`, r12g T5: its question stays
+ *        on the screen, not drawn again): what waits in the terminal then was typed at it, also
+ *        during a stall that ended in that Enter's own callbacks; the type-ahead read between the
+ *        two reads (the rest of the Enter's own chunk) is still dropped.
  *  - **line** (stdin is not a TTY: pipes, tests): lines are queued in arrival order and handed
  *    to reads; the prompt and the consumed line are written so transcripts look like the
  *    terminal. A line that is exactly `\x03` stands for Ctrl+C (emitted as `'interrupt'` at
@@ -188,6 +199,14 @@ export interface ReadOptions {
    * and those still waiting in the terminal while the input is held (module doc, r12 #0).
    */
   discardTypeahead?: boolean;
+  /**
+   * With `discardTypeahead`: the question this read answers has been on the screen since before
+   * the keys that wait in the terminal were typed (repl/core.ts approvalFlow's read again after an
+   * empty Enter, the question not drawn again): they were typed at it, so the read is never held
+   * for them (no hold while the input is parked or away, none for an overdue heartbeat, no drop in
+   * the window that gives the input back; r12g T5). The type-ahead is still dropped.
+   */
+  questionShown?: boolean;
 }
 
 export interface ReadInputOptions extends ReadOptions {
@@ -234,11 +253,13 @@ export interface LineReaderOptions {
    * Terminal mode: whether the input is still kiro-claude's controlling terminal, asked when it
    * ends right after a stop (r11 #0, {@link LineReader.hungUp}: then it is canonical mode's end of
    * file, a Ctrl+D typed while the shell had the terminal, not a hangup, which takes the
-   * controlling terminal away). Default: Linux's /proc/self/stat on the input ({@link
-   * terminalInForeground}), false elsewhere and for an input that is no controlling terminal;
-   * tests pass their own.
+   * controlling terminal away), and while away after a stop (r12 #4: its loss is the end of the
+   * terminal session). undefined: it cannot be told now (r12g T3: out of file descriptors or
+   * memory) or at all (no /proc), which is neither. Default {@link controllingTerminal} on the
+   * input (Linux's /proc/self/stat), false elsewhere and for an input that is no controlling
+   * terminal; tests pass their own.
    */
-  controlling?: () => boolean;
+  controlling?: () => boolean | undefined;
   /**
    * Terminal mode: kiro-claude waited off the terminal in the background before this reader takes
    * it (repl/core.ts run: `kiro-claude chat &`, a stop while it started and `bg`; r10 #1), so the
@@ -438,17 +459,27 @@ const DEV_TTY_RDEV = 5 << 8;
  * foreground group, a probe that cannot run (no `stty`), and on other systems (no /proc:
  * DECISION, the module doc says what that leaves). `probe` false: where only the probe could tell,
  * false (not known to be the foreground) without asking it (the probe stops a job in the
- * background, which after a fatal signal's continue left the job stopped).
+ * background, which after a fatal signal's continue left the job stopped). False too while it
+ * cannot be told now whether the input is the controlling terminal (r12g T3: /proc/self/stat
+ * unreadable, out of file descriptors or memory, {@link ttyAnswer}): the callers look again later
+ * and touch nothing of the terminal meanwhile (taken for the foreground, a chat waiting in an
+ * orphaned background group took the terminal there, failed with EIO and closed). A /proc that
+ * cannot be read for good (none mounted) or parsed is as off Linux: true (r12g verification).
+ * `sys`: tests' system calls.
  */
-export function terminalInForeground(input: unknown, probe = true): boolean {
-  const job = terminalJob(input);
+export function terminalInForeground(input: unknown, probe = true, sys: TtySys = realTtySys): boolean {
+  const a = ttyAnswer(input, sys);
+  if (a === 'cannot tell') return false;
+  const job = jobOn(typeof a === 'object' ? a : undefined);
   if (!job) return true;
-  return job.foreground ?? (probe ? probeForeground(job.fd) ?? true : false);
+  return job.foreground ?? (probe ? probeForeground(job.fd, job.tty) ?? true : false);
 }
 
 /** /proc/self/stat's view of the controlling terminal `input` reads (Linux), see {@link controllingTty}. */
 interface ControllingTty {
   fd: number;
+  /** The terminal's device (`tty_nr`): the same for every descriptor that reads it, `/dev/tty` too. */
+  tty: number;
   /** kiro-claude's process group, session, and the terminal's foreground group: 0 when outside its PID namespace. */
   pgrp: number;
   sid: number;
@@ -456,28 +487,89 @@ interface ControllingTty {
 }
 
 /**
- * The controlling terminal `input` reads (Linux: /proc/self/stat's `tty_nr` is the input's device,
- * or the input is `/dev/tty`), or undefined: off Linux, an input that is no terminal file
- * descriptor (tests' fakes, or a hung-up terminal: isatty fails with EIO), a terminal that is not
- * the controlling one, and no controlling terminal (none, or it went away: a hangup and the end of
- * the session, its leader's exit, clear `tty_nr`).
+ * The system calls the controlling-terminal check makes ({@link ttyAnswer}): isatty, a read of
+ * /proc/self/stat, fstat's `rdev`. Tests pass their own ({@link terminalGone},
+ * {@link controllingTerminal}); a failing call throws its error (with its `code`).
+ */
+export interface TtySys {
+  isatty(fd: number): boolean;
+  procStat(): string;
+  rdev(fd: number): number;
+}
+
+const realTtySys: TtySys = {
+  isatty: (fd) => tty.isatty(fd),
+  procStat: () => fs.readFileSync('/proc/self/stat', 'utf8'),
+  rdev: (fd) => fs.fstatSync(fd).rdev,
+};
+
+/**
+ * Errors of a check that say nothing about the terminal (r12g T3): out of file descriptors or
+ * memory, a busy resource, a signal. fstat failing otherwise (EIO, ENXIO, EBADF) is an answer.
+ */
+const TRANSIENT_ERRORS = new Set(['EMFILE', 'ENFILE', 'ENOMEM', 'EAGAIN', 'EWOULDBLOCK', 'EINTR', 'ENOBUFS']);
+
+/**
+ * Whether `input` is kiro-claude's controlling terminal (Linux: /proc/self/stat's `tty_nr` is the
+ * input's device, or the input is `/dev/tty`): its view of it; `'no'`: off Linux, an input that
+ * is no terminal file descriptor (tests' fakes, or a hung-up terminal: isatty fails with EIO), a
+ * terminal that is not the controlling one, no controlling terminal (none, or it went away: a
+ * hangup and the end of the session, its leader's exit, clear `tty_nr`), an fstat that fails for
+ * the terminal (EIO, ENXIO, EBADF); `'cannot tell'` (r12g T3): /proc/self/stat cannot be read now
+ * for a transient reason (out of file descriptors or memory: EMFILE, ENOMEM; it says nothing about
+ * the terminal), or fstat fails with such a transient error; `'unknown'` (r12g verification):
+ * /proc/self/stat cannot be read for good (no /proc mounted: a chroot, a minimal container or
+ * sandbox, ENOENT; EACCES, EPERM) or not parsed, so job control cannot be told at all there, as
+ * off Linux (the foreground is taken for granted, as before T3: taken for "cannot tell", the chat
+ * waited before its first prompt for a foreground it could never see), and it is no answer about
+ * the terminal session either. Before, every failure read as "not the controlling terminal",
+ * which the end-of-session watch took for its end.
+ */
+function ttyAnswer(input: unknown, sys: TtySys = realTtySys): ControllingTty | 'no' | 'cannot tell' | 'unknown' {
+  if (process.platform !== 'linux') return 'no';
+  const fd = (input as { fd?: unknown } | undefined)?.fd;
+  if (typeof fd !== 'number' || !sys.isatty(fd)) return 'no';
+  let stat: string;
+  try {
+    stat = sys.procStat();
+  } catch (e) {
+    return TRANSIENT_ERRORS.has(String((e as NodeJS.ErrnoException | undefined)?.code)) ? 'cannot tell' : 'unknown';
+  }
+  // after the command name: state ppid pgrp session tty_nr tpgid …
+  const close = stat.lastIndexOf(')');
+  const f = stat.slice(close + 2).split(' ');
+  if (close < 0 || f.length < 6 || !f.slice(1, 6).every((v) => /^-?\d+$/.test(v))) return 'unknown';
+  const ttyNr = Number(f[4]);
+  if (!(ttyNr > 0)) return 'no';
+  let rdev: number;
+  try {
+    rdev = sys.rdev(fd);
+  } catch (e) {
+    return TRANSIENT_ERRORS.has(String((e as NodeJS.ErrnoException | undefined)?.code)) ? 'cannot tell' : 'no';
+  }
+  if (rdev !== ttyNr && rdev !== DEV_TTY_RDEV) return 'no';
+  return { fd, tty: ttyNr, pgrp: Number(f[2]), sid: Number(f[3]), tpgid: Number(f[5]) };
+}
+
+/**
+ * The controlling terminal `input` reads ({@link ttyAnswer}), or undefined where it is not one or
+ * that cannot be told now (job control then does not apply: {@link terminalJob}).
  */
 function controllingTty(input: unknown): ControllingTty | undefined {
-  if (process.platform !== 'linux') return undefined;
-  const fd = (input as { fd?: unknown } | undefined)?.fd;
-  if (typeof fd !== 'number' || !tty.isatty(fd)) return undefined;
-  try {
-    const stat = fs.readFileSync('/proc/self/stat', 'utf8');
-    // after the command name: state ppid pgrp session tty_nr tpgid …
-    const f = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-    const ttyNr = Number(f[4]);
-    if (!(ttyNr > 0)) return undefined;
-    const rdev = fs.fstatSync(fd).rdev;
-    if (rdev !== ttyNr && rdev !== DEV_TTY_RDEV) return undefined;
-    return { fd, pgrp: Number(f[2]), sid: Number(f[3]), tpgid: Number(f[5]) };
-  } catch {
-    return undefined;
-  }
+  const a = ttyAnswer(input);
+  return typeof a === 'object' ? a : undefined;
+}
+
+/**
+ * Whether `input` is kiro-claude's controlling terminal with a foreground group (job control
+ * applies: {@link terminalJob}), and undefined while that cannot be told ({@link ttyAnswer}: out of
+ * file descriptors, r12g T3; /proc unreadable for good, r12g verification).
+ * LineReaderOptions.controlling's default.
+ */
+export function controllingTerminal(input: unknown, sys: TtySys = realTtySys): boolean | undefined {
+  const a = ttyAnswer(input, sys);
+  if (a === 'cannot tell' || a === 'unknown') return undefined;
+  return a !== 'no' && a.tpgid >= 0;
 }
 
 /**
@@ -488,25 +580,47 @@ function controllingTty(input: unknown): ControllingTty | undefined {
  * session outside its PID namespace reads 0: not). undefined wherever no job control applies or
  * it cannot be told (see there; a terminal with no foreground group, `tpgid` -1, too).
  */
-function terminalJob(input: unknown): { fd: number; pgrp: number; foreground: boolean | undefined; sessionLeader: boolean } | undefined {
-  const c = controllingTty(input);
+function terminalJob(input: unknown): TerminalJob | undefined {
+  return jobOn(controllingTty(input));
+}
+
+interface TerminalJob {
+  fd: number;
+  tty: number;
+  pgrp: number;
+  foreground: boolean | undefined;
+  sessionLeader: boolean;
+}
+
+/** {@link terminalJob} on the controlling terminal `c` ({@link controllingTty}). */
+function jobOn(c: ControllingTty | undefined): TerminalJob | undefined {
   if (!c || !(c.tpgid >= 0)) return undefined;
   const sessionLeader = c.sid === process.pid;
-  if (c.pgrp > 0 && c.tpgid > 0) return { fd: c.fd, pgrp: c.pgrp, foreground: c.pgrp === c.tpgid, sessionLeader };
+  if (c.pgrp > 0 && c.tpgid > 0) return { fd: c.fd, tty: c.tty, pgrp: c.pgrp, foreground: c.pgrp === c.tpgid, sessionLeader };
   // a group outside the PID namespace reads 0: one visible and the other not are two groups
-  return { fd: c.fd, pgrp: c.pgrp, foreground: c.pgrp > 0 || c.tpgid > 0 ? false : undefined, sessionLeader };
+  return { fd: c.fd, tty: c.tty, pgrp: c.pgrp, foreground: c.pgrp > 0 || c.tpgid > 0 ? false : undefined, sessionLeader };
 }
 
 /**
- * A watch for the end of the terminal session (r12 #4): when `input` is kiro-claude's controlling
- * terminal now ({@link controllingTty}), the returned function is true once it no longer is (a
- * hangup, the session leader's exit: the kernel takes the controlling terminal away, and sends a
- * process group neither in the foreground nor stopped no SIGHUP); otherwise always false (off
- * Linux, an input that is no controlling terminal).
+ * A watch for the end of the terminal session (r12 #4): once `input` was seen as kiro-claude's
+ * controlling terminal ({@link ttyAnswer}: when the watch is made, or at a later look if it could
+ * not be told then), the returned function is true once it positively no longer is (a hangup, the
+ * session leader's exit: the kernel takes the controlling terminal away, and sends a process group
+ * neither in the foreground nor stopped no SIGHUP); otherwise false: off Linux, an input that is
+ * no controlling terminal, and whenever it cannot be told (r12g T3: out of file descriptors or
+ * memory, /proc/self/stat unreadable, also for good; such a failure ended the chat's session,
+ * exit 0). `sys`: tests' system calls.
  */
-export function terminalGone(input: unknown): () => boolean {
-  if (!controllingTty(input)) return () => false;
-  return () => !controllingTty(input);
+export function terminalGone(input: unknown, sys: TtySys = realTtySys): () => boolean {
+  const first = ttyAnswer(input, sys);
+  // (no controlling terminal now: none to come, no session of it to end)
+  if (first === 'no') return () => false;
+  let seen = typeof first === 'object';
+  return () => {
+    const a = ttyAnswer(input, sys);
+    if (typeof a === 'object') seen = true;
+    return seen && a === 'no';
+  };
 }
 
 /**
@@ -534,13 +648,18 @@ export const FOREGROUND_PROBE_MS = 100;
  * and blocks the event loop up to {@link FOREGROUND_PROBE_MS} in the background; it is asked only
  * where kiro-claude would otherwise take the foreground for granted ({@link
  * terminalInForeground}: the first prompt and its wait, the reader's retake and looks while away,
- * the hand-back after a child, a close, a write held while the chat starts). Within one event-loop
- * turn the answer is reused (no signal is dispatched to kiro-claude before the next one: a second
- * probe right after `kill %1`'s SIGCONT stopped the job again before its SIGTERM was handled, and
- * the chat's exit then waited for that stopped wrapper to reap it).
+ * the hand-back after a child, a close, a write held while the chat starts; never once a fatal
+ * signal is in, which each caller looks at first). The answer is one per terminal (`tty`, its
+ * device: stdin's and stdout's descriptors of it get the same) and is reused until the next check
+ * phase; a background one (the probe was a stop) until the check phase after the next poll phase,
+ * which dispatches the signals that came with a continue (`kill %1`: SIGTERM, then SIGCONT). A
+ * second probe before that stopped the job again before its SIGTERM was handled, and the chat (or
+ * the `unshare` that waits for it) stayed stopped until another `kill %1` or `kill -CONT`: right
+ * after `kill %1`'s SIGCONT, and (r12g T2) when the start's wait asked about stdin and a write held
+ * while it starts asked about stdout in the same turn, or the other way round.
  */
-function probeForeground(fd: number): boolean | undefined {
-  if (lastProbe?.fd === fd) return lastProbe.verdict;
+function probeForeground(fd: number, tty: number): boolean | undefined {
+  if (lastProbe?.tty === tty) return lastProbe.verdict;
   let verdict: boolean | undefined;
   try {
     const g = spawnSync('stty', ['-g'], { stdio: [fd, 'pipe', 'ignore'], encoding: 'utf8', timeout: 2000, killSignal: 'SIGKILL' });
@@ -554,16 +673,17 @@ function probeForeground(fd: number): boolean | undefined {
   } catch {
     // (no stty: the old answer)
   }
-  const probe = { fd, verdict };
+  const probe = { tty, verdict };
   lastProbe = probe;
-  setImmediate(() => {
+  const forget = (): void => {
     if (lastProbe === probe) lastProbe = undefined;
-  });
+  };
+  setImmediate(verdict === false ? () => setImmediate(forget) : forget);
   return verdict;
 }
 
-/** The last {@link probeForeground} answer, until the check phase after it. */
-let lastProbe: { fd: number; verdict: boolean | undefined } | undefined;
+/** The last {@link probeForeground} answer and its terminal, while it is reused (see there). */
+let lastProbe: { tty: number; verdict: boolean | undefined } | undefined;
 
 /**
  * Stop kiro-claude the way the kernel stops a background job that reads its terminal, because it
@@ -822,11 +942,19 @@ export class LineReader extends EventEmitter {
    */
   private modeLost = false;
   /**
-   * The input was kiro-claude's controlling terminal when the reader went {@link away}: once it is
-   * not any more (a hangup, the session's end: no SIGHUP reaches an orphaned group that is not
-   * stopped), the input ends as at a hangup at the retake, nothing touched (r12 #4).
+   * The input was kiro-claude's controlling terminal when the reader went {@link away} (or at a
+   * later look, when that could not be told then: r12g T3): once it positively is not any more (a
+   * hangup, the session's end: no SIGHUP reaches an orphaned group that is not stopped), the input
+   * ends as at a hangup at the retake, nothing touched (r12 #4); a look that cannot tell changes
+   * nothing.
    */
   private awayOnTty = false;
+  /**
+   * The terminal session ended while kiro-claude was off the terminal ({@link endAsHungUp}): nothing
+   * more is written to the terminal or changed in it (r12g T4: no prompt, no bracketed-paste switch,
+   * no mode change at {@link close}).
+   */
+  private sessionEnded = false;
   private suspended = false;
   private typeahead: [string | undefined, Key][] = [];
   private readlineAddedHistory = false;
@@ -843,7 +971,7 @@ export class LineReader extends EventEmitter {
   private unguardResize: (() => void) | undefined;
   /** Ends the reading of the keys queued in a cooked mode as such ({@link takeCooked}). */
   private cookedOff: (() => void) | undefined;
-  private readonly controlling: () => boolean;
+  private readonly controlling: () => boolean | undefined;
   /** Terminal mode on POSIX, while the input flows: the heartbeat ({@link INPUT_BEAT_MS}, {@link syncBeat}). */
   private beat: NodeJS.Timeout | undefined;
   /** When the heartbeat last ran, or started. */
@@ -888,9 +1016,11 @@ export class LineReader extends EventEmitter {
     this.output = opts.output;
     this.onHistory = opts.onHistory;
     this.muted = opts.muted ?? (() => false);
-    this.foreground = opts.foreground ?? (() => terminalInForeground(opts.input));
+    // (no foreground probe once a fatal signal is in: in the background it stops the job again,
+    // r12 #2; a close then touches nothing where only the probe could tell, r12g T2)
+    this.foreground = opts.foreground ?? (() => terminalInForeground(opts.input, !this.muted()));
     this.stopInBackground = opts.stopInBackground ?? ((signal) => stopForTerminal(opts.input, signal));
-    this.controlling = opts.controlling ?? (() => terminalJob(opts.input) !== undefined);
+    this.controlling = opts.controlling ?? (() => controllingTerminal(opts.input));
     this.historySize = opts.historySize ?? DEFAULT_HISTORY_SIZE;
     if (this.terminal) {
       const ifOpts: readline.ReadLineOptions = {
@@ -936,7 +1066,7 @@ export class LineReader extends EventEmitter {
         this.inputEnded = true;
         // right after a stop (no beat since) and still the controlling terminal: a Ctrl+D typed
         // in the shell's cooked mode, read before the stop was seen (r11 #0)
-        if (this.beat && performance.now() - this.beatAt > INPUT_GAP_MS && this.controlling()) this.eofTyped = true;
+        if (this.beat && performance.now() - this.beatAt > INPUT_GAP_MS && this.controlling() === true) this.eofTyped = true;
       });
     } else {
       this.rl = readline.createInterface({ input: opts.input, terminal: false, crlfDelay: Infinity });
@@ -980,12 +1110,26 @@ export class LineReader extends EventEmitter {
   /**
    * The input ends as at a hangup ({@link hungUp}: every read gets `eof`), nothing of the terminal
    * touched: the REPL's hand-back after a child found the terminal session over while it waited
-   * off the terminal (repl/core.ts handBack; an orphaned process group gets no SIGHUP, r12 #4).
+   * off the terminal (repl/core.ts handBack; an orphaned process group gets no SIGHUP, r12 #4), as
+   * does the reader away after a stop ({@link retakeNow}). From then on nothing more is written to
+   * the terminal or changed in it ({@link terminalEnded}, r12g T4: a read draws no prompt, a close
+   * no bracketed-paste switch and no mode change).
    */
   endAsHungUp(): void {
     if (this.closed || this.ended) return;
-    if (this.terminal) this.inputEnded = true;
+    if (this.terminal) {
+      this.inputEnded = true;
+      this.sessionEnded = true;
+    }
     this.onClose();
+  }
+
+  /**
+   * Terminal mode: the terminal session ended while kiro-claude was off the terminal ({@link
+   * endAsHungUp}): the REPL writes nothing more to the terminal (r12g T4).
+   */
+  get terminalEnded(): boolean {
+    return this.sessionEnded;
   }
 
   /** Whether a read is waiting for input. */
@@ -1053,6 +1197,9 @@ export class LineReader extends EventEmitter {
       else if (this.ended) this.finish(pending, { kind: 'eof' });
       else if (opts.discardTypeahead) {
         this.typeahead = [];
+        // its question was on the screen before what waits in the terminal was typed (a read
+        // again after an empty answer, r12g T5): those keys answer it, as typed
+        if (opts.questionShown) return;
         // the input is held (r12 #0): what the terminal holds meanwhile was typed before this
         // question, and is dropped once the input is given back; or it is being given back now
         if (this.parked || this.away) pending.held = true;
@@ -1139,8 +1286,9 @@ export class LineReader extends EventEmitter {
   private showPrompt(p: PendingRead): void {
     if (this.closed || this.muted()) return;
     if (this.terminal) {
-      // a child owns the terminal, or it is not taken back yet after a stop (drawn then)
-      if (this.suspended || this.away) return;
+      // a child owns the terminal, or it is not taken back yet after a stop (drawn then); or the
+      // terminal session ended (r12g T4: the read gets `eof` at once)
+      if (this.suspended || this.away || this.sessionEnded) return;
       this.rl.setPrompt(p.prompt);
       this.promptLine();
     } else if (p.prompt !== '') {
@@ -1161,7 +1309,7 @@ export class LineReader extends EventEmitter {
 
   /** Print `text` (ending with a newline) above the active prompt, then redraw it. */
   printAbove(text: string): void {
-    if (this.muted()) return;
+    if (this.muted() || this.sessionEnded) return;
     const t = this.top();
     if (!t || !this.terminal || this.suspended || this.away) {
       // line mode: the prompt is already on the current line; end it, then show it again
@@ -1395,7 +1543,8 @@ export class LineReader extends EventEmitter {
    * before its question was drawn (Claude Code's request was read first: the park keeps the
    * terminal unread for a poll while the pipe is read, and a continue is taken in two event-loop
    * turns), so they are dropped ({@link dropAhead}), as they were when read as type-ahead before
-   * the request. Nothing for any other read: the prompt and a question take them, as typed.
+   * the request. Nothing for any other read: the prompt and a question take them, as typed, and
+   * so does an approval's read again after an empty Enter (ReadOptions.questionShown, r12g T5).
    */
   private release(): void {
     const t = this.top();
@@ -1473,7 +1622,7 @@ export class LineReader extends EventEmitter {
     // again, SIGTTIN), nothing drawn
     this.away = true;
     this.modeLost = false;
-    this.awayOnTty = this.controlling();
+    this.awayOnTty = this.controlling() === true;
     this.rl.pause();
     this.syncBeat();
     const t0 = performance.now();
@@ -1534,7 +1683,7 @@ export class LineReader extends EventEmitter {
     if (!this.away) {
       this.away = true;
       this.modeLost = true;
-      this.awayOnTty = this.controlling();
+      this.awayOnTty = this.controlling() === true;
       this.rl.pause();
       this.syncBeat();
     }
@@ -1655,7 +1804,10 @@ export class LineReader extends EventEmitter {
    * looks again every {@link FOREGROUND_POLL_MS} ({@link lookAgain}). An input that was the
    * controlling terminal when the reader went away and is not any more (the terminal session
    * ended: no SIGHUP reaches an orphaned group that is not stopped, and "cannot be told" counts as
-   * the foreground) ends as at a hangup, nothing touched ({@link endAsHungUp}, r12 #4).
+   * the foreground) ends as at a hangup, nothing touched ({@link endAsHungUp}, r12 #4). Only a
+   * positive answer does: one that cannot be told now (out of file descriptors) changes nothing
+   * (r12g T3), and one that finds the controlling terminal while that could not be told when the
+   * reader went away arms the check.
    */
   private retakeNow(freshLine: boolean): void {
     this.stopAwayPoll();
@@ -1665,7 +1817,9 @@ export class LineReader extends EventEmitter {
       this.away = false;
       return;
     }
-    if (this.awayOnTty && !this.controlling()) {
+    const controlling = this.controlling();
+    if (controlling === true) this.awayOnTty = true;
+    else if (controlling === false && this.awayOnTty) {
       this.endAsHungUp();
       return;
     }
@@ -1702,6 +1856,9 @@ export class LineReader extends EventEmitter {
    * PendingRead.held}).
    */
   private lookAgain(): void {
+    // (the loss of the controlling terminal is looked for once it was seen: here when that could
+    // not be told as the reader went away, r12g T3)
+    if (!this.awayOnTty && !this.closed && !this.ended && this.controlling() === true) this.awayOnTty = true;
     if (this.closed || this.ended || !this.away || this.suspended || this.muted() || this.foreground()) {
       this.scheduleRetake(true);
       return;
@@ -1938,7 +2095,9 @@ export class LineReader extends EventEmitter {
    * foreground} says so): from the background readline's close() (raw mode off: a tcsetattr) and
    * the switch (a write, with `stty tostop`) stopped kiro-claude with SIGTTOU until `fg` (r10 #3).
    * There the input is paused and readline closed without the mode change; the terminal stays as
-   * the shell has it (Node's own exit restores the mode kiro-claude started with).
+   * the shell has it (Node's own exit restores the mode kiro-claude started with). The same once
+   * the terminal session ended ({@link terminalEnded}, r12g T4: before, the switch was written to
+   * the hung-up terminal and the mode change failed there, EIO ignored).
    */
   close(): void {
     if (this.closed) return;
@@ -1946,7 +2105,7 @@ export class LineReader extends EventEmitter {
     this.stopAwayPoll();
     this.syncBeat();
     this.cookedOff?.();
-    const away = this.terminal && (this.away || !this.foreground());
+    const away = this.terminal && (this.away || this.sessionEnded || !this.foreground());
     if (this.terminal && !away) this.output.write('\u001b[?2004l');
     if (!away) {
       this.rl.close();

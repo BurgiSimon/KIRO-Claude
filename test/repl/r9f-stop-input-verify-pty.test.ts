@@ -25,6 +25,7 @@ import * as path from 'node:path';
 import { builtBin } from '../cli/helpers.js';
 import { mkRoot, sleep, type Root } from '../headless/r5f-signals-helpers.js';
 import { removeOnExit } from '../tmpdirs.js';
+import { stoppedJobState } from './r11f-ta-pty-helpers.js';
 
 const PTY_DRIVER = String.raw`
 import os, pty, sys, select, signal, struct, fcntl, termios, time
@@ -203,10 +204,8 @@ async function startChat(t: Term): Promise<number> {
  */
 async function stoppedForTerminal(t: Term, pid: number): Promise<void> {
   await waitUntil(() => procState(pid) === 'T', `the chat stops by itself in the background (state ${procState(pid)})`, 10_000);
-  const mark = t.screen().length;
-  t.write('jobs -l\r');
-  await t.waitFor(/jobs -l\r?\n[\s\S]*\[1\][\s\S]*BASH\$ $/, 'the job list', mark, 10_000);
-  assert.match(t.screen().slice(mark), /\[1\][+-]? +\d+ +Stopped \(tty input\)/, t.screen().slice(mark));
+  // (bash may not count the job stopped yet: `jobs -l` is asked until it does, r12g T1)
+  assert.equal(await stoppedJobState(t), 'Stopped (tty input)');
 }
 
 /**

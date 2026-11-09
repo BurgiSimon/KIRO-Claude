@@ -26,6 +26,7 @@ import * as path from 'node:path';
 import { builtBin } from '../cli/helpers.js';
 import { mkRoot, sleep, type Root } from '../headless/r5f-signals-helpers.js';
 import { removeOnExit } from '../tmpdirs.js';
+import { stoppedJobState } from './r11f-ta-pty-helpers.js';
 
 const PTY_DRIVER = String.raw`
 import os, pty, sys, select, signal, struct, fcntl, termios, time
@@ -399,8 +400,9 @@ test('r10f #0: Ctrl+Z inside /editor (vim), `bg` (vim redraws: the job stops aga
     // vim takes the terminal back in the background: SIGTTOU stops the job again, as before
     await sleep(300);
     await waitUntil(() => procState(pid) === 'T', `the chat runs on in the background while vim is stopped (state ${procState(pid)})`, 10_000);
-    t.write('jobs -l\r');
-    await t.waitFor(/Stopped[\s\S]*BASH\$ $/, 'bash reports the job stopped again', mark);
+    // (bash may not count the job stopped yet, and reports a change only at its next prompt:
+    // `jobs -l` is asked until it does, r12g T1)
+    assert.match(await stoppedJobState(t), /^Stopped/, 'bash reports the job stopped again');
     mark = t.screen().length;
     t.write('fg\r');
     await sleep(1500);

@@ -65,12 +65,16 @@
  * dispatches the hangup's SIGHUP, so the REPL waits for it ({@link ExitSignals.awaitSignal},
  * bounded by {@link DUPLICATE_SIGNAL_WINDOW_MS}) instead of quitting first (r6 #3); it waits the
  * same way when the terminal session ended while it waited off the terminal in an orphaned
- * process group, which no SIGHUP reaches (r12 #4: it then closes and exits 0).
+ * process group, which no SIGHUP reaches (r12 #4: it then closes and exits 0, writing nothing more
+ * to the terminal, r12g T4).
  *
  * As the init of a PID namespace (`unshare --fork --pid --mount-proc kiro-claude chat`) the
  * re-raised signal is dropped by the kernel (a default-action signal a namespace's init sends
  * itself): with no listener left for it, the process exits with the signal's status at once (r12
- * #2), not after the fallback.
+ * #2), not after the fallback; with claude/lifecycle.ts's forwarder still listening (Claude Code
+ * or a hook still running: a close that overran the grace), once that one has forwarded the
+ * signal, ended them and removed its listener (r12g verification: before, its own re-raise was
+ * dropped the same way and the exit came with the fallback, 7 s after the signal).
  */
 
 import * as os from 'node:os';
@@ -95,6 +99,23 @@ function sameEvent(b: NodeJS.Signals, a: NodeJS.Signals): boolean {
 
 /** After the re-raise: exit with the signal's status if the process is somehow still alive. */
 const SIGNAL_EXIT_FALLBACK_MS = 5000;
+/**
+ * As a PID namespace's init, how often a re-raised signal looks for its last listener to go
+ * ({@link exitOnceUnheld}).
+ */
+const UNHELD_POLL_MS = 20;
+
+/**
+ * As the init of a PID namespace, after a re-raise the kernel dropped: exit with `status` once no
+ * listener for `sig` is left (at once when none is), looked at every {@link UNHELD_POLL_MS}; the
+ * fallback (which keeps the process up meanwhile) still ends a process whose listener stays (r12 #2,
+ * r12g verification).
+ */
+function exitOnceUnheld(sig: NodeJS.Signals, status: number): void {
+  if (process.listenerCount(sig) > 0) setTimeout(() => exitOnceUnheld(sig, status), UNHELD_POLL_MS).unref();
+  else process.exit(status);
+}
+
 /** At most this much output is held ({@link holdTerminalOutput}); more is dropped. */
 const HELD_OUTPUT_MAX = 1 << 20;
 
@@ -405,8 +426,12 @@ export class ExitSignals {
     process.kill(process.pid, sig);
     // a PID namespace's init (`unshare --fork --pid --mount-proc kiro-claude chat`): the kernel
     // drops a signal at its default action that it sends itself, so with no listener left for it
-    // nothing would end the process before the fallback (r12 #2)
-    if (process.platform === 'linux' && process.pid === 1 && process.listenerCount(sig) === 0) process.exit(status);
+    // nothing would end the process before the fallback (r12 #2). One left is claude/lifecycle.ts's
+    // forwarder (Claude Code or a hook still running: a close that overran the grace): it forwards
+    // the signal, SIGKILLs what is left after its grace and re-raises it with its listener removed,
+    // which the kernel drops the same way, so the exit comes once no listener is left (r12g
+    // verification: it came only with the fallback, 7 s after the signal instead of about 2 s)
+    if (process.platform === 'linux' && process.pid === 1) exitOnceUnheld(sig, status);
   }
 }
 

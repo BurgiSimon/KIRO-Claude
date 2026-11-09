@@ -28,7 +28,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import { builtBin } from '../cli/helpers.js';
-import { answers, chatCommand, jobState, nothingDrawn, procState, setup, skipPty, sleep, waitUntil, type Setup } from './r11f-ta-pty-helpers.js';
+import { answers, chatCommand, nothingDrawn, procState, setup, skipPty, sleep, stoppedJobState, waitUntil, type Setup } from './r11f-ta-pty-helpers.js';
 
 const UNSHARE = 'unshare --fork --pid --mount-proc';
 const skip =
@@ -124,8 +124,9 @@ test('r12f #2: inside a PID namespace the foreground is told by the probe (job I
     s.t.write(`${UNSHARE} '${process.execPath}' '${script}' &\r`);
     await s.t.waitFor(/FG=\w+/, 'the probe in the background', mark, 20_000);
     assert.match(s.t.screen().slice(mark), /IDS=1,0,0,0 FG=false/, 'in the background');
-    // the probe stopped the job as a background job's mode change does (`unshare`: the job's leader)
-    assert.equal(await jobState(s.t), 'Stopped (tty output)');
+    // the probe stopped the job as a background job's mode change does (`unshare`: the job's leader;
+    // asked until bash counts it stopped, r12g T1)
+    assert.equal(await stoppedJobState(s.t), 'Stopped (tty output)');
     mark = s.t.screen().length;
     s.t.write('fg\r');
     await s.t.waitFor(/BASH\$ $/, 'the job ends after fg', mark + 4, 20_000);
@@ -179,7 +180,7 @@ test('r12f #2: as PID 1 of a PID namespace, a start with `&` stays off the termi
     await sleep(1500);
     const ticks = await ticksOver(pid);
     assert.ok(ticks < 40, `CPU ticks over 2 s in the background: ${ticks} (200: one full core)`);
-    assert.equal(await jobState(s.t), 'Stopped (tty output)');
+    assert.equal(await stoppedJobState(s.t), 'Stopped (tty output)');
     nothingDrawn(s.t, mark);
     mark = s.t.screen().length;
     s.t.write('fg\r');
@@ -236,7 +237,8 @@ test('r12f #2: as PID 2 of a PID namespace (`bash -c`), Ctrl+Z then `bg` stops t
       await waitUntil(() => procState(pid!) === 'T', `the chat stops again in the background (state ${procState(pid!)})`, 10_000);
       await sleep(300);
       assert.equal(procState(pid), 'T');
-      assert.equal(await jobState(s.t), 'Stopped (tty output)');
+      // (asked until bash counts the job stopped, r12g T1)
+      assert.equal(await stoppedJobState(s.t), 'Stopped (tty output)');
       nothingDrawn(s.t, mark);
       if (end === 'kill') {
         s.t.write('kill %1\r');

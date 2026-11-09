@@ -142,7 +142,8 @@ In chat:
   session. The next open of that session (`kiro-claude chat --resume` when it is the latest one,
   `--resume-id`, `--delete-session`, or an ACP `session/load`) run by the same user on that
   machine continues it, so that it closes as at a hangup (its SessionEnd hooks run), and then
-  starts as usual, a moment later;
+  starts as usual, a moment later, from what the old chat saved as it closed (the turn it was
+  running is kept, as an interrupted turn, and the new one follows it);
   `kill -CONT <pid>` closes it too. A chat stopped by Ctrl+Z in a terminal that is still open is
   never touched.
   The same holds for a chat stopped
@@ -152,7 +153,9 @@ In chat:
   back (`bash -mc 'kiro-claude chat & …'` once that shell has exited) the chat cannot stop: it
   waits off the terminal, its lock held, until a signal or the end of the terminal session, which
   closes it as a hangup does (its SessionEnd hooks run and its lock is released; no SIGHUP reaches
-  such a job, so it exits with status 0, writing nothing); one
+  such a job, so it exits with status 0 and writes nothing more to the terminal, while a piped
+  output such as `| tee log` still gets the resume hint), also when it got there after a `!cmd`
+  or a stop; one
   that had stopped before that shell exited is closed as at a hangup. What you type right after
   `fg`, before the chat has the terminal back, counts as typed (Enter submits, Ctrl+D is Ctrl+D)
   after Ctrl+Z, after a `kill -TSTP` or `kill -STOP` from elsewhere (with what you typed in the
@@ -165,7 +168,11 @@ In chat:
   also keys typed while kiro-claude could not read them (a moment it hung, also while it waited
   for a terminal or a slow `ssh` link to take its output, a `kill -STOP` from elsewhere) when the
   question came up meanwhile. They are not shown, kept or sent; a Ctrl+C
-  among them still interrupts. Other prompts and questions get such keys as typed, in order.
+  among them still interrupts. Other prompts and questions get such keys as typed, in order. An
+  Enter alone at an approval asks again without drawing the question anew, and what you type
+  after it is typed at the question (also while kiro-claude hung right after that Enter); what
+  reaches kiro-claude together with that Enter (pasted with it, or typed while kiro-claude hung
+  before it read the Enter) is dropped.
   Lines typed while the chat starts in the foreground, or while a `!cmd` runs that does
   not read them, keep their Enter as a new line, as in Kiro CLI: a paste there stays one input and
   none of its lines runs before you press Enter.
@@ -176,7 +183,7 @@ In chat:
   namespace with no job-control shell inside it the system cannot tell kiro-claude whether it has
   the terminal, so it asks `stty`: started there with `&` (and, run by a plain `bash -c` there,
   after Ctrl+Z and `bg`) the chat stays off the terminal, the shell reports the job `Stopped (tty
-  output)`, `fg` brings it back and `kill %1` closes it.
+  output)`, `fg` brings it back and one `kill %1` closes it (also after Ctrl+Z inside a `!cmd`).
 * `$EDITOR` (`/editor`, `/reply`, the spec's "Open in $EDITOR") and `!cmd` get the terminal while
   they run, also when the chat's output is piped (`kiro-claude chat | tee session.log`): what you
   type, Ctrl+C and Ctrl+Z are theirs. As in Kiro CLI, their output goes where the chat's goes (into

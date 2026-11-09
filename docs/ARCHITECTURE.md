@@ -514,7 +514,14 @@ journal); Claude Code keeps its own transcript, which kiro-claude resumes and fo
   An approval whose question was on the screen before the input was held (a stall or a stop at
   an open approval; the reader's self-stop in the background, which comes after the question was
   written there) takes those keys as typed at it (the cooked ones without an Enter of their own,
-  below). Other reads (the prompt, `ask`, `confirm`, `choose`) take them as type-ahead, in order,
+  below). So does the approval's read again after an empty Enter at it (`approvalFlow`, the
+  question not drawn again: `ReadOptions.questionShown`, r12g T5): what waits in the terminal then
+  was typed at the question, so that read is never held (no hold while parked or away, none for an
+  overdue beat, no drop in the release window); before, a stall that ended in the Enter's own
+  callbacks (its echo blocked on a terminal that does not drain) made it start overdue, and the
+  rest of the keys typed at the question during the stall were dropped. The type-ahead read
+  between the two reads (the rest of the Enter's own chunk) is still dropped, as before.
+  Other reads (the prompt, `ask`, `confirm`, `choose`) take them as type-ahead, in order,
   once. Not seen in time: a stop
   shorter than 250 ms (no one types and runs `fg` in that time) and one that lands in a timers
   phase after the beat (keys typed during it and a permission request queued meanwhile are then
@@ -620,7 +627,27 @@ journal); Claude Code keeps its own transcript, which kiro-claude resumes and fo
   `LineReader.endAsHungUp` at the retake, the REPL then waits the 500 ms for a SIGHUP and closes):
   the session is closed (SessionEnd runs, the record is saved, the lock released), nothing is
   written and no terminal mode changed, and the chat exits 0 (DECISION: as a hung-up input whose
-  SIGHUP never came, the end of its input). The reader's own raw switch, also at its creation, is
+  SIGHUP never came, the end of its input). Nothing is written to the terminal on every such path
+  (r12g T4): after the start's wait, and after the hand-back's (`handBack`) or the away reader's
+  `endAsHungUp` (`LineReader.terminalEnded`: a read draws no prompt, `close()` writes no
+  bracketed-paste switch and changes no mode; `Repl.sessionGone` drops what the REPL would write to
+  a stdout or stderr that is a terminal: the next prompt, the resume hint, an approval's question);
+  before, those two still wrote the prompt's redraw and the resume hint to the hung-up terminal
+  (EIO ignored). A stdout that is no terminal (`| tee log`) still gets the resume hint, also after
+  the start's wait. Only a positive answer is that end (r12g T3): the input no longer a terminal
+  (isatty fails), `tty_nr` 0 or another terminal, fstat failing with anything but a transient
+  error. A look that cannot read `/proc/self/stat` (out of file descriptors or memory: EMFILE,
+  ENFILE, ENOMEM, EAGAIN, EINTR) or whose fstat fails transiently cannot tell (`ttyAnswer`):
+  before, it was taken for the end, and a chat waiting off the terminal that ran out of file
+  descriptors closed silently with exit 0. It is no answer for `terminalGone` and the away
+  reader's check (armed only by a look that saw the controlling terminal), and not the foreground
+  for `terminalInForeground` (the waits and the reader look again 20 ms later and touch nothing
+  of the terminal meanwhile; taken for the foreground, the orphaned chat took the terminal there,
+  failed with EIO and closed as at a hangup). A `/proc/self/stat` that cannot be read for good (no
+  /proc mounted: a chroot, a minimal container or sandbox, ENOENT; EACCES, EPERM) or parsed is no
+  answer either, and job control is then as off Linux: the foreground is taken for granted, as
+  before T3 (r12g verification: taken for "cannot tell", a chat with no /proc waited before its
+  first prompt for good). The reader's own raw switch, also at its creation, is
   made with its 'error' listener in place (readline's constructor gets a no-op `setRawMode`), so an
   EIO there is the input's end (`hungUp`, every read `eof`), and `Repl.run` creates the reader
   inside the try whose finally closes the session. Until the
@@ -673,10 +700,27 @@ journal); Claude Code keeps its own transcript, which kiro-claude resumes and fo
   stop with it: bash reports the job 'Stopped (tty output)' and takes the terminal) and killed
   after 100 ms (`FOREGROUND_PROBE_MS`); one ended by a signal meanwhile (`kill %1`) counts as the
   background too. That probe is the self-stop there (`stopForTerminal` sends nothing more and the
-  caller lets two event-loop turns pass), its answer is reused within one event-loop turn, and the
-  waits look at the fatal-signal state before probing again: a second probe right after `kill
-  %1`'s SIGCONT, before its SIGTERM was handled, stopped `unshare` again, and the chat's exit then
-  waited for it. Its cost: two process spawns (a few milliseconds) wherever kiro-claude would
+  caller lets two event-loop turns pass), and the waits look at the fatal-signal state before
+  probing again: a second probe right after `kill %1`'s SIGCONT, before its SIGTERM was handled,
+  stopped `unshare` again, and the chat's exit then waited for it. Its answer is one per terminal
+  (its device: stdin's and stdout's descriptors of the controlling terminal get the same), reused
+  until the next check phase, and a background one (the probe was a stop) until the check phase
+  after the next poll phase, which dispatches the signals that came with the continue (r12g T2:
+  keyed by descriptor, the start's wait asking about stdin and a write held while it starts
+  asking about stdout in the same turn probed twice, so `kill %1` of a chat started with `&` as
+  PID 2 left it stopped, also of one whose start had a notice held). And no
+  probe runs once a fatal signal is in, at every caller: the waits and the reader's looks (muted
+  first; the reader's default `foreground` asks without the probe while muted, so a close then
+  touches nothing where only the probe could tell), the hand-back after a child (r12g T2: Ctrl+Z
+  inside a `!cmd`, then `kill %1`, probed after the SIGTERM and stopped `unshare` again while the
+  chat closed: the job stayed 'Stopped (tty output)'; its first look comes two event-loop turns
+  after the child's exit, since that exit can be dispatched before the SIGTERM of the same
+  continue: both come through libuv's signal pipe in the order their handlers ran, which under
+  load is not the order sent, and 2 of 9 such runs under load stopped `unshare` again), the first
+  look after the start (`waited`, two turns after the start's end too: it can end in the poll that
+  the continue's signals come in, read after its other I/O), a write held while it starts (held
+  then, and dropped), and the resume hint (asked without the probe). Its cost: two process
+  spawns (a few milliseconds) wherever kiro-claude would
   otherwise take the foreground for granted (the start's wait, a write held while it starts, the
   reader's retake and looks while away, the hand-back after a child, a close), up to 100 ms of a
   blocked event loop each in the background (about two probes per 20 ms poll, the event loop then
@@ -896,7 +940,13 @@ Both front ends use `ExitSignals` (`repl/exitSignals.ts`) on POSIX:
 * As the init of a PID namespace (`unshare --fork --pid --mount-proc kiro-claude chat`) the
   re-raised signal is dropped by the kernel (a default-action signal a namespace's init sends
   itself), so with no listener left for it kiro-claude exits with the signal's status (128 + its
-  number) at once instead of after the 5 s fallback (r12 #2). Node's exit then restores the
+  number) at once instead of after the 5 s fallback (r12 #2). When the close overran its 2 s grace
+  (Claude Code or a hook still running), the listener left is `claude/lifecycle.ts`'s forwarder,
+  whose own re-raise the kernel drops the same way: `ExitSignals` exits once that one has
+  forwarded the signal, SIGKILLed what was left after its 1 s grace and removed its listener (looked
+  at every 20 ms), about 3 s after the signal at most as under a shell (r12g verification: it
+  waited for the fallback, 7 s; the likely cause of one failure of `r12f-tb-pidns-pty`'s `kill
+  %1` test under a heavy load). Node's exit then restores the
   terminal mode it started with, which from the background spins as any terminal mode change or
   read of a namespace's init does there. The chat is never in the background with the terminal in
   raw mode there unless something stops the processes of its job outside the namespace behind its
@@ -922,7 +972,29 @@ time, field 22 of `/proc/self/stat`). Opening a session (`chat --resume`, `--res
 `session/load`, a fork, a tangent) takes it, and `chat --delete-session` refuses while another
 live process holds it: `Failed to start session: Session is active in another process (PID N)`
 (the text KiroCrew retries `session/load` on). A lock whose process is dead, an unreadable one
-and one of our own process are taken over; one of another host counts as live.
+and one of our own process are taken over (one of our own process is replaced in one step, a
+rename over it, so the name is never free while it changes hands: ACP `loadFresh` hands its lock
+to the session it starts); one of another host counts as live.
+
+* **Race-free takeover (r12g S2).** Removing a stale lock and creating ours cannot be one step, so
+  the openers that judged the same lock text stale first claim it: `.<sid>.lock.takeover-<k>`,
+  created exclusively (hard link of a written temp file, like a lock, with the claimant's pid,
+  host, boot and start time), `k` a hash of the stale text. Only the claim's owner removes the
+  stale lock, by rename to a name of its own; when what it moved is not that stale text (a third
+  party removed it and a fresh open's lock took the name meanwhile: KiroCrew removes a dead
+  holder's lock itself) it is put back with link(), which never replaces a lock. The others wait
+  for the claim (read every 2 ms, up to 1 s; it is created only while absent) and look at the
+  lock again, and the exclusive create
+  gives the session to exactly one opener; the rest get the error above, naming the owner (or the
+  claimant, when it is still taking over after that wait). A claim whose writer is gone (it died in
+  the middle of a takeover: a dead pid, a pid of another process now, a zombie, an earlier boot, or
+  an unparsable claim older than 10 s) is passed: the next claim's name is a hash of `k` and that
+  claim's text, which every opener derives alike (up to 64 are passed: a cap that, reached,
+  would leave the stale lock in place for good, so it only bounds the walk). A lock text is unique
+  (pid, `started_at`) and never comes back once gone, so the owner then removes every claim on it.
+  `SessionStore.delete` (`--delete-session`, a spec phase record, a left-behind unused chat)
+  removes a stale lock the same way: an open that took it over meanwhile keeps its lock. The lock
+  file's shape and every error text are unchanged.
 
 * **Hung-up holder (r12 #1).** A stopped process runs no handler, so a chat stopped with a hangup
   or a kill pending keeps its lock until it is continued, and under `sudo` with `use_pty` that is
@@ -948,10 +1020,28 @@ and one of our own process are taken over; one of another host counts as live.
   one gets the lock and the other the error), and so does every other live holder: a chat stopped
   by Ctrl+Z in a terminal that is still open has nothing pending and is never touched. A plain
   `kill <pid>` (SIGTERM pending) of a stopped chat takes effect at the next open of its session.
-  Residual: the open read the record before it took the lock (`KiroSessionImpl.build`, ACP
-  `loadFresh`), so what the continued chat saves at its close and the open did not read (a turn
-  it was running when it was stopped, saved as interrupted; a line Claude never read, put back) is
-  overwritten by the open's next save (the Claude transcript keeps that turn).
+* **The record after the lock (r12g S1).** What the continued chat saves at its close (the turn it
+  was running when it was stopped, saved as interrupted; a line Claude never read, put back; its
+  title, message count, trust, plan mode, agent, effort) is newer than the record the open read
+  before it took the lock, and the lock says so (`SessionLock.continuedHolder`).
+  `KiroSessionImpl.build` reads a saved record again once the lock is taken, every time (a holder
+  that closed normally between that read and the lock saved too), and when it changed, resolves
+  the launch mode, agent, model, effort and trust again from it, under the lock already held and
+  by id (`--resume` stays on that session): the next turn follows the old chat's last one, a chat
+  whose first turn was in progress is resumed (not started as a new Claude session), and the trust
+  and plan mode are what the holder saved, never the open's older copy (`--trust-all-tools` stays
+  per invocation; the open's own `--agent`, `--model`, `--effort` still win). ACP `loadFresh`,
+  which turns the record's agent, model and effort into the session's options, takes the
+  session's lock before it reads them (continuing a hung-up holder; with no lock on disk too, so
+  that no other process can open, change and close the session between that read and the
+  session's start: r12g verify), and keeps it until the session has taken it over (a lock of this
+  process, replaced in one step), so the closing holder cannot take it back in between; a lock
+  still held answers from the session's start as before. A record gone
+  under the lock (a chat that never had a message drops its record at its close) keeps the copy
+  read before: the session runs on under the same id (as a new conversation when it never had
+  one). `chat --delete-session` reads nothing it writes back; the REPL's makeNewest reads under
+  the lock. Residual: the REPL's `/chat resume` passes the agent, model and effort of the list it
+  showed (read before the user picked) as explicit options, which win over the re-read.
 
 ## Signals and child processes
 

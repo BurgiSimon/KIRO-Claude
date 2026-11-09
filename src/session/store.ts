@@ -25,8 +25,15 @@
  * link of a fully written temp file, so a lock is never observed half-written). An existing lock
  * held by a live process of this host other than us ⇒ `Failed to start session: Session is active
  * in another process (PID N)`; a lock from a dead PID, an unreadable lock, or one written by this
- * process is taken over. A lock written on another host cannot be checked and is treated as live
- * (DECISION). `release()` removes the lock only while it is still ours.
+ * process is taken over (one of this process is replaced in one step, a rename over it, so that
+ * the name is never free while it changes hands: ACP loadFresh hands its lock to the session it
+ * starts; r12g verify). A lock written on another host cannot be checked and is treated as live
+ * (DECISION). `release()` removes the lock only while it is still ours. The takeover is race-free
+ * (r12g S2): the openers that judged the same lock stale claim it first (an exclusive
+ * `.<sid>.lock.takeover-<hash>` file; "Stale-lock takeover" below), only the claim's owner removes
+ * it (by rename, put back with link() when what it moved is not that stale lock), and the
+ * exclusive create then gives the session to exactly one opener; the others get the error above.
+ * `delete()` removes a stale lock the same way.
  *
  * Hung-up holder (r12 #1, DECISION): a chat stopped for good with a hangup or kill pending keeps
  * its lock until it is continued, since a stopped process runs no handler. Under `sudo` with
@@ -42,10 +49,12 @@
  * SessionEnd hooks run, its record is saved, its lock released, within its 2 s close grace), and
  * waits for that, blocking, up to {@link HUNG_UP_HOLDER_WAIT_MS}, before it takes the lock as for a
  * dead holder. A holder that is still running then keeps the error. Any other live holder (a chat
- * stopped by Ctrl+Z in a terminal still open: nothing pending) is never touched.
+ * stopped by Ctrl+Z in a terminal still open: nothing pending) is never touched. The lock it
+ * returns then says so ({@link SessionLock.continuedHolder}): what the holder saved at its close
+ * is newer than a record read before the lock (KiroSessionImpl.build reads it again, r12g S1).
  */
 
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -526,9 +535,13 @@ function readText(p: string): string | undefined {
   }
 }
 
-/** Create `p` with `data` only if it does not exist (atomic content). */
+/**
+ * Create `p` with `data` only if it does not exist (atomic content). The temp file's name keeps at
+ * most 160 characters of `p`'s, so it stays within the 255-byte name limit also for a takeover
+ * claim of the longest session id (`.<200-char id>.lock.takeover-<k>`, 240; r12g verify).
+ */
 function createExclusive(p: string, data: string): boolean {
-  const tmp = path.join(path.dirname(p), `.${path.basename(p)}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`);
+  const tmp = path.join(path.dirname(p), `.${path.basename(p).slice(0, 160)}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`);
   fs.writeFileSync(tmp, data, { mode: 0o600 });
   try {
     fs.linkSync(tmp, p);
@@ -562,6 +575,169 @@ function createExclusive(p: string, data: string): boolean {
   }
 }
 
+function unlinkQuiet(p: string): void {
+  try {
+    fs.unlinkSync(p);
+  } catch {
+    // gone already
+  }
+}
+
+/**
+ * Put the lock `data` in place of a lock of this process at `lockPath` in one step (a written temp
+ * file renamed over it): the name is never free, so no other open can take the session in between
+ * (a removal and a create, as for a stale lock, would leave it free for a moment). False when it
+ * could not be done (the caller then takes the lock over as a stale one).
+ */
+function replaceOwnLock(lockPath: string, data: string): boolean {
+  const tmp = path.join(path.dirname(lockPath), `.${path.basename(lockPath).slice(0, 160)}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`);
+  try {
+    fs.writeFileSync(tmp, data, { mode: 0o600 });
+    fs.renameSync(tmp, lockPath);
+    return true;
+  } catch {
+    unlinkQuiet(tmp);
+    return false;
+  }
+}
+
+/*
+ * Stale-lock takeover (r12g S2, DECISION). Removing a stale lock and creating ours cannot be one
+ * step, so the openers that judged the same lock text stale first claim it:
+ * `.<sid>.lock.takeover-<k>`, created exclusively like a lock (our pid, host, boot and start time),
+ * `k` a hash of the stale text. Only the claim's owner removes the stale lock; the others wait for
+ * that, reading the claim (it is created only while absent), and look at the lock again (the
+ * exclusive create then decides who owns the session). A claim
+ * whose writer is gone (it died in the middle of a takeover) is passed: the next claim's name is a
+ * hash of `k` and that claim's text, which every opener derives alike, so there is still one owner
+ * at a time. The stale text is unique (pid, started_at) and never comes back once it is gone from
+ * the lock path, so every claim on it is garbage then and removed by the owner.
+ */
+/** How long an open waits for another opener's takeover of the same stale lock. */
+const TAKEOVER_WAIT_MS = 1000;
+const TAKEOVER_POLL_MS = 2;
+/**
+ * Claims of gone claimants passed before giving up (each one a process that died in a takeover).
+ * Past it nobody would ever remove the stale lock (every open of the session failing for good), so
+ * it only bounds the walk (r12g verify: it was 4).
+ */
+const TAKEOVER_MAX_CLAIMS = 64;
+/** A claim that cannot be parsed and is older than this is a gone claimant's (one is written at once). */
+const UNREAD_CLAIM_STALE_MS = 10_000;
+
+function claimKey(seed: string): string {
+  return createHash('sha256').update(seed).digest('hex').slice(0, 24);
+}
+
+/**
+ * The writer of the claim `text` at `claimPath` can no longer act: our own (a takeover of ours
+ * that threw: none runs now), a dead pid, a pid now another process's or a zombie (its start time
+ * on this boot), a claim of an earlier boot, or an unparsable claim older than
+ * {@link UNREAD_CLAIM_STALE_MS}. A claim of another host cannot be checked and is left to it.
+ */
+function claimantGone(text: string, claimPath: string): boolean {
+  const cl = parseLock(text);
+  if (!cl) {
+    try {
+      return Date.now() - fs.statSync(claimPath).mtimeMs > UNREAD_CLAIM_STALE_MS;
+    } catch {
+      return false;
+    }
+  }
+  if (cl.host !== os.hostname()) return false;
+  if (cl.pid === process.pid) return true;
+  if (!pidAlive(cl.pid)) return true;
+  const boot = (lockIdentity() as { boot_id?: string }).boot_id;
+  if (boot === undefined || cl.boot_id === undefined || cl.start_ticks === undefined) return false;
+  if (cl.boot_id !== boot) return true;
+  const st = procStat('/proc', cl.pid);
+  return st !== undefined && st.pid === cl.pid && (st.start !== cl.start_ticks || st.state === 'Z' || st.state === 'X');
+}
+
+/**
+ * Under a takeover claim: remove `lockPath` if it still reads `text`. By rename to a name of ours,
+ * which moves exactly the file then there; when that is not `text` (a third party removed the stale
+ * lock and a new opener's lock took the name meanwhile: KiroCrew removes a dead holder's lock
+ * itself), it is put back with link(), which never replaces a lock. True when `text` is no longer
+ * at `lockPath`.
+ */
+function removeIfStill(lockPath: string, text: string): boolean {
+  let cur: string;
+  try {
+    cur = fs.readFileSync(lockPath, 'utf8');
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'ENOENT';
+  }
+  if (cur !== text) return true;
+  const aside = path.join(path.dirname(lockPath), `.${path.basename(lockPath)}.${process.pid}.${randomBytes(6).toString('hex')}.stale`);
+  try {
+    fs.renameSync(lockPath, aside);
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'ENOENT';
+  }
+  if (readText(aside) !== text) {
+    try {
+      fs.linkSync(aside, lockPath);
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      // a filesystem without hard links: moved back unless yet another lock took the name
+      if (code !== 'EEXIST' && !fs.existsSync(lockPath)) {
+        try {
+          fs.renameSync(aside, lockPath);
+          return true;
+        } catch {
+          // fall through
+        }
+      }
+      log.warn(`session lock ${path.basename(lockPath)}: could not put back the lock of an open that took its name while its stale lock was removed (${code ?? String(e)})`);
+    }
+  }
+  unlinkQuiet(aside);
+  return true;
+}
+
+/**
+ * Take the stale lock `text` off `lockPath`, race-free (see "Stale-lock takeover" above).
+ * Undefined: look at the lock again (we removed it, the claim's owner did, or it was replaced).
+ * Otherwise another opener still holds the claim at the end of a bounded wait
+ * ({@link TAKEOVER_WAIT_MS}): the session is about to be its own (`claimant`, when parsable).
+ */
+function takeOverStale(lockPath: string, text: string): { claimant?: LockData } | undefined {
+  const dir = path.dirname(lockPath);
+  const mine = `${JSON.stringify({ pid: process.pid, started_at: uniqueLockTime(), host: os.hostname(), ...lockIdentity() })}\n`;
+  const until = Date.now() + TAKEOVER_WAIT_MS;
+  const passed: string[] = [];
+  let key = claimKey(text);
+  while (passed.length < TAKEOVER_MAX_CLAIMS) {
+    const claim = path.join(dir, `.${path.basename(lockPath)}.takeover-${key}`);
+    // created only while absent: a wait polls with reads, not a temp file written every poll (each
+    // one left behind by a SIGKILL that lands there; r12g verify)
+    if (readText(claim) === undefined && createExclusive(claim, mine)) {
+      let gone = false;
+      try {
+        gone = removeIfStill(lockPath, text);
+      } finally {
+        for (const p of gone ? [...passed, claim] : [claim]) unlinkQuiet(p);
+      }
+      return undefined;
+    }
+    const ct = readText(claim);
+    if (ct === undefined) return undefined;
+    if (claimantGone(ct, claim)) {
+      passed.push(claim);
+      key = claimKey(`${key}\n${ct}`);
+      continue;
+    }
+    if (readText(lockPath) !== text) return undefined;
+    if (Date.now() >= until) {
+      const claimant = parseLock(ct);
+      return claimant ? { claimant } : {};
+    }
+    sleepSync(TAKEOVER_POLL_MS);
+  }
+  return undefined;
+}
+
 /** Last lock timestamp handed out by this process: `started_at` is unique per process. */
 let lastLockTime = 0;
 function uniqueLockTime(): string {
@@ -572,6 +748,14 @@ function uniqueLockTime(): string {
 
 export interface SessionLock {
   release(): void;
+  /**
+   * This lock was taken after a hung-up holder that {@link SessionStore.acquireLock} continued had
+   * closed (module doc, "Hung-up holder"): what that holder saved at its close (the turn it was
+   * running, settled as interrupted; a line Claude never read put back; its title, trust, plan
+   * mode) is newer than anything read before the lock was taken, so a record read then must be
+   * read again (KiroSessionImpl.build re-reads it under the lock in every case, r12g S1).
+   */
+  readonly continuedHolder: boolean;
 }
 
 /** Persistent session index (see module doc). */
@@ -786,13 +970,8 @@ export class SessionStore {
     const text = readText(lockPath);
     if (text !== undefined) {
       const l = parseLock(text);
-      if (!l || !heldByOther(l)) {
-        try {
-          fs.unlinkSync(lockPath);
-        } catch {
-          // ignore
-        }
-      }
+      // removed only while it still reads `text` (an open may take it over meanwhile: its lock stays)
+      if (!l || !heldByOther(l)) takeOverStale(lockPath, text);
     }
     return true;
   }
@@ -811,7 +990,10 @@ export class SessionStore {
    * continued once and waited for, blocking, up to {@link HUNG_UP_HOLDER_WAIT_MS}, also while it
    * takes its lock again for a moment as it closes (the chat's record made the newest); once it has
    * exited, a lock it left is taken over as a dead holder's. Two opens racing for it: one gets the
-   * lock, the other the 'Session is active in another process' error.
+   * lock, the other the 'Session is active in another process' error; so for any number of opens
+   * taking over the same stale lock (takeOverStale), one of them naming the opener that still holds
+   * the takeover claim after {@link TAKEOVER_WAIT_MS} when that one is slow. `continuedHolder` on
+   * the lock: it was taken after a continued holder's close.
    */
   acquireLock(id: string): SessionLock {
     const lockPath = this.lockPathFor(id);
@@ -819,25 +1001,27 @@ export class SessionStore {
     const mine: LockData = { pid: process.pid, started_at: uniqueLockTime(), host: os.hostname(), ...lockIdentity() };
     const data = `${JSON.stringify(mine)}\n`;
     let continued: Continued | undefined;
-    for (let attempt = 0; attempt < 8; attempt++) {
-      if (createExclusive(lockPath, data)) {
-        let released = false;
-        return {
-          release: () => {
-            if (released) return;
-            released = true;
-            const cur = readText(lockPath);
-            const l = cur !== undefined ? parseLock(cur) : undefined;
-            if (l && l.pid === mine.pid && l.started_at === mine.started_at) {
-              try {
-                fs.unlinkSync(lockPath);
-              } catch {
-                // ignore
-              }
+    const taken = (): SessionLock => {
+      let released = false;
+      return {
+        continuedHolder: continued !== undefined,
+        release: () => {
+          if (released) return;
+          released = true;
+          const cur = readText(lockPath);
+          const l = cur !== undefined ? parseLock(cur) : undefined;
+          if (l && l.pid === mine.pid && l.started_at === mine.started_at) {
+            try {
+              fs.unlinkSync(lockPath);
+            } catch {
+              // ignore
             }
-          },
-        };
-      }
+          }
+        },
+      };
+    };
+    for (let attempt = 0; attempt < 8; attempt++) {
+      if (createExclusive(lockPath, data)) return taken();
       const text = readText(lockPath);
       if (text === undefined) continue; // released meanwhile: retry
       const l = parseLock(text);
@@ -859,14 +1043,15 @@ export class SessionStore {
           throw active;
         }
       }
-      // stale (dead pid), unreadable, or our own: take it over if it is still the same file
-      if (readText(lockPath) === text) {
-        try {
-          fs.unlinkSync(lockPath);
-        } catch {
-          // someone else removed it; retry
-        }
-      }
+      // a lock of this process (another lock object of ours: ACP loadFresh hands the lock it read
+      // the record under to the session it starts): replaced in one step, so that no other process
+      // finds the name free meanwhile (r12g verify; only this process writes or removes it)
+      if (l?.pid === process.pid && replaceOwnLock(lockPath, data)) return taken();
+      // stale (dead pid), unreadable, or our own: take it over, race-free (takeOverStale); an
+      // opener still taking the same stale lock over at the end of the wait owns the session
+      const busy = takeOverStale(lockPath, text);
+      if (busy?.claimant) throw new Error(`Failed to start session: Session is active in another process (PID ${busy.claimant.pid})`);
+      if (busy) break;
     }
     throw new Error(`Failed to start session: could not acquire the session lock ${lockPath}`);
   }

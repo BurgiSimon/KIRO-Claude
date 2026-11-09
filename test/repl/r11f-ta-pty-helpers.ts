@@ -244,7 +244,7 @@ export async function startAtPrompt(t: Term, r: Root, opts: { prefix?: string; p
  * bash's state of job %1 (`jobs -l`, which names the stop signal: 'Stopped (tty input)' for
  * SIGTTIN, 'Stopped (tty output)' for SIGTTOU, plain 'Stopped' for SIGTSTP / SIGSTOP), or 'Running'.
  */
-export async function jobState(t: Term): Promise<string> {
+export async function jobState(t: Pick<Term, 'write' | 'screen' | 'waitFor'>): Promise<string> {
   const mark = t.screen().length;
   t.write('jobs -l\r');
   await t.waitFor(/jobs -l\r?\n[\s\S]*\[1\][+-]? +\d+ +\S[\s\S]*BASH\$ $/, 'the job list', mark, 10_000);
@@ -253,10 +253,27 @@ export async function jobState(t: Term): Promise<string> {
   return m?.[1] ?? '';
 }
 
+/**
+ * {@link jobState} once bash counts job %1 stopped: `jobs -l` is asked again (every 100 ms, up to
+ * `ms`) while it reads 'Running'. bash learns of a stop from its SIGCHLD and counts a job stopped
+ * only once every process of it has stopped (`| cat`, a wrapper), so right after /proc shows the
+ * chat in state T `jobs -l` can still list the job Running (r12g T1: such a one-shot check failed
+ * once in a full suite). Returns the last state read ('Running' at the deadline).
+ */
+export async function stoppedJobState(t: Pick<Term, 'write' | 'screen' | 'waitFor'>, ms = 10_000): Promise<string> {
+  const t0 = Date.now();
+  for (;;) {
+    const state = await jobState(t);
+    if (state !== 'Running' || Date.now() - t0 > ms) return state;
+    await sleep(100);
+  }
+}
+
 /** The chat stops by itself (it needs the terminal and is in the background): state T, and bash says 'Stopped (tty input)'. */
 export async function stopsForTerminal(t: Term, pid: number, ms = 10_000): Promise<void> {
   await waitUntil(() => procState(pid) === 'T', `the chat stops in the background (state ${procState(pid)})`, ms);
-  assert.equal(await jobState(t), 'Stopped (tty input)');
+  // (bash may not count the job stopped yet: asked until it does, r12g T1)
+  assert.equal(await stoppedJobState(t), 'Stopped (tty input)');
 }
 
 /** Nothing of the chat's own (greeting, prompt) drawn after `mark`. */

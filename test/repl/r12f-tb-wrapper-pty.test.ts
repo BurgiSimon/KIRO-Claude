@@ -22,7 +22,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import * as inputMod from '../../src/repl/input.js';
-import { SLOW_START, answers, bg, chatCommand, ctrlZ, jobState, killedCleanly, procPgrp, procState, setup, skipPty, sleep, waitUntil } from './r11f-ta-pty-helpers.js';
+import { SLOW_START, answers, bg, chatCommand, ctrlZ, killedCleanly, procPgrp, procState, setup, skipPty, sleep, stoppedJobState, waitUntil } from './r11f-ta-pty-helpers.js';
 
 const haveTimeout = spawnSync('timeout', ['--version'], { stdio: 'ignore' }).status === 0;
 const skip = skipPty || (haveTimeout ? false : 'needs GNU timeout');
@@ -86,7 +86,8 @@ test('r12f #5: `timeout 600 kiro-claude chat`, Ctrl+Z, `bg`: the chat stops the 
     await bg(s.t);
     // continued in the background, the chat needs the terminal and stops its job again
     await waitUntil(() => procState(pid) === 'T' && procState(wrapper) === 'T', `the job stops again (chat ${procState(pid)}, timeout ${procState(wrapper)})`, 10_000);
-    assert.equal(await jobState(s.t), 'Stopped', 'bash still counts the job running: its fg sends no SIGCONT');
+    // (asked until bash counts the job stopped, r12g T1; before r12 #5 it stayed Running for good)
+    assert.equal(await stoppedJobState(s.t), 'Stopped', 'bash still counts the job running: its fg sends no SIGCONT');
     mark = s.t.screen().length;
     s.t.write('fg\r');
     await answers(s.t, mark, 'two');
@@ -103,7 +104,7 @@ test('r12f #5: `timeout 600 kiro-claude chat &` (still starting): it stops the j
     await waitUntil(() => s.r.locks().length === 1, 'the session lock', 20_000);
     const pid = s.t.chatPid();
     await waitUntil(() => procState(pid) === 'T', `the chat stops in the background once started (state ${procState(pid)})`, 20_000);
-    assert.equal(await jobState(s.t), 'Stopped');
+    assert.equal(await stoppedJobState(s.t), 'Stopped');
     const mark = s.t.screen().length;
     s.t.write('fg\r');
     await s.t.waitFor(/Welcome to[\s\S]*> $/, 'the greeting and the prompt after fg', mark, 15_000);
@@ -126,7 +127,7 @@ test('r12f #5: under `timeout`, `kill %1` of the self-stopped chat closes it at 
     await bg(s.t);
     await waitUntil(() => procState(pid) === 'T', 'the chat stops again in the background', 10_000);
     await sleep(200);
-    assert.equal(await jobState(s.t), 'Stopped');
+    assert.equal(await stoppedJobState(s.t), 'Stopped');
     await killedCleanly(s, pid);
   } finally {
     await s.t.dispose();
