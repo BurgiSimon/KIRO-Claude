@@ -443,7 +443,13 @@ journal); Claude Code keeps its own transcript, which kiro-claude resumes and fo
   After `fg` raw mode and bracketed paste are back and the prompt being read is drawn again with
   its half-typed line; an approval prompt still takes its answer. As the terminal's session
   leader (`ssh -t host kiro-claude chat`, `docker run -it`, `tmux new 'kiro-claude chat'`) there
-  is no shell to return to: the kernel discards the stop and the chat goes on as before.
+  is no shell to return to: the kernel discards the stop and the chat goes on as before. As the
+  init (PID 1) of a PID namespace on Linux (`unshare --fork --pid --mount-proc kiro-claude chat`)
+  Ctrl+Z does nothing at all (r12 #2): the kernel ignores a default-action SIGTSTP, SIGTTIN or
+  SIGTTOU for a namespace's init, so the SIGTSTP stopped only the rest of its group outside the
+  namespace (`unshare`), bash took the terminal back, and the chat ran on behind it; its retake
+  then changed the terminal mode from the background, where the kernel's SIGTTOU, dropped for
+  init, made the ioctl restart forever (100% CPU, no JS ran, so `kill %1` never closed it).
   readline's own suspend is not used: it left the input paused after `fg`, and in cooked mode
   when the stop was discarded (Enter no longer submitted, and Ctrl+D was an end of input taken
   for a hangup). A stop from elsewhere (`kill -TSTP` or `kill -STOP` of kiro-claude, then `fg`)
@@ -473,13 +479,49 @@ journal); Claude Code keeps its own transcript, which kiro-claude resumes and fo
   the keys stay in the terminal until the retake reads them as typed in the shell's cooked mode
   (below). None makes it a blocked event
   loop (a long synchronous step, a GC pause, a slow machine): the input is resumed as it was,
-  nothing drawn, no mode changed, the keys read raw and in order (a stop that began after that
-  poll is seen by the next beat). Ctrl+Z (its stop pauses the input first) and the reader's own
-  stop in the background (below) are made while away, without the heartbeat, so their continue
-  is never taken for a stop from elsewhere (one retake, one redraw). Not seen in time: a stop
+  nothing drawn, no mode changed, the keys read raw and in the order typed (a stop that began
+  after that poll is seen by the next beat), but after the Claude Code output that came during
+  the block: its pipe is read in the parked poll. Ctrl+Z (its stop pauses the input first) and
+  the reader's own stop in the background (below) are made while away, without the heartbeat,
+  so their continue is never taken for a stop from elsewhere (one retake, one redraw); only the
+  SIGCONT such a stop
+  still has to come is absorbed (`LineReader.ownContPending`: the first SIGCONT after it, before
+  the first heartbeat after its retake). r12 #3: by time alone (any SIGCONT within 250 ms of a
+  retake), a stop from elsewhere and its `fg` right after a retake (a supervisor or a test
+  harness; no person is that fast) got no retake: bash had put the terminal in its canonical
+  mode, nothing was drawn, and Return (a newline: Ctrl+J, a soft newline) never submitted.
+  Keys held this way never answer an approval asked meanwhile (r12 #0): while the input is
+  parked, and while the reader is away after a continue (two event-loop turns), Claude Code's
+  pipe is still read, so a permission request that came after the keys was read first, and the
+  approval prompt then read them as typed at it (`y` + Enter allowed the tool, `t` trusted it, any
+  other line denied it as a redirect and sent that line to the model, Ctrl+D cancelled it), on
+  a stall under bash, a stop from elsewhere with no shell (the session leader, raw keys), and
+  under bash too (the keys the shell queued before `fg` were kept in the approval's line, their
+  Return a soft newline). Before r11 the keys were read first, as type-ahead, which the approval
+  drops. So an approval whose read starts while the input is held, or in the poll that gives it
+  back (`LineReader.release`), drops what is read for it before the second check phase after the
+  input is given back (the keys that waited in the terminal), as type-ahead always is there:
+  nothing of them is echoed, kept in its line or sent anywhere, and no Return, Ctrl+D, Ctrl+Z or
+  Shift+Tab among them acts (a bracketed paste that starts among them is dropped to its end); a
+  Ctrl+C still interrupts, as it would have at once. The answer is what is typed at the question.
+  The same holds for an approval whose read starts with the heartbeat overdue (more than 250 ms
+  since the last beat): a stall that ended in the very callbacks that read the request, before
+  its question was drawn (a long synchronous step there; a write to a terminal that does not
+  drain, a slow `ssh` link: Node's writes to a terminal block). The input is parked at once, as
+  the overdue beat would have, so the keys typed during the stall, still in the terminal or later
+  in the same poll's batch, are dropped as above (r12 verification: with the input neither parked
+  nor away they were read into the approval, and `y` + Enter allowed the tool).
+  An approval whose question was on the screen before the input was held (a stall or a stop at
+  an open approval; the reader's self-stop in the background, which comes after the question was
+  written there) takes those keys as typed at it (the cooked ones without an Enter of their own,
+  below). Other reads (the prompt, `ask`, `confirm`, `choose`) take them as type-ahead, in order,
+  once. Not seen in time: a stop
   shorter than 250 ms (no one types and runs `fg` in that time) and one that lands in a timers
-  phase after the beat. An end of input read with no beat since such a stop (the second case)
-  while the input is still the controlling terminal is canonical mode's end of file, a Ctrl+D
+  phase after the beat (keys typed during it and a permission request queued meanwhile are then
+  read in one poll, in the order they are ready: a request read first leaves the keys to its
+  approval, as before r12, where a cooked Return is a soft newline, but a raw one, as the
+  session leader, answers it). An end of input read with no beat since such a stop (the second
+  case) while the input is still the controlling terminal is canonical mode's end of file, a Ctrl+D
   typed in the shell (a hangup takes the controlling terminal away before its read returns), so it
   is not taken for a hangup: the chat quits as at the end of piped input, without waiting for a
   SIGHUP that does not come (DECISION: the input stream is over either way; reopening the terminal
@@ -487,8 +529,8 @@ journal); Claude Code keeps its own transcript, which kiro-claude resumes and fo
   after the 500 ms wait for a SIGHUP.
   As the terminal's session leader (no shell can take the terminal) the terminal stays raw
   during such a stop, and the keys typed meanwhile are read as the raw keys they are (a Ctrl+J
-  stays a soft newline). The stop clock (`util/process.ts`, above) keeps its own heartbeat,
-  unchanged. From the stop on the reader's input
+  stays a soft newline; dropped for an approval asked during the stop, above). The stop clock
+  (`util/process.ts`, above) keeps its own heartbeat, unchanged. From the stop on the reader's input
   is paused and nothing of it is drawn; it takes the terminal back two event-loop turns after the
   continue, never inside the stop's own callback or the SIGCONT dispatch, and only when
   kiro-claude is the terminal's foreground process group (r9 #0/#1: a terminal mode change from
@@ -511,7 +553,14 @@ journal); Claude Code keeps its own transcript, which kiro-claude resumes and fo
   after a continue the signals that came with it are dispatched first (two event-loop turns), and
   a further stop needs another poll interval and another look at the fatal-signal state, so
   `kill %1` of the self-stopped chat (SIGTERM, then SIGCONT) and a hangup (SIGHUP, SIGCONT) close
-  it at once, and a plain `kill <pid>` waits for a continue as for any stop (r10 #5). `bg` or a
+  it at once, and a plain `kill <pid>` waits for a continue as for any stop (r10 #5). Not so a
+  hangup under `sudo` with `use_pty`: bash sends sudo SIGHUP and SIGCONT, and sudo passes the
+  SIGHUP on to the stopped chat but, its user's terminal gone, never continues it, as for any
+  program it runs (also after a plain Ctrl+Z; r12 #1: state T, SIGHUP pending in ShdPnd, for
+  good). kiro-claude can do nothing while stopped, so the chat keeps its lock until the next open
+  of its session (`chat --resume`, `--resume-id`, `--delete-session`, ACP `session/load`) by the
+  same user continues it (the hung-up holder in [Session locks](#session-locks)), or until
+  `kill -CONT <pid>`; it then closes as at a hangup. `bg` or a
   `kill -CONT` of the self-stopped chat continue it in the background, where it stops again at the
   next look. Between r9 and r11 it only polled there and ran on (bash's `fg` of a job it knows to
   be running sends no SIGCONT: the poll noticed it); but something above the chat may depend on
@@ -523,8 +572,23 @@ journal); Claude Code keeps its own transcript, which kiro-claude resumes and fo
   The stop is the whole process group's, as the kernel's own SIGTTIN for a background read: bash
   counts a job stopped only once none of its processes runs, so a wrapper (`npx`, a script) or
   the rest of a pipeline (`kiro-claude chat | tee log`) left running kept the job 'Running' and
-  `fg` sent no SIGCONT (r11, bash 5.2). Claude Code and hook commands run in process groups of
-  their own and go on. SIGTTIN rather than SIGTTOU (caught while a child owns the terminal,
+  `fg` sent no SIGCONT (r11, bash 5.2). Nor does SIGTTIN stop a process of the group that ignores
+  or catches it (r12 #5): GNU `timeout` (also with `--foreground`) sets SIGTTIN and SIGTTOU to
+  SIG_IGN in itself, so under it the job stayed 'Running', `fg` sent no SIGCONT, and the chat
+  stayed stopped for good (Ctrl+Z, `bg`, `fg`; `timeout 600 kiro-claude chat &`, `fg`). So before
+  a self-stop with SIGTTIN the reader looks at the other processes of its own process group
+  (`groupHoldsOff`: every `/proc/<pid>/stat` for the group, `/proc/<pid>/status` SigIgn and
+  SigCgt for the group's members, zombies left out; a fraction of a millisecond for a hundred
+  processes, looked at again at most once a second for the same group, so an orphaned group's
+  discarded stop every 20 ms does not rescan): when one holds SIGTTIN off and none holds SIGTSTP
+  off, the stop is a SIGTSTP, which stops `timeout` too (it catches only HUP, INT, QUIT, ALRM, TERM
+  and CHLD): bash reports the job 'Stopped' (`jobs -l` too, not 'Stopped (tty input)') and `fg`
+  continues it. Under a wrapper that holds both off (a script with `trap '' TTIN TSTP`) the stop
+  stays a SIGTTIN, as before: the job stays 'Running' and the chat stopped until a `kill -CONT`
+  (DECISION: a SIGSTOP would stop that wrapper too, but nothing could be told from it any more,
+  and such a wrapper asked not to be stopped). sudo with `use_pty` is not in the chat's group (its
+  monitor gives the command a group of its own), so `TerminalStops` below is unchanged. Claude
+  Code and hook commands run in process groups of their own and go on. SIGTTIN rather than SIGTTOU (caught while a child owns the terminal,
   below) or SIGTSTP (sudo answers a command's SIGTSTP by suspending itself even when it is in the
   foreground already; at a SIGTTIN or SIGTTOU there it resumes the command in the foreground).
   But a stop that comes back sooner than 20 ms (`STOP_ANSWERED_MS`, no person's `fg`/`bg`/`kill`)
@@ -542,7 +606,24 @@ journal); Claude Code keeps its own transcript, which kiro-claude resumes and fo
   starting shell has gone, `bash -mc 'kiro-claude chat & …'`; Linux discards a default-action
   SIGTSTP, SIGTTIN or SIGTTOU there, so the poll goes on alone, as before r11). A chat stopped this
   way whose job then becomes orphaned (that `bash -mc` shell exits while it is stopped) gets the
-  kernel's SIGHUP and SIGCONT for an orphaned stopped group and closes as at a hangup. Until the
+  kernel's SIGHUP and SIGCONT for an orphaned stopped group and closes as at a hangup. One still
+  waiting off the terminal in an orphaned group (its start finished, or `bg` came, after that
+  shell exited) gets no signal at all when the terminal session ends (the kernel's hangup signals
+  the foreground group and the session leader; an orphaned group only when it has a stopped
+  process), but it loses its controlling terminal (`tty_nr` 0, and the hung-up fd fails isatty),
+  which `/proc` then read as "cannot be told", i.e. the foreground: the reader's retake ran, and
+  `Repl.run` created its reader on the hung-up terminal, where readline's raw switch failed with
+  EIO before the reader's 'error' listener existed, so the chat ended with 'setRawMode EIO',
+  exit status 1, its session not closed (no SessionEnd, the lock left; r12 #4). Now an input that
+  was the controlling terminal when the wait began (or when the reader went away) and is not any
+  more ends the wait as a hangup whose SIGHUP never comes (`terminalGone`; the reader:
+  `LineReader.endAsHungUp` at the retake, the REPL then waits the 500 ms for a SIGHUP and closes):
+  the session is closed (SessionEnd runs, the record is saved, the lock released), nothing is
+  written and no terminal mode changed, and the chat exits 0 (DECISION: as a hung-up input whose
+  SIGHUP never came, the end of its input). The reader's own raw switch, also at its creation, is
+  made with its 'error' listener in place (readline's constructor gets a no-op `setRawMode`), so an
+  EIO there is the input's end (`hungUp`, every read `eof`), and `Repl.run` creates the reader
+  inside the try whose finally closes the session. Until the
   retake the terminal is in the shell's cooked mode: keys typed then are echoed by the terminal and
   queued with Return made a newline (ICRNL), which raw mode reads as Ctrl+J, a soft newline, and
   a Ctrl+D as canonical mode's NUL end-of-file placeholder, which readline drops (r10 #2: polled
@@ -567,15 +648,46 @@ journal); Claude Code keeps its own transcript, which kiro-claude resumes and fo
   terminal is cooked) stays one input and none of its lines (`!cmd`, `/command`) runs before an
   Enter (r10 verification: read as typed, each pasted line was submitted on its own). And an
   approval prompt (a read that discards type-ahead) never reads such keys as typed: a `y` +
-  Return typed blind during an approval-time `!cmd`, or into the shell before `fg`, answers it
-  only with an Enter typed at its question (r10 verification). The foreground test
+  Return typed blind during an approval-time `!cmd`, or into the shell before `fg` at an
+  approval asked before the stop, answers it only with an Enter typed at its question (r10
+  verification); at one asked during the stop they were typed before its question and are
+  dropped (r12 #0, above). The foreground test
   is Linux's `/proc/self/stat` (the process group against the controlling terminal's foreground
   group, when the input is that terminal: its own device or `/dev/tty`, as in `kiro-claude chat
   < /dev/tty`, which the r9 verification found taken for another terminal, so in the background
   the chat stopped again and `kill %1` never closed it). DECISION: elsewhere (no portable tcgetpgrp without a
   native module) the reader takes itself for the foreground: the retake is still deferred past the
   signals that came with the continue, and after `bg` the chat stops again (SIGTTOU) until `fg`, as
-  before. The first prompt takes the terminal only in the foreground too (`Repl.run`, r10 #1).
+  before. In a PID namespace with its own `/proc` and no job-control shell inside it (`unshare
+  --fork --pid --mount-proc kiro-claude chat`, as its PID 1, or as its PID 2 under a plain `bash
+  -c`) the job's process group, its session and the terminal's foreground group belong to the
+  parent namespace and read 0 there (r12 #2), which read as "cannot be told", i.e. the foreground,
+  so none of the r9-r11 background handling ran: as PID 1 (which no default-action stop signal
+  stops) a start with `&`, or the retake after Ctrl+Z, changed the terminal mode from the
+  background and spun in the kernel (above), and as PID 2 Ctrl+Z, `bg` stopped it inside that
+  ioctl until `fg`, `kill %1` waiting with it (the r9 #1 failure). One group visible and the other
+  not is the background. Neither visible, kiro-claude asks a short-lived child in its process
+  group (`probeForeground`): `stty -g` reads the terminal's mode (no job-control check), and `stty
+  <that mode>` re-applies it, which in the foreground exits 0 within milliseconds, and in the
+  background is stopped by the kernel with SIGTTOU to the whole group (the job's processes it can
+  stop with it: bash reports the job 'Stopped (tty output)' and takes the terminal) and killed
+  after 100 ms (`FOREGROUND_PROBE_MS`); one ended by a signal meanwhile (`kill %1`) counts as the
+  background too. That probe is the self-stop there (`stopForTerminal` sends nothing more and the
+  caller lets two event-loop turns pass), its answer is reused within one event-loop turn, and the
+  waits look at the fatal-signal state before probing again: a second probe right after `kill
+  %1`'s SIGCONT, before its SIGTERM was handled, stopped `unshare` again, and the chat's exit then
+  waited for it. Its cost: two process spawns (a few milliseconds) wherever kiro-claude would
+  otherwise take the foreground for granted (the start's wait, a write held while it starts, the
+  reader's retake and looks while away, the hand-back after a child, a close), up to 100 ms of a
+  blocked event loop each in the background (about two probes per 20 ms poll, the event loop then
+  blocked most of the time: about 6% of a core with the `stty` children, measured as 32 clock
+  ticks in 5 s for a start with `&` left stopped; signals are handled up to about 200 ms late),
+  and only in such a namespace. DECISION: no `stty` (or a probe that fails otherwise) keeps the old
+  answer, the foreground. As PID 1 the re-raised fatal signal is dropped too (the kernel ignores
+  a default-action signal a namespace's init sends itself), so with no listener left for it
+  `ExitSignals` exits with its status at once. The common case, an interactive shell as the
+  namespace's init (`unshare -fp --mount-proc bash -i`, a container's shell), creates the job's
+  groups inside the namespace and is unaffected. The first prompt takes the terminal only in the foreground too (`Repl.run`, r10 #1).
   Stopped while it starts (Ctrl+Z: the terminal is still cooked, so the terminal's SIGTSTP stops
   the job; `kill -STOP`) and continued in the background (`kill %1`, `bg`), or started as
   `kiro-claude chat &`, the chat created its line reader from the background: readline's raw-mode
@@ -777,7 +889,19 @@ Both front ends use `ExitSignals` (`repl/exitSignals.ts`) on POSIX:
   the signal. Ctrl+D (a key in raw mode) and the end of piped input quit at once, and so does an
   end of input read right after a stop from elsewhere that the reader did not see in time while
   the input is still the controlling terminal: canonical mode's end of file, a Ctrl+D typed in the
-  shell, no hangup (`LineReader.hungUp`, r11 #0, above).
+  shell, no hangup (`LineReader.hungUp`, r11 #0, above). That includes a hangup the reader meets
+  when it is created (readline's raw switch is made only once its 'error' listener is there,
+  r12 #4) and a chat waiting off the terminal in an orphaned process group, which no SIGHUP
+  reaches: after the 500 ms it closes and exits 0, writing nothing (above).
+* As the init of a PID namespace (`unshare --fork --pid --mount-proc kiro-claude chat`) the
+  re-raised signal is dropped by the kernel (a default-action signal a namespace's init sends
+  itself), so with no listener left for it kiro-claude exits with the signal's status (128 + its
+  number) at once instead of after the 5 s fallback (r12 #2). Node's exit then restores the
+  terminal mode it started with, which from the background spins as any terminal mode change or
+  read of a namespace's init does there. The chat is never in the background with the terminal in
+  raw mode there unless something stops the processes of its job outside the namespace behind its
+  back (`kill -TSTP` of `unshare` from elsewhere: the shell takes the terminal, and the chat, not
+  stopped and seeing no stop, still reads it; a known gap).
 * Headless: at a signal during the turn the children still running (`claude`, hook commands) get
   SIGTERM and, 1 s later, SIGKILL with their surviving group members, as under the lifecycle
   forwarder; the session is marked closed first, so nothing respawns Claude Code or sends the
@@ -788,6 +912,46 @@ Both front ends use `ExitSignals` (`repl/exitSignals.ts`) on POSIX:
   is opened again.
 * Not on Windows (no POSIX re-raise), and not for an embedder that passes
   `installSignalHandlers: false`; there the signal is the lifecycle forwarder's (below).
+
+## Session locks
+
+`session/store.ts` keeps one lock per session, `<sid>.lock` in the session index:
+`{"pid","started_at","host"}` (the shape KiroCrew reads; it looks at `pid` only) plus, on Linux,
+`boot_id` (this boot's `/proc/sys/kernel/random/boot_id`) and `start_ticks` (the writer's start
+time, field 22 of `/proc/self/stat`). Opening a session (`chat --resume`, `--resume-id`, ACP
+`session/load`, a fork, a tangent) takes it, and `chat --delete-session` refuses while another
+live process holds it: `Failed to start session: Session is active in another process (PID N)`
+(the text KiroCrew retries `session/load` on). A lock whose process is dead, an unreadable one
+and one of our own process are taken over; one of another host counts as live.
+
+* **Hung-up holder (r12 #1).** A stopped process runs no handler, so a chat stopped with a hangup
+  or a kill pending keeps its lock until it is continued, and under `sudo` with `use_pty` that is
+  for good once the terminal of a chat stopped in the background closes (above). So an open whose
+  lock such a process holds sends it SIGCONT, which lets the pending signal close it as at a hangup
+  (SessionEnd hooks, record saved, lock released, within its 2 s close grace), waits for that
+  (`HUNG_UP_HOLDER_WAIT_MS`, 3 s, polling the lock file and the process every 20 ms; blocking, as
+  the lock is taken synchronously, so in an ACP server other sessions' frames wait too), and then
+  takes the lock as for a dead holder, also when the holder takes it again for a moment while it
+  closes (its record made the newest) or exits leaving it. The holder must be verifiably the
+  lock's writer and in that state (`hungUpLockHolder`): Linux; this host and boot; the start time
+  in its `/proc/<pid>/stat` the lock's `start_ticks` (a reused pid, or a lock without these
+  fields, as KiroCrew, kiro-cli or an older kiro-claude write it, is never signalled); /proc of
+  our own pid namespace; state `T` (a job-control stop; a ptrace stop `t` is left alone); SIGHUP
+  or SIGTERM pending in `/proc/<pid>/status` SigPnd or ShdPnd; our real and effective uid; and
+  the lock file a regular file of our effective uid, not a symbolic link (those process facts are
+  readable by anyone, so a lock another user wrote, in an index of theirs that root opens under
+  `sudo -E`, ties them to nothing; r12 #1 verification). Nothing but SIGCONT is sent, at most once
+  per open. `chat --delete-session` of a chat that never had a message reports it deleted when
+  that chat's close dropped its record meanwhile. The user sees the new chat (or the
+  `session/load` answer) a moment later and nothing else; the old chat's SessionEnd hooks run in
+  its own process. A holder still running after the wait keeps the error (of two opens racing,
+  one gets the lock and the other the error), and so does every other live holder: a chat stopped
+  by Ctrl+Z in a terminal that is still open has nothing pending and is never touched. A plain
+  `kill <pid>` (SIGTERM pending) of a stopped chat takes effect at the next open of its session.
+  Residual: the open read the record before it took the lock (`KiroSessionImpl.build`, ACP
+  `loadFresh`), so what the continued chat saves at its close and the open did not read (a turn
+  it was running when it was stopped, saved as interrupted; a line Claude never read, put back) is
+  overwritten by the open's next save (the Claude transcript keeps that turn).
 
 ## Signals and child processes
 
@@ -911,8 +1075,13 @@ configOptions (or the current mode) never disagree:
   the session reports; an error there reads as a refused pin), an `/effort` line that failed
   after the session saved the level, an agent swap whose Claude Code restart failed. The session
   keeps and saves such a choice, and its next child starts with it (`--model`, `--effort`, the
-  agent's configuration). A warning goes to the log. After such a swap, until a prompt starts
-  that child, the `tools` and `mcp` commands answer at once and describe the agent switched to
+  agent's configuration). A warning goes to the log. After the answer of a mode change that
+  switched the agent (`set_mode`, `set_config_option` `mode`, the `agent` command) come the MCP
+  report of the new agent's servers and an `available_commands_update`, as after `session/new`
+  (r12 #6/#7: `set_config_option` `mode` sent neither, so not even the prompt after a failed
+  restart reported its servers; only a later `mcp` or `tools` command did). After a swap whose
+  restart failed, until a prompt starts that child, the `tools` and `mcp` commands answer at once
+  and describe the agent switched to
   (see [Configuration changes mid-session](#configuration-changes-mid-session)). A server
   nothing has started is `failed` in `mcp`, with that reason as its `error`. The MCP report
   sends no `server_init_failure` for it and does not wait for it. The turn that starts the next

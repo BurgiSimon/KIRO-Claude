@@ -27,7 +27,10 @@
  *        (`fg`; at once when the stop is discarded because the group is orphaned: kiro-claude is
  *        the terminal's session leader, as under `ssh -t`, `docker run -it` or `tmux new 'cmd'`)
  *        raw mode and bracketed paste are back and the active read's prompt is drawn again with
- *        its half-typed line. readline's own suspend is never used: it left the input paused
+ *        its half-typed line. As a PID namespace's init on Linux (`unshare --fork --pid
+ *        --mount-proc kiro-claude chat`), which no default-action stop signal stops, Ctrl+Z does
+ *        nothing (r12 #2: the SIGTSTP stopped only `unshare`, the shell took the terminal and the
+ *        chat ran on behind it). readline's own suspend is never used: it left the input paused
  *        after SIGCONT, and raw mode off when the stop was discarded (r7 #2). While no read is
  *        active (a turn runs) Ctrl+Z is kept as type-ahead: the stop happens at the next prompt,
  *        once it is drawn, and an approval prompt drops it with the rest; presses typed ahead
@@ -51,9 +54,12 @@
  *        drawn in that poll, by Claude Code's output read before the SIGCONT, leaves it paused:
  *        readline's prompt() would resume it); a SIGCONT
  *        in that poll makes it a stop, none a blocked event loop, and the input goes on as if
- *        nothing happened (no redraw, no mode change, the keys raw and in order). Keys typed
- *        during a stop with no shell that could take the terminal (kiro-claude leads its session)
- *        are raw keys and read as such.
+ *        nothing happened (no redraw, no mode change, the keys raw and in the order typed). Keys
+ *        typed during a stop with no shell that could take the terminal (kiro-claude leads its
+ *        session) are raw keys and read as such. Either way they are read after the Claude Code
+ *        output that came meanwhile (its pipe is read while the terminal is held), so for a
+ *        permission request in it they were typed before its approval question was drawn: they
+ *        are dropped there, as type-ahead always is (below, r12 #0).
  *        From the stop on the input is paused and nothing is drawn until the terminal is taken
  *        back, which happens two event-loop turns after the continue, never inside the stop's
  *        callback or the SIGCONT dispatch, and only in the foreground (r9 #0/#1: a mode change
@@ -70,12 +76,18 @@
  *        input)'; under `sudo` with `use_pty` the polling alone never came up after `fg`), as
  *        Q's rustyline and any terminal program stop there; `bg` or a `kill -CONT` continue it
  *        and the next look stops it again (with SIGTSTP after a stop that came back at once:
- *        {@link TerminalStops}); a turn without a read runs on (its output still
- *        written there) until its prompt. The foreground test is Linux's
- *        /proc/self/stat ({@link terminalInForeground}); elsewhere (DECISION, no portable
- *        tcgetpgrp without a native module) it takes the foreground: after `bg` the chat stops
- *        again (SIGTTOU) at the retake until `fg`, as before, while the deferral still lets a
- *        fatal signal win. {@link LineReader.close} in the background (away, or not in the
+ *        {@link TerminalStops}, and when another process of its group holds SIGTTIN off and none
+ *        SIGTSTP, GNU `timeout`: r12 #5, {@link groupHoldsOff}); a turn without a read runs on (its
+ *        output still written there) until its prompt. The foreground test is Linux's
+ *        /proc/self/stat ({@link terminalInForeground}; in a PID namespace with its own /proc and
+ *        no job-control shell, where the job's IDs read 0, a short-lived `stty` child that the
+ *        kernel stops in the background, r12 #2, {@link probeForeground}); elsewhere (DECISION, no
+ *        portable tcgetpgrp without a native module) it takes the foreground: after `bg` the chat
+ *        stops again (SIGTTOU) at the retake until `fg`, as before, while the deferral still lets a
+ *        fatal signal win. An input that was the controlling terminal when the reader went away
+ *        and is not any more (the terminal session ended; no SIGHUP reaches an orphaned group that
+ *        is not stopped) ends as at a hangup at the retake, nothing touched (r12 #4,
+ *        {@link LineReader.endAsHungUp}). {@link LineReader.close} in the background (away, or not in the
  *        foreground) changes no mode and writes nothing either (r10 #3: readline's close() turned
  *        raw mode off from there, and SIGTTOU stopped kiro-claude until `fg`);
  *      - keys queued in the shell's cooked mode: when the reader takes the terminal back after a
@@ -92,14 +104,34 @@
  *      - while no read is active, other keys are kept as type-ahead and replayed into the next
  *        read (rustyline left them in the TTY buffer, so Classic behaves the same); reads with
  *        `discardTypeahead` (approval prompts) drop them, so text typed while a response
- *        streamed can never answer a `[y/n/t]` question by accident (DECISION).
+ *        streamed can never answer a `[y/n/t]` question by accident (DECISION). The approval
+ *        prompt (repl/core.ts approvalFlow) is the only such read: the prompt and the other
+ *        questions (`ask`, `confirm`, `choose`: a Stop hook's choice, the plan-mode `[y/n]`, the
+ *        `/spec` menus) take type-ahead, as rustyline's next read took what was typed. That holds
+ *        also for keys kiro-claude could not read before the request came (r12 #0): while the
+ *        heartbeat parks the input, and while it is away after a continue, Claude Code's pipe is
+ *        still read, so a permission request typed after them is read first. An approval whose
+ *        read starts while the input is held, or in the poll that gives it back ({@link
+ *        LineReader.release}), or with the heartbeat overdue (a stall that ended in the callbacks
+ *        that read the request, before its question was drawn: a long synchronous step, a write to
+ *        a terminal that does not drain, a slow `ssh` link; the input is parked then, as the beat
+ *        would have; r12 verification), drops what is read for it up to the second check phase
+ *        after the input is given back (the keys that waited in the terminal): they are not echoed, not
+ *        kept in its line or sent anywhere, and no Return, Ctrl+D, Ctrl+Z or Shift+Tab among them
+ *        acts; a bracketed paste that starts among them is dropped to its end; a Ctrl+C still
+ *        interrupts, as it would have at once. Not when its question was on the screen before the
+ *        input was held (a stall or a stop at an open approval, a self-stop in the background
+ *        after the question was written there): those keys were typed at it and are read as such,
+ *        the cooked ones as above (no answer without an Enter typed at its question).
  *  - **line** (stdin is not a TTY: pipes, tests): lines are queued in arrival order and handed
  *    to reads; the prompt and the consumed line are written so transcripts look like the
  *    terminal. A line that is exactly `\x03` stands for Ctrl+C (emitted as `'interrupt'` at
  *    once when a turn is listening, else queued) and `\x04` for Ctrl+D. End of input ⇒ `eof`.
  *
  * In both modes an error on the input (a hung-up terminal: EIO from `setRawMode` or a read) is
- * end of input: every pending read gets `eof`, never an unhandled 'error' (r5 #1); in terminal
+ * end of input: every pending read gets `eof`, never an unhandled 'error' (r5 #1), also at the
+ * reader's creation (readline's constructor turned raw mode on before the reader's 'error'
+ * listener existed, and its EIO was thrown out of it: r12 #4; the reader switches itself); in terminal
  * mode a half-typed line at the input's end (the terminal went away) is dropped, not delivered
  * as a line (line mode keeps a last line without a newline: piped text), and
  * {@link LineReader.hungUp} says the terminal hung up (its SIGHUP follows, r6 #3; not for an end
@@ -126,8 +158,10 @@
  * main prompt are recorded, and only in terminal mode.
  */
 
+import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
 import * as tty from 'node:tty';
@@ -149,7 +183,10 @@ export type ReadResult =
 
 export interface ReadOptions {
   signal?: AbortSignal;
-  /** Terminal mode: drop keys typed before this read started (approval prompts). */
+  /**
+   * Terminal mode: drop keys typed before this read started (approval prompts): the type-ahead,
+   * and those still waiting in the terminal while the input is held (module doc, r12 #0).
+   */
   discardTypeahead?: boolean;
 }
 
@@ -222,6 +259,13 @@ interface PendingRead {
    * keys the terminal queued in a cooked mode are never read as typed for it ({@link takeCooked}).
    */
   discard: boolean;
+  /**
+   * A discarding read that started while the input was held (parked by the heartbeat, or away
+   * after a stop; or with the heartbeat overdue, which parks it then: r12 verification): the keys
+   * still waiting in the terminal then were typed before its question was drawn, and are dropped
+   * when the input is given back ({@link LineReader.release}, r12 #0).
+   */
+  held?: boolean;
   /** Logical input (backslash / fence continuation) vs a single answer line. */
   logical: boolean;
   contPrompt: string;
@@ -263,7 +307,10 @@ const DEFAULT_HISTORY_SIZE = 1000;
 const STOP_SEEN_MS = 50;
 /**
  * A SIGCONT this soon after the terminal was taken back belongs to that stop (its handler runs on
- * the event loop after the stop was handled synchronously): nothing more to do.
+ * the event loop after the stop was handled synchronously): nothing more to do. Only while the
+ * reader's own stop (Ctrl+Z, the self-stop in the background) still has its SIGCONT to come
+ * (LineReader.ownContPending): by time alone a stop from elsewhere and its `fg` inside this window
+ * got no retake, the terminal left in the shell's cooked mode (r12 #3).
  */
 const OWN_CONT_MS = 250;
 /**
@@ -317,6 +364,24 @@ function stopReading(input: unknown): void {
   (h.readStop as () => unknown).call(h);
 }
 
+/**
+ * Run `fn` (readline's constructor or close(), which switch raw mode themselves) with a no-op
+ * standing in for the input's setRawMode, then give the input its own back (an own property as
+ * such, a prototype one by removing the stand-in).
+ */
+function withoutRawSwitch<T>(input: unknown, fn: () => T): T {
+  const inp = input as { setRawMode?: unknown };
+  const own = Object.prototype.hasOwnProperty.call(inp, 'setRawMode');
+  const setRawMode = inp.setRawMode;
+  if (typeof setRawMode === 'function') inp.setRawMode = () => inp;
+  try {
+    return fn();
+  } finally {
+    if (own) inp.setRawMode = setRawMode;
+    else delete inp.setRawMode;
+  }
+}
+
 /** Ctrl+Z (readline's key for \x1a). */
 const isCtrlZ = (k: Key): boolean => k.ctrl === true && !k.shift && k.name === 'z';
 
@@ -364,22 +429,40 @@ const DEV_TTY_RDEV = 5 << 8;
  * `tpgid` of the controlling terminal, when the input is that terminal (`tty_nr` = its device, or
  * `/dev/tty`, which is it under another device number: `kiro-claude chat < /dev/tty`; r9
  * verification: taken for another terminal, it stopped the chat again in the background).
- * True whenever that cannot stop kiro-claude or cannot be told: an input that is no terminal
- * file descriptor (tests' fakes), a terminal that is not the controlling one (no job control
- * applies to it), no controlling terminal or no foreground group, and on other systems (no
- * /proc: DECISION, the module doc says what that leaves).
+ * In a PID namespace with its own /proc and no job-control shell inside it (`unshare --fork
+ * --pid --mount-proc kiro-claude chat`) both groups belong to the parent namespace and read 0
+ * (r12 #2): one of them visible and the other not is the background; neither visible is asked of
+ * a short-lived child ({@link probeForeground}). True whenever that cannot stop kiro-claude or
+ * cannot be told: an input that is no terminal file descriptor (tests' fakes), a terminal that is
+ * not the controlling one (no job control applies to it), no controlling terminal or no
+ * foreground group, a probe that cannot run (no `stty`), and on other systems (no /proc:
+ * DECISION, the module doc says what that leaves). `probe` false: where only the probe could tell,
+ * false (not known to be the foreground) without asking it (the probe stops a job in the
+ * background, which after a fatal signal's continue left the job stopped).
  */
-export function terminalInForeground(input: unknown): boolean {
-  return terminalJob(input)?.foreground ?? true;
+export function terminalInForeground(input: unknown, probe = true): boolean {
+  const job = terminalJob(input);
+  if (!job) return true;
+  return job.foreground ?? (probe ? probeForeground(job.fd) ?? true : false);
+}
+
+/** /proc/self/stat's view of the controlling terminal `input` reads (Linux), see {@link controllingTty}. */
+interface ControllingTty {
+  fd: number;
+  /** kiro-claude's process group, session, and the terminal's foreground group: 0 when outside its PID namespace. */
+  pgrp: number;
+  sid: number;
+  tpgid: number;
 }
 
 /**
- * kiro-claude's job on the controlling terminal `input` reads ({@link terminalInForeground}):
- * whether its process group is that terminal's foreground group, and whether kiro-claude leads its
- * session (no shell above it: `ssh -t host kiro-claude chat`). undefined wherever no job control
- * applies or it cannot be told (see there).
+ * The controlling terminal `input` reads (Linux: /proc/self/stat's `tty_nr` is the input's device,
+ * or the input is `/dev/tty`), or undefined: off Linux, an input that is no terminal file
+ * descriptor (tests' fakes, or a hung-up terminal: isatty fails with EIO), a terminal that is not
+ * the controlling one, and no controlling terminal (none, or it went away: a hangup and the end of
+ * the session, its leader's exit, clear `tty_nr`).
  */
-function terminalJob(input: unknown): { foreground: boolean; sessionLeader: boolean } | undefined {
+function controllingTty(input: unknown): ControllingTty | undefined {
   if (process.platform !== 'linux') return undefined;
   const fd = (input as { fd?: unknown } | undefined)?.fd;
   if (typeof fd !== 'number' || !tty.isatty(fd)) return undefined;
@@ -387,18 +470,100 @@ function terminalJob(input: unknown): { foreground: boolean; sessionLeader: bool
     const stat = fs.readFileSync('/proc/self/stat', 'utf8');
     // after the command name: state ppid pgrp session tty_nr tpgid …
     const f = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-    const pgrp = Number(f[2]);
-    const sid = Number(f[3]);
     const ttyNr = Number(f[4]);
-    const tpgid = Number(f[5]);
-    if (!(ttyNr > 0) || !(tpgid > 0)) return undefined;
+    if (!(ttyNr > 0)) return undefined;
     const rdev = fs.fstatSync(fd).rdev;
     if (rdev !== ttyNr && rdev !== DEV_TTY_RDEV) return undefined;
-    return { foreground: pgrp === tpgid, sessionLeader: sid === process.pid };
+    return { fd, pgrp: Number(f[2]), sid: Number(f[3]), tpgid: Number(f[5]) };
   } catch {
     return undefined;
   }
 }
+
+/**
+ * kiro-claude's job on the controlling terminal `input` reads ({@link terminalInForeground}):
+ * whether its process group is that terminal's foreground group (undefined: both groups are
+ * outside kiro-claude's PID namespace, r12 #2, where only {@link probeForeground} can tell), and
+ * whether kiro-claude leads its session (no shell above it: `ssh -t host kiro-claude chat`; a
+ * session outside its PID namespace reads 0: not). undefined wherever no job control applies or
+ * it cannot be told (see there; a terminal with no foreground group, `tpgid` -1, too).
+ */
+function terminalJob(input: unknown): { fd: number; pgrp: number; foreground: boolean | undefined; sessionLeader: boolean } | undefined {
+  const c = controllingTty(input);
+  if (!c || !(c.tpgid >= 0)) return undefined;
+  const sessionLeader = c.sid === process.pid;
+  if (c.pgrp > 0 && c.tpgid > 0) return { fd: c.fd, pgrp: c.pgrp, foreground: c.pgrp === c.tpgid, sessionLeader };
+  // a group outside the PID namespace reads 0: one visible and the other not are two groups
+  return { fd: c.fd, pgrp: c.pgrp, foreground: c.pgrp > 0 || c.tpgid > 0 ? false : undefined, sessionLeader };
+}
+
+/**
+ * A watch for the end of the terminal session (r12 #4): when `input` is kiro-claude's controlling
+ * terminal now ({@link controllingTty}), the returned function is true once it no longer is (a
+ * hangup, the session leader's exit: the kernel takes the controlling terminal away, and sends a
+ * process group neither in the foreground nor stopped no SIGHUP); otherwise always false (off
+ * Linux, an input that is no controlling terminal).
+ */
+export function terminalGone(input: unknown): () => boolean {
+  if (!controllingTty(input)) return () => false;
+  return () => !controllingTty(input);
+}
+
+/**
+ * How long the foreground probe's mode change may take ({@link probeForeground}): in the
+ * foreground `stty` re-applies the mode in a few milliseconds; one still running after this was
+ * stopped by the kernel (SIGTTOU) as a background job's.
+ */
+export const FOREGROUND_PROBE_MS = 100;
+
+/**
+ * Whether kiro-claude is in its terminal's foreground where /proc cannot tell (r12 #2): in a PID
+ * namespace with its own /proc and no job-control shell inside it (`unshare --fork --pid
+ * --mount-proc kiro-claude chat`, also as its PID 2 under a plain `bash -c`) kiro-claude's process
+ * group and the terminal's foreground group belong to the parent namespace and read 0, and as
+ * that namespace's init the kernel ignores every default-action stop signal for kiro-claude: a
+ * terminal mode change of its own from the background got SIGTTOU, which the kernel dropped,
+ * and restarted for good inside the ioctl (100% CPU, no JS ran, `kill %1` never closed it). So a
+ * short-lived child in kiro-claude's process group (`stty`, never kiro-claude itself) re-applies
+ * the terminal's current mode (`stty -g`, read without a job-control check): in the foreground it
+ * exits 0 at once (true); in the background the kernel stops it, and the processes of the job it
+ * can stop with it (SIGTTOU to the group: the shell reports the job 'Stopped (tty output)' and
+ * takes the terminal), and it is killed after {@link FOREGROUND_PROBE_MS} (false; also when a
+ * signal ended it, `kill %1`). undefined when it cannot run or fails (no `stty`, a hung-up
+ * terminal): the caller's old answer applies. Each call spawns `stty` twice (a few milliseconds),
+ * and blocks the event loop up to {@link FOREGROUND_PROBE_MS} in the background; it is asked only
+ * where kiro-claude would otherwise take the foreground for granted ({@link
+ * terminalInForeground}: the first prompt and its wait, the reader's retake and looks while away,
+ * the hand-back after a child, a close, a write held while the chat starts). Within one event-loop
+ * turn the answer is reused (no signal is dispatched to kiro-claude before the next one: a second
+ * probe right after `kill %1`'s SIGCONT stopped the job again before its SIGTERM was handled, and
+ * the chat's exit then waited for that stopped wrapper to reap it).
+ */
+function probeForeground(fd: number): boolean | undefined {
+  if (lastProbe?.fd === fd) return lastProbe.verdict;
+  let verdict: boolean | undefined;
+  try {
+    const g = spawnSync('stty', ['-g'], { stdio: [fd, 'pipe', 'ignore'], encoding: 'utf8', timeout: 2000, killSignal: 'SIGKILL' });
+    const mode = g.status === 0 ? g.stdout.trim() : '';
+    if (/^[0-9A-Fa-f:]+$/.test(mode)) {
+      const s = spawnSync('stty', [mode], { stdio: [fd, 'ignore', 'ignore'], timeout: FOREGROUND_PROBE_MS, killSignal: 'SIGKILL' });
+      if (s.status === 0) verdict = true;
+      // stopped (SIGTTOU) and killed at the timeout, or ended by a signal meanwhile (`kill %1`)
+      else if (s.signal !== null || (s.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT') verdict = false;
+    }
+  } catch {
+    // (no stty: the old answer)
+  }
+  const probe = { fd, verdict };
+  lastProbe = probe;
+  setImmediate(() => {
+    if (lastProbe === probe) lastProbe = undefined;
+  });
+  return verdict;
+}
+
+/** The last {@link probeForeground} answer, until the check phase after it. */
+let lastProbe: { fd: number; verdict: boolean | undefined } | undefined;
 
 /**
  * Stop kiro-claude the way the kernel stops a background job that reads its terminal, because it
@@ -424,7 +589,12 @@ function terminalJob(input: unknown): { foreground: boolean; sessionLeader: bool
  * which the REPL catches while a child owns the terminal (repl/exitSignals.ts childOwnsTerminal),
  * or SIGTSTP, which sudo answers by suspending itself even when it is in the foreground already;
  * but after a stop that came back at once while kiro-claude is still in the background, SIGTSTP
- * is what helps ({@link TerminalStops}).
+ * is what helps ({@link TerminalStops}). Nor does SIGTTIN stop a process of the group that ignores
+ * or catches it: GNU `timeout` (also with `--foreground`) ignores SIGTTIN and SIGTTOU itself, so
+ * under it the job stayed 'Running', `fg` sent no SIGCONT, and the chat stayed stopped (r12 #5).
+ * So when another process of kiro-claude's group holds SIGTTIN off and none holds SIGTSTP off
+ * ({@link groupHoldsOff}: /proc, looked at only here, before a stop), the stop is a SIGTSTP
+ * (bash: 'Stopped', also in `jobs -l`); when one holds both off, it stays a SIGTTIN, as before.
  *
  * Nothing (false) where it cannot be told or does not apply (as {@link terminalInForeground}: off
  * Linux, an input that is not the controlling terminal), in the foreground, when kiro-claude leads
@@ -432,11 +602,23 @@ function terminalJob(input: unknown): { foreground: boolean; sessionLeader: bool
  * signal is installed (it would catch the signal instead of stopping). Node starts every program
  * with SIGTTIN at its default action (an inherited SIG_IGN is reset), and a stop the kernel
  * discards or ignores returns at once: the caller's poll goes on as before. `signal` is SIGTSTP
- * instead after a stop that came back at once ({@link TerminalStops}).
+ * instead after a stop that came back at once ({@link TerminalStops}). With job IDs outside
+ * kiro-claude's PID namespace nothing is sent and the answer is true: the foreground probe that
+ * found it in the background was the stop ({@link probeForeground}, r12 #2).
  */
 export function stopForTerminal(input: unknown, signal: TerminalStop = 'SIGTTIN'): boolean {
   const job = terminalJob(input);
-  if (!job || job.foreground || job.sessionLeader) return false;
+  if (!job || job.foreground === true || job.sessionLeader) return false;
+  // job IDs outside the PID namespace: the probe that found kiro-claude in the background was the
+  // stop (the kernel stopped it and the job's processes it can stop, SIGTTOU); the caller lets the
+  // signals that came with a continue be dispatched before it probes again (`kill %1`'s SIGCONT
+  // was followed by a probe that stopped the job again, its SIGTERM not handled yet)
+  if (job.foreground === undefined) return true;
+  // (a group outside the PID namespace reads 0 for its members too: not looked at)
+  if (signal === 'SIGTTIN' && job.pgrp > 0) {
+    const held = groupHoldsOffCached(job.pgrp);
+    if (held.SIGTTIN && !held.SIGTSTP) signal = 'SIGTSTP';
+  }
   if (process.listenerCount(signal) > 0) return false;
   try {
     process.kill(0, signal);
@@ -444,6 +626,63 @@ export function stopForTerminal(input: unknown, signal: TerminalStop = 'SIGTTIN'
     return false;
   }
   return true;
+}
+
+/** Which stop signals another process of a process group holds off ({@link groupHoldsOff}). */
+export type StopHolds = Record<TerminalStop, boolean>;
+
+/**
+ * Whether a process of process group `pgrp` other than kiro-claude (a wrapper: GNU `timeout`, a
+ * script with `trap '' TTIN`; the rest of a pipeline) ignores or catches SIGTTIN, and SIGTSTP
+ * (Linux /proc: each process's `stat` for its group, `status` SigIgn / SigCgt for the signals): at
+ * either such a stop leaves it running, and bash counts its job stopped only once none of its
+ * processes runs (r12 #5). Zombies count as gone. Nothing off Linux or when /proc cannot be read.
+ * One `stat` read per process on the system (a fraction of a millisecond for a hundred).
+ */
+export function groupHoldsOff(pgrp: number): StopHolds {
+  const held: StopHolds = { SIGTTIN: false, SIGTSTP: false };
+  if (process.platform !== 'linux' || !(pgrp > 0)) return held;
+  const bit = (sig: TerminalStop): bigint => 1n << BigInt((os.constants.signals[sig] ?? 1) - 1);
+  let names: string[];
+  try {
+    names = fs.readdirSync('/proc');
+  } catch {
+    return held;
+  }
+  for (const name of names) {
+    if (!/^\d+$/.test(name) || Number(name) === process.pid) continue;
+    try {
+      const stat = fs.readFileSync(`/proc/${name}/stat`, 'utf8');
+      const f = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      if (Number(f[2]) !== pgrp || f[0] === 'Z' || f[0] === 'X') continue;
+      const status = fs.readFileSync(`/proc/${name}/status`, 'utf8');
+      const mask = (field: string): bigint => {
+        const m = new RegExp(`^${field}:\\s*([0-9a-fA-F]+)$`, 'm').exec(status);
+        return m ? BigInt(`0x${m[1]}`) : 0n;
+      };
+      const off = mask('SigIgn') | mask('SigCgt');
+      for (const sig of ['SIGTTIN', 'SIGTSTP'] as const) if ((off & bit(sig)) !== 0n) held[sig] = true;
+    } catch {
+      // gone meanwhile
+    }
+  }
+  return held;
+}
+
+/** {@link groupHoldsOff} is looked at again only this long after its last look, for the same group. */
+const GROUP_LOOK_MS = 1000;
+let groupLook: { pgrp: number; at: number; held: StopHolds } | undefined;
+
+/**
+ * {@link groupHoldsOff}, at most once per {@link GROUP_LOOK_MS} for the same group: in an orphaned
+ * group every self-stop is discarded and the next one follows a poll later ({@link
+ * FOREGROUND_POLL_MS}), and the members of a job seldom change.
+ */
+function groupHoldsOffCached(pgrp: number): StopHolds {
+  const now = performance.now();
+  if (groupLook && groupLook.pgrp === pgrp && now - groupLook.at < GROUP_LOOK_MS) return groupLook.held;
+  groupLook = { pgrp, at: now, held: groupHoldsOff(pgrp) };
+  return groupLook.held;
 }
 
 /** The signal of a self-stop ({@link stopForTerminal}): SIGTTIN, or SIGTSTP ({@link TerminalStops}). */
@@ -510,14 +749,24 @@ const twoTurns = (): Promise<void> => new Promise((resolve) => setImmediate(() =
  * taken). A stop that is discarded or ignored (`stop()` false, or true and back at once) leaves the
  * poll alone, as before r11. Each wait's first stop is a SIGTTIN; one that came back at once makes
  * the next one a SIGTSTP ({@link TerminalStops}: under `sudo` with `use_pty`, after a child
- * that died holding the terminal).
+ * that died holding the terminal). False too once `gone()` (r12 #4, {@link terminalGone}: the
+ * terminal session ended meanwhile, which a hung-up terminal's "cannot be told" made look like
+ * the foreground), looked at before the foreground each time.
  */
-export async function waitForForeground(foreground: () => boolean, muted: () => boolean, stop: (signal: TerminalStop) => boolean): Promise<boolean> {
+export async function waitForForeground(
+  foreground: () => boolean,
+  muted: () => boolean,
+  stop: (signal: TerminalStop) => boolean,
+  gone: () => boolean = () => false,
+): Promise<boolean> {
   const stops = new TerminalStops();
-  while (!foreground()) {
-    if (muted()) return false;
+  for (;;) {
+    // (muted first: where the foreground is probed, a probe after `kill %1`'s continue stopped the
+    // job again, r12 #2)
+    if (muted() || gone()) return false;
+    if (foreground()) break;
     await new Promise((resolve) => setTimeout(resolve, FOREGROUND_POLL_MS));
-    if (muted() || foreground()) continue;
+    if (muted() || gone() || foreground()) continue;
     const t0 = performance.now();
     if (!stop(stops.next)) {
       stops.notSent();
@@ -572,6 +821,12 @@ export class LineReader extends EventEmitter {
    * still believes it raw, so {@link retake} turns raw mode off first (libuv applies only changes).
    */
   private modeLost = false;
+  /**
+   * The input was kiro-claude's controlling terminal when the reader went {@link away}: once it is
+   * not any more (a hangup, the session's end: no SIGHUP reaches an orphaned group that is not
+   * stopped), the input ends as at a hangup at the retake, nothing touched (r12 #4).
+   */
+  private awayOnTty = false;
   private suspended = false;
   private typeahead: [string | undefined, Key][] = [];
   private readlineAddedHistory = false;
@@ -594,10 +849,31 @@ export class LineReader extends EventEmitter {
   /** When the heartbeat last ran, or started. */
   private beatAt = 0;
   /**
-   * The heartbeat saw a gap and paused the input ({@link onBeat}) until the check phase after the
-   * next poll ({@link unpark}), unless a SIGCONT in that poll ({@link continued}) decides first.
+   * The heartbeat saw a gap and paused the input ({@link onBeat}; or an approval read started with
+   * the beat overdue, {@link overdue}) until the check phase after the next poll ({@link unpark}),
+   * unless a SIGCONT in that poll ({@link continued}) decides first.
    */
   private parked = false;
+  /**
+   * The input was given back after it was held ({@link release}): set from then until the second
+   * check phase after it, while what is read was already waiting in the terminal (r12 #0).
+   */
+  private releasing: object | undefined;
+  /**
+   * Keys read now for this read (the active one) were typed before its question was drawn: they
+   * are dropped ({@link dropAhead}). Set by {@link release} for a {@link PendingRead.held} read and
+   * for a discarding read that starts while {@link releasing}; cleared with it.
+   */
+  private dropFor: PendingRead | undefined;
+  /** A bracketed paste whose start was dropped for this read: dropped up to its end too. */
+  private dropPaste: PendingRead | undefined;
+  /**
+   * The reader stopped itself (Ctrl+Z's SIGTSTP in {@link jobStop}, the self-stop in {@link
+   * lookAgain}) and its SIGCONT has not been dispatched yet: the next SIGCONT is that stop's own
+   * ({@link continued}, r12 #3). Cleared by that SIGCONT, and at the first heartbeat after the
+   * retake (a stop the kernel discarded sends none).
+   */
+  private ownContPending = false;
   /**
    * The input ended right after a stop while it was still the controlling terminal: canonical
    * mode's end of file (a Ctrl+D typed while the shell had the terminal), not a hangup ({@link
@@ -628,7 +904,10 @@ export class LineReader extends EventEmitter {
       if (opts.completer) ifOpts.completer = opts.completer;
       const out = opts.output as unknown as Partial<EventEmitter>;
       const resizeBefore = new Set(out.listeners?.('resize') ?? []);
-      this.rl = readline.createInterface(ifOpts);
+      // readline's constructor turns raw mode on before this reader's 'error' listener (below)
+      // exists: on a hung-up terminal its EIO was thrown out of createInterface, and the REPL
+      // ended with 'setRawMode EIO' without closing its session (r12 #4); turned on below instead
+      this.rl = withoutRawSwitch(opts.input, () => readline.createInterface(ifOpts));
       this.guardResize(out, resizeBefore);
       const hist = this.rlHistory();
       if (hist && opts.history) {
@@ -659,11 +938,6 @@ export class LineReader extends EventEmitter {
         // in the shell's cooked mode, read before the stop was seen (r11 #0)
         if (this.beat && performance.now() - this.beatAt > INPUT_GAP_MS && this.controlling()) this.eofTyped = true;
       });
-      // Bracketed paste keeps pasted newlines inside one input.
-      this.output.write('\u001b[?2004h');
-      // keys typed after `fg` while the chat waited off the terminal were queued in its cooked mode
-      if (opts.cooked) this.takeCooked();
-      this.syncBeat();
     } else {
       this.rl = readline.createInterface({ input: opts.input, terminal: false, crlfDelay: Infinity });
       this.rl.on('line', (line: string) => this.onPipeLine(line));
@@ -680,6 +954,38 @@ export class LineReader extends EventEmitter {
       if (this.terminal) this.inputEnded = true;
       this.onClose();
     });
+    if (this.terminal) this.takeTerminal(opts.cooked === true);
+  }
+
+  /**
+   * The constructor takes the terminal once its 'error' listener is there: raw mode on (an EIO, a
+   * hung-up terminal, is the input's end, {@link hungUp}: every read gets `eof`; r12 #4), bracketed
+   * paste on (it keeps pasted newlines inside one input), the keys typed after `fg` while the chat
+   * waited off the terminal read as queued in its cooked mode (`cooked`, {@link takeCooked}), and
+   * the heartbeat started.
+   */
+  private takeTerminal(cooked: boolean): void {
+    const inp = this.input as NodeJS.ReadStream;
+    try {
+      if (typeof inp.setRawMode === 'function') inp.setRawMode(true);
+    } catch {
+      // ignore
+    }
+    if (this.ended) return; // a hung-up terminal: setRawMode failed (EIO), the input ended
+    this.output.write('\u001b[?2004h');
+    if (cooked) this.takeCooked();
+    this.syncBeat();
+  }
+
+  /**
+   * The input ends as at a hangup ({@link hungUp}: every read gets `eof`), nothing of the terminal
+   * touched: the REPL's hand-back after a child found the terminal session over while it waited
+   * off the terminal (repl/core.ts handBack; an orphaned process group gets no SIGHUP, r12 #4).
+   */
+  endAsHungUp(): void {
+    if (this.closed || this.ended) return;
+    if (this.terminal) this.inputEnded = true;
+    this.onClose();
   }
 
   /** Whether a read is waiting for input. */
@@ -745,8 +1051,22 @@ export class LineReader extends EventEmitter {
       this.showPrompt(pending);
       if (!this.terminal) this.drainQueue();
       else if (this.ended) this.finish(pending, { kind: 'eof' });
-      else if (opts.discardTypeahead) this.typeahead = [];
-      else this.replayTypeahead();
+      else if (opts.discardTypeahead) {
+        this.typeahead = [];
+        // the input is held (r12 #0): what the terminal holds meanwhile was typed before this
+        // question, and is dropped once the input is given back; or it is being given back now
+        if (this.parked || this.away) pending.held = true;
+        else if (this.releasing) this.dropFor = pending;
+        else if (this.overdue()) {
+          // a stall ended in these callbacks, after Claude Code's request was read and before its
+          // question was drawn (a long synchronous step, a write to a terminal that does not drain,
+          // a stop that landed in JavaScript): the keys typed during it are still in the terminal,
+          // or later in this poll's batch, and were read into the approval (r12 verification). The
+          // input is parked now, as the overdue heartbeat would have, and they are dropped
+          pending.held = true;
+          this.park();
+        }
+      } else this.replayTypeahead();
     });
   }
 
@@ -998,6 +1318,7 @@ export class LineReader extends EventEmitter {
     }
     if (k.name === 'paste-start') this.inPaste = true;
     else if (k.name === 'paste-end') this.inPaste = false;
+    if (this.dropAhead(k)) return true;
     if (isCtrlZ(k) && (this.inPaste || this.suspended || this.top())) {
       // a read is active: stop now; in a paste or while a child owns the terminal: dropped.
       // While no read is active (a turn runs) it is kept as type-ahead below: the stop waits
@@ -1049,6 +1370,48 @@ export class LineReader extends EventEmitter {
     return false;
   }
 
+  /**
+   * A key that was typed before the active read's question was drawn ({@link dropFor}: it waited
+   * in the terminal while the input was held, r12 #0) is dropped, as type-ahead always is at an
+   * approval prompt: not echoed, not kept in its line, not read as a Ctrl+D, Ctrl+Z or Shift+Tab;
+   * a bracketed paste that starts among them is dropped up to its end. A Ctrl+C is handled before
+   * (it interrupts, as at once). True when `k` was dropped.
+   */
+  private dropAhead(k: Key): boolean {
+    const t = this.top();
+    if (!t || this.suspended || (this.dropFor !== t && this.dropPaste !== t)) return false;
+    if (k.name === 'paste-start') this.dropPaste = t;
+    else if (k.name === 'paste-end') this.dropPaste = undefined;
+    // a dropped Return's LF (the second half of CRLF) is not read as Ctrl+J at the question
+    this.lastReturnAt = k.name === 'return' && !k.meta ? Date.now() : 0;
+    return true;
+  }
+
+  /**
+   * The input is given back after it was held ({@link unpark}, {@link retake}; r12 #0): what is
+   * read before the second check phase from now (whichever phase this runs in) already waited in
+   * the terminal, as for {@link takeCooked}. For a discarding read that started while it was held
+   * ({@link PendingRead.held}), or that starts meanwhile ({@link readImpl}), those keys were typed
+   * before its question was drawn (Claude Code's request was read first: the park keeps the
+   * terminal unread for a poll while the pipe is read, and a continue is taken in two event-loop
+   * turns), so they are dropped ({@link dropAhead}), as they were when read as type-ahead before
+   * the request. Nothing for any other read: the prompt and a question take them, as typed.
+   */
+  private release(): void {
+    const t = this.top();
+    this.dropFor = t !== undefined && (t.held === true || this.dropFor === t) ? t : undefined;
+    for (const p of this.stack) p.held = false;
+    const mark = {};
+    this.releasing = mark;
+    setImmediate(() =>
+      setImmediate(() => {
+        if (this.releasing !== mark) return;
+        this.releasing = undefined;
+        this.dropFor = undefined;
+      }),
+    );
+  }
+
   /** Ctrl+C (also used for a process SIGINT in line mode). */
   ctrlC(): void {
     // While a child owns the terminal (`!cmd`, `$EDITOR`) the SIGINT is the child's: it stops
@@ -1077,7 +1440,8 @@ export class LineReader extends EventEmitter {
    * the way the terminal's own Ctrl+Z would, then take the terminal back. Nothing on Windows (no
    * job control, as readline), without an active read (a turn runs: the Ctrl+Z waits as
    * type-ahead), after the input's end, while a child owns the terminal (its own job control
-   * applies) or while muted (a fatal signal: keys are dropped). An active read can be an approval
+   * applies), while muted (a fatal signal: keys are dropped), or as a PID namespace's init on Linux
+   * (which no default-action stop can stop, r12 #2: the key is dropped). An active read can be an approval
    * prompt in the middle of a turn, with other calls' hook commands still running: they go on
    * while kiro-claude is stopped, and the stop does not count against their timeouts
    * (util/process.ts runningTimeout; one that exited meanwhile keeps its exit status, r8 #0/#1).
@@ -1088,6 +1452,11 @@ export class LineReader extends EventEmitter {
    */
   private jobStop(): void {
     if (process.platform === 'win32' || this.closed || this.ended || this.suspended || this.away || this.muted()) return;
+    // a PID namespace's init (`unshare --fork --pid --mount-proc kiro-claude chat`): the kernel
+    // ignores a default-action stop for it, so SIGTSTP stopped only the rest of its group (unshare),
+    // the shell took the terminal and the chat ran on behind it (r12 #2): Ctrl+Z does nothing there,
+    // as for a session leader
+    if (process.platform === 'linux' && process.pid === 1) return;
     const inp = this.input as NodeJS.ReadStream;
     const t = this.top();
     if (!t) return;
@@ -1104,9 +1473,12 @@ export class LineReader extends EventEmitter {
     // again, SIGTTIN), nothing drawn
     this.away = true;
     this.modeLost = false;
+    this.awayOnTty = this.controlling();
     this.rl.pause();
     this.syncBeat();
     const t0 = performance.now();
+    // the next SIGCONT is this stop's own (r12 #3)
+    this.ownContPending = true;
     try {
       // returns once the group continues (fg, bg), or at once when the stop is discarded
       process.kill(0, 'SIGTSTP');
@@ -1127,15 +1499,21 @@ export class LineReader extends EventEmitter {
    * terminal in its own (cooked) mode, where Enter would be a soft newline and Ctrl+D an end of
    * input: it is taken back as after {@link jobStop} ({@link scheduleRetake}), the active read's
    * prompt drawn on the shell's fresh line. Nothing of the terminal is touched here, inside the
-   * SIGCONT dispatch (r9 #0/#1). Not for the SIGCONT of a stop whose retake is scheduled or has
-   * just run, while a child owns the terminal, or once the input ended; while muted (a fatal
-   * signal closes kiro-claude) the input is only paused. A stop from elsewhere that the heartbeat
-   * saw ({@link onBeat}) parked the input before this poll, so the keys the shell queued are
-   * still in the terminal, read at the retake as typed ({@link takeCooked}; r11 #0: this listener
-   * runs after the other I/O of its poll, and pausing here alone came after they were read); this
+   * SIGCONT dispatch (r9 #0/#1). Not for the SIGCONT of a stop whose retake is scheduled, nor for
+   * the reader's own stop's SIGCONT dispatched within {@link OWN_CONT_MS} after its retake (only
+   * while {@link ownContPending}: a stop from elsewhere and its `fg` right after a retake is
+   * taken back too, r12 #3), while a child owns the terminal, or once the input ended; while
+   * muted (a fatal signal closes kiro-claude) the input is only paused. A stop from elsewhere that
+   * the heartbeat saw ({@link onBeat}) parked the input before this poll, so the keys the shell
+   * queued are still in the terminal, read at the retake as typed ({@link takeCooked}; r11 #0:
+   * this listener runs after the other I/O of its poll, and pausing here alone came after they
+   * were read), or dropped for an approval asked in the meantime ({@link release}, r12 #0); this
    * SIGCONT decides the park: it was a stop.
    */
   private continued(): void {
+    // the SIGCONT of the reader's own stop, if one was still to come (r12 #3)
+    const own = this.ownContPending;
+    this.ownContPending = false;
     const parked = this.parked;
     this.parked = false;
     if (this.closed || this.ended || this.suspended) return;
@@ -1145,14 +1523,18 @@ export class LineReader extends EventEmitter {
       return;
     }
     if (this.retakePending) return;
-    if (!this.away && performance.now() - this.retakenAt < OWN_CONT_MS) {
+    if (!this.away && own && performance.now() - this.retakenAt < OWN_CONT_MS) {
       // (a park needs a gap longer than this since the retake: not reached; given back all the same)
-      if (parked) this.rl.resume();
+      if (parked) {
+        this.rl.resume();
+        this.release();
+      }
       return;
     }
     if (!this.away) {
       this.away = true;
       this.modeLost = true;
+      this.awayOnTty = this.controlling();
       this.rl.pause();
       this.syncBeat();
     }
@@ -1189,12 +1571,24 @@ export class LineReader extends EventEmitter {
    * the input is paused already.
    */
   private onBeat(): void {
+    // an own stop's SIGCONT is dispatched before its retake, and the beat runs only from then on:
+    // one still to come here belongs to a stop the kernel discarded, which sends none (r12 #3)
+    this.ownContPending = false;
     const now = performance.now();
     const gap = now - this.beatAt;
     this.beatAt = now;
     if (gap <= INPUT_GAP_MS || this.parked) return;
     if (this.closed || this.ended || this.away || this.suspended || this.muted()) return;
     if ((this.rl as unknown as { paused?: boolean }).paused === true) return;
+    this.park();
+  }
+
+  /**
+   * Park the input ({@link onBeat}): paused, its reading stopped (also for the rest of this poll's
+   * callbacks), given back in the next check phase ({@link unpark}) unless a SIGCONT decides first.
+   */
+  private park(): void {
+    this.beatAt = performance.now();
     this.parked = true;
     this.rl.pause();
     stopReading(this.input);
@@ -1202,18 +1596,31 @@ export class LineReader extends EventEmitter {
   }
 
   /**
+   * The event loop got no turn for longer than {@link INPUT_GAP_MS} and the heartbeat has not run
+   * since (it is overdue): a stall, or a stop from elsewhere, ended in the callbacks running now,
+   * and what the terminal holds was typed during it (r12 verification: {@link readImpl}).
+   */
+  private overdue(): boolean {
+    if (this.beat === undefined || this.parked || this.closed || this.ended || this.away || this.suspended || this.muted()) return false;
+    return performance.now() - this.beatAt > INPUT_GAP_MS;
+  }
+
+  /**
    * The check phase after the poll that followed a park ({@link onBeat}) with no SIGCONT in it
    * ({@link continued} decides otherwise): no stop, the event loop was blocked. The input goes on
    * as if nothing happened: resumed (unless something else holds it meanwhile: away, a child,
    * closed; a prompt drawn meanwhile left it paused, {@link promptLine}), nothing drawn, no mode
-   * changed, the keys read in order and raw, as typed. A stop that came after that poll had begun
-   * is seen by the next beat (the gap is still there).
+   * changed, the keys read raw, in the order typed, but after the Claude Code output read during
+   * the park: for an approval asked in it they were typed before its question, and are dropped
+   * ({@link release}, r12 #0). A stop that came after that poll had begun is seen by the next beat
+   * (the gap is still there).
    */
   private unpark(): void {
     if (!this.parked) return;
     this.parked = false;
     if (this.closed || this.ended || this.away || this.suspended) return;
     if ((this.rl as unknown as { paused?: boolean }).paused === true) this.rl.resume();
+    this.release();
   }
 
   /**
@@ -1245,7 +1652,10 @@ export class LineReader extends EventEmitter {
    * The scheduled retake: nothing while muted (a fatal signal's close runs; the terminal stays as
    * the shell left it, nothing is drawn: r9 #1) nor in the background (`bg`, `kill -CONT` while a
    * shell holds the terminal: off the terminal); else {@link retake}. In the background the reader
-   * looks again every {@link FOREGROUND_POLL_MS} ({@link lookAgain}).
+   * looks again every {@link FOREGROUND_POLL_MS} ({@link lookAgain}). An input that was the
+   * controlling terminal when the reader went away and is not any more (the terminal session
+   * ended: no SIGHUP reaches an orphaned group that is not stopped, and "cannot be told" counts as
+   * the foreground) ends as at a hangup, nothing touched ({@link endAsHungUp}, r12 #4).
    */
   private retakeNow(freshLine: boolean): void {
     this.stopAwayPoll();
@@ -1253,6 +1663,10 @@ export class LineReader extends EventEmitter {
     if (this.suspended) {
       // a child owns the terminal: resume() takes it back
       this.away = false;
+      return;
+    }
+    if (this.awayOnTty && !this.controlling()) {
+      this.endAsHungUp();
       return;
     }
     if (this.foreground()) {
@@ -1281,8 +1695,11 @@ export class LineReader extends EventEmitter {
    * turns on, after the signals that came with it (`kill %1` closes it, muted). While no read waits
    * (a turn runs in the background, its output still written there) it only looks again later; it
    * stops at the turn's next prompt. A stop the kernel discards (an orphaned process group) leaves
-   * the poll as before. A SIGCONT comes back through {@link continued} at once. A stop that came
-   * back at once makes the next one a SIGTSTP ({@link TerminalStops}).
+   * the poll as before. A SIGCONT comes back through {@link continued} at once (the stop's own:
+   * {@link ownContPending}). A stop that came back at once makes the next one a SIGTSTP ({@link
+   * TerminalStops}). The question of a read that waits here was written to the terminal before
+   * the look: keys typed after `fg` are typed at it, not dropped as typed before it ({@link
+   * PendingRead.held}).
    */
   private lookAgain(): void {
     if (this.closed || this.ended || !this.away || this.suspended || this.muted() || this.foreground()) {
@@ -1290,9 +1707,14 @@ export class LineReader extends EventEmitter {
       return;
     }
     if (this.top()) {
+      // the question of a read that waits here is on the screen now (written from the background):
+      // what is typed after `fg` is typed at it, so it is read as after any stop (r12 #0)
+      for (const p of this.stack) p.held = false;
       const t0 = performance.now();
       if (this.stopInBackground(this.stops.next)) {
         this.stops.sent(performance.now() - t0);
+        // the next SIGCONT is this stop's own (r12 #3)
+        this.ownContPending = true;
         this.scheduleRetake(true);
         return;
       }
@@ -1357,7 +1779,8 @@ export class LineReader extends EventEmitter {
    * a stop from elsewhere these include the keys typed in the shell before `fg` (the heartbeat
    * parked the input before they were read, r11 #0), except when kiro-claude leads its session:
    * no shell can have taken the terminal, its mode stayed raw, and the keys typed during the stop
-   * are raw keys, read as such.
+   * are raw keys, read as such. For an approval asked since the stop (Claude Code's request was
+   * read while away) they were typed before its question, and are dropped ({@link release}).
    */
   private retake(t: PendingRead | undefined, freshLine: boolean): void {
     const inp = this.input as NodeJS.ReadStream;
@@ -1386,6 +1809,7 @@ export class LineReader extends EventEmitter {
     this.syncBeat();
     if (this.closed || this.ended) return;
     this.rl.resume();
+    this.release();
     if (!keysRaw) this.takeCooked();
     if (this.muted()) return;
     this.output.write('\u001b[?2004h');
@@ -1485,6 +1909,8 @@ export class LineReader extends EventEmitter {
   resume(cooked = false): void {
     if (!this.suspended) return;
     this.suspended = false;
+    // (a read's question was up during the child: what it left is read as typed at it, r10)
+    for (const p of this.stack) p.held = false;
     if (!this.terminal) return;
     this.syncBeat();
     const inp = this.input as NodeJS.ReadStream;
@@ -1527,16 +1953,7 @@ export class LineReader extends EventEmitter {
       return;
     }
     // readline's close() calls the input's setRawMode(false): a no-op stands in while it runs
-    const inp = this.input as unknown as { setRawMode?: unknown };
-    const own = Object.prototype.hasOwnProperty.call(inp, 'setRawMode');
-    const setRawMode = inp.setRawMode;
-    if (typeof setRawMode === 'function') inp.setRawMode = () => inp;
-    try {
-      this.rl.close();
-    } finally {
-      if (own) inp.setRawMode = setRawMode;
-      else delete inp.setRawMode;
-    }
+    withoutRawSwitch(this.input, () => this.rl.close());
   }
 }
 

@@ -63,7 +63,14 @@
  * end of input (repl/input.ts) and cli/main.ts ignores EIO on stdout / stderr, so neither crashes
  * kiro-claude before the close (r5 #1). That end of input reaches the REPL a moment before Node
  * dispatches the hangup's SIGHUP, so the REPL waits for it ({@link ExitSignals.awaitSignal},
- * bounded by {@link DUPLICATE_SIGNAL_WINDOW_MS}) instead of quitting first (r6 #3).
+ * bounded by {@link DUPLICATE_SIGNAL_WINDOW_MS}) instead of quitting first (r6 #3); it waits the
+ * same way when the terminal session ended while it waited off the terminal in an orphaned
+ * process group, which no SIGHUP reaches (r12 #4: it then closes and exits 0).
+ *
+ * As the init of a PID namespace (`unshare --fork --pid --mount-proc kiro-claude chat`) the
+ * re-raised signal is dropped by the kernel (a default-action signal a namespace's init sends
+ * itself): with no listener left for it, the process exits with the signal's status at once (r12
+ * #2), not after the fallback.
  */
 
 import * as os from 'node:os';
@@ -393,8 +400,13 @@ export class ExitSignals {
     this.dispose();
     // claude/lifecycle.ts's forwarder (while children are tracked) or the default disposition ends
     // the process; should anything else swallow the signal, exit with its status
-    setTimeout(() => process.exit(128 + (os.constants.signals[sig] ?? 15)), SIGNAL_EXIT_FALLBACK_MS);
+    const status = 128 + (os.constants.signals[sig] ?? 15);
+    setTimeout(() => process.exit(status), SIGNAL_EXIT_FALLBACK_MS);
     process.kill(process.pid, sig);
+    // a PID namespace's init (`unshare --fork --pid --mount-proc kiro-claude chat`): the kernel
+    // drops a signal at its default action that it sends itself, so with no listener left for it
+    // nothing would end the process before the fallback (r12 #2)
+    if (process.platform === 'linux' && process.pid === 1 && process.listenerCount(sig) === 0) process.exit(status);
   }
 }
 

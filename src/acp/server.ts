@@ -1485,7 +1485,12 @@ export class AcpServer {
     });
   }
 
-  /** `session/set_config_option` (05 §4.9); a `mode` change is cancelled like `set_mode` ({@link swapUnder}). */
+  /**
+   * `session/set_config_option` (05 §4.9); a `mode` change is cancelled like `set_mode`
+   * ({@link swapUnder}), and one that switched the agent is followed, after its `configOptions`
+   * answer, by the same MCP report and `available_commands_update` as `set_mode` (r12 #6/#7: the
+   * report also tells the next prompt to report servers no child started, `mcpUnstarted`).
+   */
   private setConfigOption(p: Record<string, unknown>, rc: RequestContext): Promise<unknown> {
     const st = this.getSession(p.sessionId);
     const configId = str(p.configId);
@@ -1494,6 +1499,7 @@ export class AcpServer {
       if (st.closed) throw sessionNotFound();
       await st.whenReady();
       const value = p.value;
+      const agentBefore = st.session.agent.name;
       switch (configId) {
         case 'model':
           if (typeof value !== 'string') throw invalidParams('model value must be a string');
@@ -1516,7 +1522,12 @@ export class AcpServer {
           throw invalidParams(`Unknown config option: ${configId}`);
       }
       const entries = await this.listModels(st);
-      return { configOptions: configOptions(entries, st.session.model, st.session.effort) };
+      const result = { configOptions: configOptions(entries, st.session.model, st.session.effort) };
+      if (agentBefore === st.session.agent.name) return result;
+      return respondThen(result, async () => {
+        await this.reportMcp(st);
+        this.update(st.id, availableCommandsUpdate(loadPrompts(st.ws)));
+      });
     });
   }
 

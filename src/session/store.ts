@@ -19,12 +19,30 @@
  * Writes are atomic (temp + rename), files 0600, the directory is created 0700.
  *
  * Locks: `<sid>.lock` = `{"pid":N,"started_at":"<iso>","host":"<hostname>"}` (the shape
- * KiroCrew understands, 08a §4.2), created exclusively (hard link of a fully written temp
- * file, so a lock is never observed half-written). An existing lock held by a live process of
- * this host other than us ⇒ `Failed to start session: Session is active in another process
- * (PID N)`; a lock from a dead PID, an unreadable lock, or one written by this process is
- * taken over. A lock written on another host cannot be checked and is treated as live
+ * KiroCrew understands, 08a §4.2; it reads `pid` only), plus on Linux `"boot_id"` (this boot's
+ * `/proc/sys/kernel/random/boot_id`) and `"start_ticks"` (the writer's start time, field 22 of
+ * `/proc/self/stat`), which tie the lock to the process that wrote it. Created exclusively (hard
+ * link of a fully written temp file, so a lock is never observed half-written). An existing lock
+ * held by a live process of this host other than us ⇒ `Failed to start session: Session is active
+ * in another process (PID N)`; a lock from a dead PID, an unreadable lock, or one written by this
+ * process is taken over. A lock written on another host cannot be checked and is treated as live
  * (DECISION). `release()` removes the lock only while it is still ours.
+ *
+ * Hung-up holder (r12 #1, DECISION): a chat stopped for good with a hangup or kill pending keeps
+ * its lock until it is continued, since a stopped process runs no handler. Under `sudo` with
+ * `use_pty`, closing the terminal of a chat stopped in the background (Ctrl+Z, or the chat's own
+ * stop after `bg`, `&`, a `!cmd` that ended there) leaves it so: sudo passes the SIGHUP on but never
+ * continues the command once the user's terminal is gone, as for any program it runs. So when the
+ * holder is such a process ({@link hungUpLockHolder}: Linux; this host and boot; state `T`, a
+ * job-control stop, never a ptrace stop `t`; SIGHUP or SIGTERM pending in `/proc/<pid>/status`
+ * SigPnd or ShdPnd; our real and effective uid; its start time the lock's `start_ticks`, so a
+ * reused pid or a lock without these fields is never signalled; and the lock file a regular file
+ * of our effective uid, not a symbolic link, since anyone can read those facts of any process),
+ * {@link SessionStore.acquireLock} sends it SIGCONT (nothing else), which lets the pending signal close it as at a hangup (its
+ * SessionEnd hooks run, its record is saved, its lock released, within its 2 s close grace), and
+ * waits for that, blocking, up to {@link HUNG_UP_HOLDER_WAIT_MS}, before it takes the lock as for a
+ * dead holder. A holder that is still running then keeps the error. Any other live holder (a chat
+ * stopped by Ctrl+Z in a terminal still open: nothing pending) is never touched.
  */
 
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -33,6 +51,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import type { AgentTrust, SessionRecord, SessionTurnRecord, WorkspaceContext } from '../types.js';
 import { mkdirp, writeJsonAtomic } from '../util/fsx.js';
+import { log } from '../util/log.js';
 import { expandTilde, realpathSafe } from '../util/paths.js';
 // (kiroFiles.ts imports this module too: both only call each other's functions, never at load)
 import { recordNeverUsed } from './kiroFiles.js';
@@ -272,6 +291,10 @@ interface LockData {
   pid: number;
   started_at: string;
   host?: string;
+  /** This boot's id (`/proc/sys/kernel/random/boot_id`) when the lock was written (Linux). */
+  boot_id?: string;
+  /** The writer's start time, field 22 of `/proc/<pid>/stat` (clock ticks since boot; Linux). */
+  start_ticks?: number;
 }
 
 function parseLock(text: string): LockData | undefined {
@@ -280,10 +303,202 @@ function parseLock(text: string): LockData | undefined {
     if (!isObj(v) || typeof v.pid !== 'number' || !Number.isInteger(v.pid) || v.pid <= 0) return undefined;
     const l: LockData = { pid: v.pid, started_at: str(v.started_at, '') };
     if (typeof v.host === 'string') l.host = v.host;
+    if (typeof v.boot_id === 'string' && v.boot_id !== '') l.boot_id = v.boot_id;
+    if (typeof v.start_ticks === 'number' && Number.isSafeInteger(v.start_ticks) && v.start_ticks >= 0) l.start_ticks = v.start_ticks;
     return l;
   } catch {
     return undefined;
   }
+}
+
+/** `<root>/<pid>/stat`: the pid it names, its state (field 3) and start time (field 22); undefined when unreadable. */
+function procStat(root: string, pid: number | 'self'): { pid: number; state: string; start: number } | undefined {
+  let text: string;
+  try {
+    text = fs.readFileSync(path.join(root, String(pid), 'stat'), 'latin1');
+  } catch {
+    return undefined;
+  }
+  const close = text.lastIndexOf(')');
+  if (close < 0) return undefined;
+  // after ") ": state(3) ppid(4) … starttime(22) → indices 0 … 19 (the comm field may hold spaces)
+  const f = text.slice(close + 2).split(' ');
+  const p = Number.parseInt(text, 10);
+  const start = Number(f[19]);
+  if (!Number.isInteger(p) || !f[0] || !Number.isSafeInteger(start)) return undefined;
+  return { pid: p, state: f[0], start };
+}
+
+/** `<root>/sys/kernel/random/boot_id`, undefined when unreadable. */
+function bootId(root: string): string | undefined {
+  try {
+    return fs.readFileSync(path.join(root, 'sys', 'kernel', 'random', 'boot_id'), 'latin1').trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** This process's `boot_id` / `start_ticks` for its locks (read once); null off Linux or when /proc is not ours. */
+let ownIdentity: { boot_id: string; start_ticks: number } | null | undefined;
+function lockIdentity(): { boot_id: string; start_ticks: number } | Record<string, never> {
+  if (ownIdentity === undefined) {
+    ownIdentity = null;
+    if (process.platform === 'linux') {
+      const self = procStat('/proc', 'self');
+      const boot = bootId('/proc');
+      if (self && self.pid === process.pid && boot) ownIdentity = { boot_id: boot, start_ticks: self.start };
+    }
+  }
+  return ownIdentity ?? {};
+}
+
+/**
+ * What {@link hungUpLockHolder} reads: the proc file system (default `/proc`) and our real and
+ * effective user ids (default this process's). A seam for tests.
+ */
+export interface LockProcView {
+  procRoot?: string;
+  uid?: number;
+  euid?: number;
+}
+
+/** SIGHUP (1) and SIGTERM (15) in a `/proc/<pid>/status` signal mask: bits 0 and 14. */
+const HANGUP_OR_TERM_BITS = (1 << 0) | (1 << 14);
+
+/**
+ * How long an open waits for a hung-up holder it continued to close and give up its lock
+ * ({@link SessionStore.acquireLock}): the chat's close grace (2 s, `SIGNAL_CLOSE_GRACE_MS`) and a
+ * margin. A blocking wait (the lock is taken synchronously).
+ */
+export const HUNG_UP_HOLDER_WAIT_MS = 3000;
+const HUNG_UP_POLL_MS = 20;
+
+/**
+ * True when lock `text` is held by a process that is stopped for good with a hangup or a kill
+ * pending and that we may continue so it closes (module doc, "Hung-up holder"): Linux; the lock
+ * names this host, this boot and the holder's start time (so the pid is the process that wrote it,
+ * not a reused one); /proc describes our own pid namespace; the process is in state `T` (a
+ * job-control stop; a ptrace stop `t` is never touched); SIGHUP or SIGTERM is pending (SigPnd or
+ * ShdPnd); its real and effective uid are ours. Anything unreadable ⇒ false. (Before it acts,
+ * acquireLock also requires the lock file itself to be ours, {@link ownLockFile}.)
+ */
+export function hungUpLockHolder(text: string, view: LockProcView = {}): boolean {
+  const l = parseLock(text);
+  return l !== undefined && hungUpHolder(l, view);
+}
+
+function hungUpHolder(l: LockData, view: LockProcView = {}): boolean {
+  if (process.platform !== 'linux') return false;
+  if (l.host !== os.hostname() || l.pid === process.pid || l.boot_id === undefined || l.start_ticks === undefined) return false;
+  const root = view.procRoot ?? '/proc';
+  const uid = view.uid ?? process.getuid?.();
+  const euid = view.euid ?? process.geteuid?.();
+  if (uid === undefined || euid === undefined) return false;
+  if (procStat(root, 'self')?.pid !== process.pid || bootId(root) !== l.boot_id) return false;
+  const st = procStat(root, l.pid);
+  if (!st || st.pid !== l.pid || st.state !== 'T' || st.start !== l.start_ticks) return false;
+  let status: string;
+  try {
+    status = fs.readFileSync(path.join(root, String(l.pid), 'status'), 'latin1');
+  } catch {
+    return false;
+  }
+  const ids = /^Uid:\s+(\d+)\s+(\d+)/m.exec(status);
+  if (!ids || Number(ids[1]) !== uid || Number(ids[2]) !== euid) return false;
+  let bits = 0;
+  let masks = 0;
+  for (const m of status.matchAll(/^(?:SigPnd|ShdPnd):\s*([0-9a-fA-F]+)\s*$/gm)) {
+    bits |= Number.parseInt(m[1]!.slice(-4), 16);
+    masks++;
+  }
+  return masks > 0 && (bits & HANGUP_OR_TERM_BITS) !== 0;
+}
+
+/** A hung-up holder this open continued: its pid, its start time, and how long we wait for it. */
+interface Continued {
+  pid: number;
+  start: number;
+  until: number;
+}
+
+/**
+ * Whether `pid` is still the process that started at `start` and has not exited (a zombie has).
+ * An entry that cannot be read counts as running while the pid exists (never a live holder's lock
+ * taken for a gone one).
+ */
+function stillRunning(pid: number, start: number): boolean {
+  const st = procStat('/proc', pid);
+  if (!st) return pidAlive(pid);
+  return st.start === start && st.state !== 'Z' && st.state !== 'X';
+}
+
+/** Lock `l` was written by the process `c` names (it may take its lock again while it closes). */
+function writtenBy(l: LockData, c: Continued): boolean {
+  return l.pid === c.pid && l.start_ticks === c.start && l.host === os.hostname();
+}
+
+function sleepSync(ms: number): void {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    // ignore
+  }
+}
+
+/** Until the lock file no longer reads `text`, the holder has exited, or `c.until` (a blocking poll). */
+function waitForHolder(lockPath: string, text: string, c: Continued): void {
+  for (;;) {
+    const left = c.until - Date.now();
+    if (left <= 0 || readText(lockPath) !== text || !stillRunning(c.pid, c.start)) return;
+    sleepSync(Math.min(HUNG_UP_POLL_MS, left));
+  }
+}
+
+/**
+ * The lock file at `lockPath` is a regular file (not a symbolic link) owned by our effective uid
+ * that still reads `text`, read through one descriptor (owner and content of the same file). Its
+ * pid, boot id and start time are facts anyone can read of any process, so only a lock we (our
+ * uid) wrote ties them to the process that wrote it (r12 #1 verification: a lock another user
+ * could write, in a session index of theirs that root opens under `sudo -E`, named any of our
+ * stopped processes).
+ */
+function ownLockFile(lockPath: string, text: string): boolean {
+  const euid = process.geteuid?.();
+  if (euid === undefined) return false;
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(lockPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const st = fs.fstatSync(fd);
+    return st.isFile() && st.uid === euid && fs.readFileSync(fd, 'utf8') === text;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+/**
+ * The hung-up holder of lock `text` ({@link hungUpLockHolder}, in a lock file of ours,
+ * {@link ownLockFile}), continued with SIGCONT and waited for ({@link waitForHolder}); undefined
+ * (nothing sent) when the holder is not one.
+ */
+function continueHungUp(lockPath: string, text: string, l: LockData): Continued | undefined {
+  if (!hungUpHolder(l) || !ownLockFile(lockPath, text)) return undefined;
+  try {
+    process.kill(l.pid, 'SIGCONT');
+  } catch {
+    return undefined;
+  }
+  log.warn(`session lock ${path.basename(lockPath)}: PID ${l.pid} is stopped with a hangup or kill pending; sent it SIGCONT so that it closes`);
+  const c: Continued = { pid: l.pid, start: l.start_ticks!, until: Date.now() + HUNG_UP_HOLDER_WAIT_MS };
+  waitForHolder(lockPath, text, c);
+  return c;
 }
 
 /** True when `pid` names a running process (EPERM counts as running). */
@@ -591,12 +806,19 @@ export class SessionStore {
     return { pid: l.pid, startedAt: l.started_at, ...(l.host !== undefined ? { host: l.host } : {}), live: heldByOther(l) || l.pid === process.pid };
   }
 
-  /** Take the single-process lock for a session (see module doc). */
+  /**
+   * Take the single-process lock for a session (see module doc). A hung-up holder (module doc) is
+   * continued once and waited for, blocking, up to {@link HUNG_UP_HOLDER_WAIT_MS}, also while it
+   * takes its lock again for a moment as it closes (the chat's record made the newest); once it has
+   * exited, a lock it left is taken over as a dead holder's. Two opens racing for it: one gets the
+   * lock, the other the 'Session is active in another process' error.
+   */
   acquireLock(id: string): SessionLock {
     const lockPath = this.lockPathFor(id);
     this.ensureDir();
-    const mine: LockData = { pid: process.pid, started_at: uniqueLockTime(), host: os.hostname() };
+    const mine: LockData = { pid: process.pid, started_at: uniqueLockTime(), host: os.hostname(), ...lockIdentity() };
     const data = `${JSON.stringify(mine)}\n`;
+    let continued: Continued | undefined;
     for (let attempt = 0; attempt < 8; attempt++) {
       if (createExclusive(lockPath, data)) {
         let released = false;
@@ -620,7 +842,22 @@ export class SessionStore {
       if (text === undefined) continue; // released meanwhile: retry
       const l = parseLock(text);
       if (l && heldByOther(l)) {
-        throw new Error(`Failed to start session: Session is active in another process (PID ${l.pid})`);
+        const active = new Error(`Failed to start session: Session is active in another process (PID ${l.pid})`);
+        if (continued && writtenBy(l, continued)) {
+          // the holder we continued, still closing: wait on (a wait is no attempt; `until` bounds
+          // it); once it has exited (a zombie too) its lock is stale
+          if (stillRunning(continued.pid, continued.start)) {
+            if (Date.now() >= continued.until) throw active;
+            waitForHolder(lockPath, text, continued);
+            attempt--;
+            continue;
+          }
+        } else if (!continued && (continued = continueHungUp(lockPath, text, l))) {
+          attempt--;
+          continue;
+        } else {
+          throw active;
+        }
       }
       // stale (dead pid), unreadable, or our own: take it over if it is still the same file
       if (readText(lockPath) === text) {

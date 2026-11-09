@@ -183,11 +183,23 @@ export async function runChatCommand(args: string[], ctxIn: CliContext, deps: Ch
     if (p.has('delete-session')) {
       const id = p.value('delete-session')!;
       const lock = store.read(id) ? store.lockInfo(id) : undefined;
+      // A live holder refuses, except a chat stopped for good with a hangup or kill pending (sudo
+      // use_pty after its terminal closed): acquireLock continues it so that it closes, as for
+      // `chat --resume` (session/store.ts, "Hung-up holder"); the lock is held while deleting, so
+      // that chat's last write (its record made the newest) cannot bring the record back. A chat
+      // that never had a message drops its record at that close: gone as asked, so it is deleted.
+      let held: { release(): void } | undefined;
       if (lock?.live && lock.pid !== process.pid) {
-        err(ctx, `error: Session is active in another process (PID ${lock.pid})`);
-        return 1;
+        try {
+          held = store.acquireLock(id);
+        } catch {
+          err(ctx, `error: Session is active in another process (PID ${store.lockInfo(id)?.pid ?? lock.pid})`);
+          return 1;
+        }
       }
-      if (!store.delete(id)) {
+      const deleted = store.delete(id) || (held !== undefined && !store.read(id));
+      held?.release();
+      if (!deleted) {
         err(ctx, `error: no saved chat session with id '${id}'`);
         return 1;
       }
