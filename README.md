@@ -115,8 +115,9 @@ In chat:
   interrupted or the start of the chat that continues a `/spec`, is cancelled by the **next
   Ctrl+C**.
 * A **second Ctrl+C** stops Claude Code when the turn is still running 1 s later. Your next input
-  restarts it with the conversation (`--resume`); a Ctrl+C while the restarted session runs its
-  agentSpawn hooks cancels the restart. An idle Claude Code is never stopped this way.
+  restarts it with the conversation (`--resume`), once the stopped session has finished closing;
+  a Ctrl+C while the restart waits for that or the restarted session runs its agentSpawn hooks
+  cancels the restart. An idle Claude Code is never stopped this way.
 * At the prompt, Ctrl+C or Ctrl+D twice exits (or type `/quit`).
 * **Ctrl+Z** suspends kiro-claude like any terminal program; `fg` brings the chat back with what
   you had typed. Pressed while the agent works, it takes effect at the next prompt, once however
@@ -343,7 +344,10 @@ example in Zed's `settings.json`:
 ```
 
 Tool permission requests appear in the editor. Sessions are stored in `~/.kiro/sessions/cli`
-and can be loaded again.
+and can be loaded again. A `session/load` of a session the server is still closing (after
+`_kiro.dev/session/terminate` or `session/close`, whose answer comes within 5 s while the close
+may go on) waits for that close to finish, and loads what it saved; a close still running after
+20 s makes the load answer `Session is active in another process`, which KiroCrew retries.
 
 `session/cancel` also stops a Kiro command that is waiting for Claude Code: a
 `_kiro.dev/commands/execute` such as `usage` or `compact` answers `Command cancelled`, and `/usage`

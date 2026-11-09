@@ -673,7 +673,9 @@ export interface KiroSessionOptions {
    * Start in plan mode: set on the record before it is first written, so a crash while the
    * session starts (agentSpawn hooks, Claude Code's start) never leaves it on disk outside plan
    * mode. A record saved in plan mode stays in it either way (false / unset keep the record's own).
-   * Used by `/chat new|load|resume` from a chat in plan mode.
+   * Used by `/chat new|load|resume` from a chat in plan mode, and by the REPL's restart after a
+   * forced stop of a session in plan mode (a record another chat took out of it meanwhile stays
+   * in it, r12h).
    */
   planMode?: boolean;
   /** Resume an existing kiro-claude session id, or the newest for this cwd. */
@@ -887,7 +889,11 @@ export interface ReplHost {
   runTurn(input: PromptInput): Promise<TurnResult>;
   /** Swap the active session (e.g. a spec task child session); the old one is NOT closed. */
   replaceSession(next: KiroSession): void;
-  /** Create a new session sharing this REPL's UI (approvals render in the REPL). */
+  /**
+   * Create a new session sharing this REPL's UI (approvals render in the REPL). A reopen of a
+   * saved record by id (`resume`) first waits for a session close of this REPL still running
+   * (r12h: it would save its copy of the record over the new session's).
+   */
   createSession(opts: Partial<KiroSessionOptions>): Promise<KiroSession>;
 }
 

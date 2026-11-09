@@ -277,6 +277,20 @@ journal); Claude Code keeps its own transcript, which kiro-claude resumes and fo
   (Kiro's plan mode is the planner agent, which `/chat new` and `/chat load` keep): the next chat
   is in plan mode when the chat is, and a record or export saved in plan mode comes back in it
   even when the chat is not.
+  `/chat resume` takes the record's agent, model and effort as the record has them once its lock
+  is taken, as `chat --resume-id <id>` does, not as its list showed them before the user picked
+  (r12h: a chat in another terminal that reopened the record meanwhile, swapped its agent, model
+  or effort and closed keeps that change; `KiroSessionInternalOptions.resumeDefaults` makes the
+  listed ones, and the chat's effort, defaults for what the record does not name). The launch
+  `--agent`, `--model` and `--effort` do not apply to it (as before; `--effort` only through the
+  chat's effort). Inside a tangent `/chat resume` does not offer the records the tangent returns
+  to (its main conversation, outer tangents and rewinds): they are open in this chat, and a second
+  session of one in the same process would replace this process's own lock on it and have its
+  record overwritten by the chat's close (r12h). It says so (`Not listed: <id>, open in this chat
+  under the tangent (/tangent returns there).`) and refuses one it is asked for. (Q keeps one
+  conversation per chat process: its tangent is a checkpoint of it and `/chat load` replaces all
+  of it, so the case cannot arise there.) A reopen of a saved record by id from the REPL
+  (`/chat resume`, the forced-stop restart) first waits for a forced stop's close still running.
 * **Tangents.** `/tangent` forks the conversation into a tangent and `/tangent` again returns to
   the main one; `/tangent tail` brings the tangent's last question and answer back with it,
   `/tangent merge` a summary. Tangents nest. Plan mode is session state, not part of the tangent's
@@ -393,11 +407,17 @@ journal); Claude Code keeps its own transcript, which kiro-claude resumes and fo
 * A second Ctrl+C: when the turn or command still runs 1 s later (Claude Code did not end it
   after the interrupt), kiro-claude stops Claude Code (`Claude Code did not stop after the
   interrupt; stopping it.`): the session is closed (stdin EOF, SIGTERM after 2 s, then SIGKILL)
-  and the REPL returns to its prompt. The next input restarts it with `--resume`, with the agent,
-  model, trust and plan mode it had; a conversation without a finished turn, which closing
-  drops, starts afresh. A Ctrl+C while the restarted session runs its agentSpawn hooks cancels the
-  restart (`Restart cancelled (Ctrl+C). Claude Code restarts with your next input.`): the hooks
-  are killed and the next input tries again.
+  and the REPL returns to its prompt. The next input restarts it with `--resume`, with the trust
+  it had, plan mode when it or the record is in it, and the agent, model and effort the record
+  has when its lock is taken (the session's own unless a chat in another terminal reopened the
+  record meanwhile and changed them: they are only defaults, `resumeDefaults`, r12h); a
+  conversation without a finished turn, which closing drops, starts afresh. The restart waits for
+  the stopped session's close to end, also past the 10 s the stop itself waits for it (a close
+  still running saves its copy of the record at its end, over the restarted session's; r12h:
+  `The stopped session is still closing; Claude Code restarts once it has closed (Ctrl+C
+  cancels).`). A Ctrl+C during that wait, or while the restarted session runs its agentSpawn
+  hooks, cancels the restart (`Restart cancelled (Ctrl+C). Claude Code restarts with your next
+  input.`): the hooks are killed and the next input tries again.
 * The forced stop only ends a session that has work of its own in flight (`KiroSession.busy`;
   F0 in the code: an idle session is never stopped). A command waiting on another session (a
   `/spec run` task session, `/chat new` starting) or on Claude Code (re)starting is neither
@@ -1040,8 +1060,42 @@ to the session it starts); one of another host counts as live.
   under the lock (a chat that never had a message drops its record at its close) keeps the copy
   read before: the session runs on under the same id (as a new conversation when it never had
   one). `chat --delete-session` reads nothing it writes back; the REPL's makeNewest reads under
-  the lock. Residual: the REPL's `/chat resume` passes the agent, model and effort of the list it
-  showed (read before the user picked) as explicit options, which win over the re-read.
+  the lock. The REPL's `/chat resume` and forced-stop restart read the agent, model and effort
+  before the lock too (the list the user picked from, the stopped session's own) and pass them as
+  `resumeDefaults` (r12h): the record as read here wins, they apply only to what it does not name;
+  so the re-read covers them as it covers a resume without `--agent` / `--model` / `--effort`.
+* **One writer per id in an ACP server (r12h H3).** A session this process still closes holds
+  the lock, and its close runs SessionEnd hooks and then writes its in-memory record; an open of
+  the same id in this process meanwhile would replace that lock (it is our own) and have its
+  record overwritten. `_kiro.dev/session/terminate` (also `session/close`, and `_session/terminate`,
+  which Kiro documents as a notification nobody awaits; KiroCrew sends the first as a request and
+  moves on after 5 s) answers within its 5 s close budget, but the close goes on to its end. So
+  `acp/server.ts` keeps, per id, the closes of
+  that id still running (to the end of the session's own close: after `terminate`, a failed or
+  discarded start, the restart after a stuck cancel) and that restart while it creates the new
+  session (`track`); every open of an existing id waits for them before it reads the record or
+  takes the lock (`untilIdle`): `session/load` (re-checked after every wait together with a load
+  of the same id still starting, so two loads still share one session) and the stuck-cancel
+  restart. The loaded session then reads what the close saved, after its SessionEnd hooks. The
+  wait is bounded by `reopenWaitMs` (four close budgets, 20 s, above a session's own close: its
+  SessionEnd hooks, capped at 5 s, then Claude Code's EOF grace, SIGTERM and SIGKILL); a load
+  still waiting then answers `Failed to start session: Session is active in another process (PID
+  <ours>)` (KiroCrew retries on it) and opens nothing, while the stuck-cancel restart goes ahead as
+  before (a hung close must not block the session for good). A load waiting is cancelled by its
+  `$/cancel_request` (`-32800`) and by the shutdown (`Server is shutting down`); the shutdown
+  gives closes still running from an earlier `terminate` the same budget as the live sessions',
+  so their SessionEnd hooks and record save are not cut short by the exit.
+* **One writer per id in the REPL (r12h H2).** The chat holds its record open, and inside a
+  tangent every record of its tangent stack (`KiroSessionImpl.openRecordIds`): `/chat resume`
+  leaves those out (it says so; /tangent returns there) and refuses one it is asked for. A forced
+  stop waits 10 s at most for the session's close (`FORCE_CLOSE_TIMEOUT_MS`); the REPL keeps that
+  close (`unsettledCloses`) until it ends, and the restart at the next input, like any reopen of a
+  saved record by id through `ReplContext.createSession`, waits for it (a notice says so; Ctrl+C
+  cancels the restart and the next input tries again), unbounded: the close is bounded by its own
+  parts (SessionEnd hooks capped at 5 s, Claude Code's EOF grace, SIGTERM and SIGKILL), so the
+  wait outlasts the 10 s only on a loaded machine or a close stuck in the kernel. Other sessions of
+  the REPL never share a record: `/chat new|load` and the spec runtime's sessions open new ids, and
+  a session `/chat new|resume|load` replaces is closed (awaited) before the command ends.
 
 ## Signals and child processes
 

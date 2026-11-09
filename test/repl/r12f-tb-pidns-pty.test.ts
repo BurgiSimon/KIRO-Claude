@@ -175,8 +175,10 @@ test('r12f #2: as PID 1 of a PID namespace, a start with `&` stays off the termi
     let mark = s.t.screen().length;
     s.t.write(`${UNSHARE} ${chatCommand()} &\r`);
     pid = await chatPidOf(s);
-    // the start finishes, the probe finds the background and stops the job (the chat cannot stop)
-    await waitUntil(() => /Stopped \(tty output\)/.test(s.t.screen().slice(mark)), 'bash reports the job stopped', 30_000).catch(() => undefined);
+    // the start finishes, the probe finds the background and stops the job (the chat cannot stop):
+    // `jobs -l` asked until bash counts the job stopped (bash prints its own notice only before a
+    // prompt, so with nothing typed it never came: waiting for it always took the full 30 s, r12h H4)
+    assert.equal(await stoppedJobState(s.t, 30_000), 'Stopped (tty output)', 'bash counts the job stopped');
     await sleep(1500);
     const ticks = await ticksOver(pid);
     assert.ok(ticks < 40, `CPU ticks over 2 s in the background: ${ticks} (200: one full core)`);
@@ -201,10 +203,10 @@ test('r12f #2: as PID 1 of a PID namespace started with `&`, `kill %1` closes th
   let pid: number | undefined;
   try {
     await s.t.waitFor(/BASH\$ $/, 'bash prompt');
-    const mark = s.t.screen().length;
     s.t.write(`${UNSHARE} ${chatCommand()} &\r`);
     pid = await chatPidOf(s);
-    await waitUntil(() => /Stopped \(tty output\)/.test(s.t.screen().slice(mark)), 'bash reports the job stopped', 30_000).catch(() => undefined);
+    // the job stopped in the background (the probe), as bash counts it (`jobs -l`, r12h H4)
+    assert.equal(await stoppedJobState(s.t, 30_000), 'Stopped (tty output)', 'bash counts the job stopped');
     await sleep(1000);
     const t0 = Date.now();
     s.t.write('kill %1\r');

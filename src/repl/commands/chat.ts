@@ -16,7 +16,13 @@
  *    cancelled.`, neither success nor failure, and loads nothing of what it printed (R1).
  *  - `new` creates a fresh KiroSession with the chat's current agent, model and effort; `resume`
  *    resumes the picked record on its own agent, model and effort (the chat's effort when the
- *    record has none); both close the old one.
+ *    record has none); both close the old one. Those of the record are read once its lock is
+ *    taken, as `chat --resume-id` does (KiroSessionInternalOptions.resumeDefaults, r12h): a chat
+ *    in another terminal that changed them while the picker was open and closed keeps its change.
+ *    Inside a tangent, the conversations the tangent returns to (its main one, a rewind it was
+ *    entered from, outer tangents) are open in this chat and not offered (`Not listed: …`;
+ *    /tangent returns there; a conversation a rewind left is not held and is offered): a second
+ *    session of one would have its record overwritten by the chat's close (r12h).
  *  - `new`, `resume`, `load` and `load-via-script` keep the chat's current trust
  *    (`/tools untrust`, `/tools reset`, `t` answers; never the launch `--trust-tools` /
  *    `--trust-all-tools` again: Q keeps trust per process, its Load swaps the current agents into
@@ -37,7 +43,8 @@ import * as path from 'node:path';
 import { isSessionStartCancelled, withStartSignal } from '../../session/startSignal.js';
 import { SessionStore, formatListTime, formatSessionList, sessionsDir } from '../../session/store.js';
 import { c } from '../../util/ansi.js';
-import type { KiroSession } from '../../types.js';
+import type { ResumeDefaultsOption } from '../../session/kiroSession.js';
+import type { KiroSession, KiroSessionOptions } from '../../types.js';
 import { runShell } from '../../util/process.js';
 import { BUSY_MESSAGE, notSupported } from '../prompt.js';
 import type { BuiltinCommand, ReplContext } from '../types.js';
@@ -231,10 +238,28 @@ async function newChat(r: ReplContext, prompt: string): Promise<void | 'quit'> {
   if (prompt.trim()) return r.submit(prompt);
 }
 
+/**
+ * The records the chat holds open (r12h): its own and, inside a tangent, those of its tangent
+ * stack (KiroSessionImpl.openRecordIds, read duck-typed; a session without it: its own record and
+ * its tangent's parent). A second session of one would replace this process's own lock on it and
+ * have its record overwritten by the chat's close (or a later tangent exit return into a record
+ * that changed underneath).
+ */
+function openInChat(s: KiroSession): Set<string> {
+  const own = (s as { openRecordIds?: () => string[] }).openRecordIds;
+  if (typeof own === 'function') return new Set([s.id, ...own.call(s)]);
+  return new Set([s.id, ...(s.tangent ? [s.tangent.parentId] : [])]);
+}
+
 async function resume(r: ReplContext): Promise<void> {
   assertIdle(r);
   const store = new SessionStore(sessionsDir(r.ws));
-  const list = store.list({ cwd: r.ws.cwd }).filter((s) => s.sessionId !== r.session.id && s.forkKind !== 'tangent');
+  const open = openInChat(r.session);
+  const all = store.list({ cwd: r.ws.cwd }).filter((s) => s.sessionId !== r.session.id && s.forkKind !== 'tangent');
+  // the conversations the tangent returns to are not offered: /tangent goes back there (r12h)
+  const held = all.filter((s) => open.has(s.sessionId)).map((s) => s.sessionId);
+  if (held.length) r.write(`\n${c.gray(`Not listed: ${held.join(', ')}, open in this chat under the tangent (/tangent returns there).`)}\n`);
+  const list = all.filter((s) => !open.has(s.sessionId));
   if (list.length === 0) {
     r.write('\nNo saved chat sessions for this directory.\n\n');
     return;
@@ -245,9 +270,25 @@ async function resume(r: ReplContext): Promise<void> {
   );
   if (idx === undefined) return;
   const rec = list[idx]!;
-  const next = await activate(r, () =>
-    r.createSession({ ...r.baseSessionOptions(), ...keepPlanMode(r), agentName: rec.agent, model: rec.model, ...(rec.effort ? { effort: rec.effort } : {}), resume: { sessionId: rec.sessionId } }),
-  );
+  if (openInChat(r.session).has(rec.sessionId)) {
+    r.write(`\n${c.red(`${rec.sessionId} is open in this chat under the tangent: /tangent returns there.`)}\n\n`);
+    return;
+  }
+  // The record's agent, model and effort as they are once its lock is taken, as `chat --resume-id`
+  // resolves them (resumeDefaults, r12h): the list was read before the user picked, and a chat in
+  // another terminal may have changed them since. The listed agent and model, and the chat's
+  // effort, apply only to what the record does not name (the chat's effort to a record with none).
+  // Trust and plan mode are the chat's (baseSessionOptions' initialTrust, keepPlanMode), mapped to
+  // the record's agent; a record saved in plan mode stays in it.
+  const opts: Partial<KiroSessionOptions> & ResumeDefaultsOption = {
+    ...r.baseSessionOptions(),
+    ...keepPlanMode(r),
+    agentName: rec.agent,
+    model: rec.model,
+    resume: { sessionId: rec.sessionId },
+    resumeDefaults: true,
+  };
+  const next = await activate(r, () => r.createSession(opts));
   if (next === 'cancelled') return cancelled(r, 'Resuming the chat session');
   r.write(`\n${c.magenta('Picking up where we left off...')}\n\n`);
 }

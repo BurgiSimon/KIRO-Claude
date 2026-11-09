@@ -17,7 +17,9 @@
  *    `chat.modelDefaults.<model>.output_config.effort`), takes the session lock and starts. A saved
  *    record is read again once the lock is taken; when another process saved it meanwhile (a
  *    hung-up holder the lock continued saves at its close, store.ts) all of the above is resolved
- *    again from that record under the lock (r12g S1). Any
+ *    again from that record under the lock (r12g S1). A caller whose agent, model and effort were
+ *    read before the lock too (the REPL's `/chat resume` and forced-stop restart) passes them as
+ *    `resumeDefaults`: the record's win, each applies only when the record names none (r12h). Any
  *    failure (lock, spawn, `initialize` timeout or error, auth) releases the lock, removes a
  *    record this call created and the runtime dir; ClaudeProcess kills a child it started.
  *  - {@link KiroSessionImpl.start}: SessionStart (agentSpawn) hooks run BEFORE the child is
@@ -839,7 +841,22 @@ export interface KiroSessionInternalOptions extends KiroSessionOptions {
    * the signal of an enclosing `withStartSignal`.
    */
   startSignal?: AbortSignal;
+  /**
+   * With `resume` by id: `agentName`, `model` and `effort` are not the caller's choice but what it
+   * read before the session's lock was taken, which a holder that closed meanwhile may have changed
+   * (r12h): the REPL's `/chat resume` (the record as its list showed it, which can be open for any
+   * time) and its restart after a forced stop (the stopped session's own). Each is used only when
+   * the record, as read under the lock (r12g S1), names none, so the session runs the agent, model
+   * and effort that record has, as `chat --resume-id <id>` without `--agent` / `--model` /
+   * `--effort` does; `/chat resume` passes the chat's effort this way (the record's, else the
+   * chat's). Without it they are explicit and win over the record (`chat --resume-id --agent …`,
+   * ACP `loadFresh`, which reads the record under the lock itself).
+   */
+  resumeDefaults?: boolean;
 }
+
+/** The internal option the REPL passes on through its `createSession` (r12h). */
+export type ResumeDefaultsOption = Pick<KiroSessionInternalOptions, 'resumeDefaults'>;
 
 interface Preset {
   /** The record to open (its `pendingHistory`: an import without a usable transcript). */
@@ -1173,8 +1190,17 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
       log.debug(`session ${rec.sessionId} is a copy of ${store.copiedFrom(rec.sessionId)}; forking Claude session ${from}`);
     }
 
+    // `resumeDefaults` (r12h): the caller's agent, model and effort were read before this lock
+    // (the REPL's /chat resume list, its forced-stop restart): what the record names wins, here
+    // and on the pass under the lock below, which reads the record again
+    const asDefaults = opts.resumeDefaults === true && !!rec && !preset && !!opts.resume && !('latest' in opts.resume);
+    const unlessRecorded = (v: string | undefined, recorded: string | undefined): string | undefined => (asDefaults && recorded?.trim() ? undefined : v);
+    const agentOpt = unlessRecorded(opts.agentName, rec?.agent);
+    const modelOpt = unlessRecorded(opts.model, rec?.model);
+    const effortOpt = unlessRecorded(opts.effort, rec?.effort);
+
     // agent
-    const requested = opts.agentName?.trim() ? opts.agentName.trim() : undefined;
+    const requested = agentOpt?.trim() ? agentOpt.trim() : undefined;
     let agent: KiroAgent | undefined;
     if (requested) {
       agent = loaded.agents.get(requested);
@@ -1198,10 +1224,10 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     // model
     const live = readModelCache(env)?.models;
     let model: string;
-    if (opts.model?.trim()) {
-      const m = kiroToClaudeModel(opts.model.trim(), live);
+    if (modelOpt?.trim()) {
+      const m = kiroToClaudeModel(modelOpt.trim(), live);
       if (m.error) throw new ModelNotFoundError(m.error);
-      model = opts.model.trim();
+      model = modelOpt.trim();
     } else if (rec && !preset && rec.model) {
       model = rec.model;
     } else if (preset) {
@@ -1225,7 +1251,7 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
     }
 
     // effort
-    let effort: string | undefined = opts.effort?.trim() || undefined;
+    let effort: string | undefined = effortOpt?.trim() || undefined;
     if (!effort && rec?.effort) effort = rec.effort;
     if (!effort) effort = modelDefaultEffort(settings, model, kiroToClaudeModel(model, live).value);
     if (effort && !EFFORT_LEVELS.includes(effort.toLowerCase())) {
@@ -1428,6 +1454,19 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
   get tangent(): { name: string | null; parentId: string } | undefined {
     if (this.tangentStack.length === 0) return undefined;
     return { name: this.rec.tangentName, parentId: this.rec.parentId ?? this.tangentStack[this.tangentStack.length - 1]!.rec.sessionId };
+  }
+
+  /**
+   * The records this session holds open (their locks are its own) until its close has saved them:
+   * its current one and, inside a tangent, every record of its tangent stack (the main
+   * conversation and the outer tangents a `/tangent` returns to). Another session of this process
+   * opening one of them would replace that lock and have its record overwritten by this session's
+   * close, so the REPL's `/chat resume` leaves them out (r12h). Read duck-typed (not on the
+   * KiroSession contract; a session without it holds its own record and its `tangent.parentId`).
+   */
+  openRecordIds(): string[] {
+    if (this.finalized) return [];
+    return [this.rec.sessionId, ...this.tangentStack.map((f) => f.rec.sessionId)];
   }
 
   /** KiroSession.busy: a turn runs, or Claude Code has not answered a user line yet. */
@@ -4076,8 +4115,11 @@ export class KiroSessionImpl extends EventEmitter implements KiroSession {
 
 // ───────────────────────────── entry points ─────────────────────────────
 
-/** Create (or resume / fork) a session and start it (see module doc). */
-export async function createSession(opts: KiroSessionOptions): Promise<KiroSession> {
+/**
+ * Create (or resume / fork) a session and start it (see module doc). `resumeDefaults`: the REPL's
+ * reopen of a record with options read before its lock ({@link KiroSessionInternalOptions}).
+ */
+export async function createSession(opts: KiroSessionOptions & ResumeDefaultsOption): Promise<KiroSession> {
   return KiroSessionImpl.create(opts);
 }
 

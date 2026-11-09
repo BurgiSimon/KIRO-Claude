@@ -21,6 +21,11 @@
  * (queued, or waiting for the child to start); `$/cancel_request` cancels only its own prompt.
  * Concurrent `session/load`s of one id share one session; a session that finishes creating
  * after shutdown began is closed instead of registered (no orphaned `claude` child or lock).
+ * One id has one writer in this server (r12h H3): an open of an id (`session/load`, the restart
+ * after a stuck cancel) first waits for a close of that id still running here (`terminate`, also
+ * sent as a notification nobody awaits, whose close may outlast its 5 s answer), so that close's
+ * SessionEnd hooks, record save and lock release all come before the new session reads the
+ * record or takes the lock; shutdown gives such closes the same budget as the live sessions'.
  *
  * Cancelling commands and starts (C3). The 05 §4.6 "no turn running: ignore" leaves a Kiro
  * command (`commands/execute`, or one sent as prompt text) out, so a command waiting for Claude
@@ -370,9 +375,16 @@ export interface AcpServerTimings {
   closeTimeoutMs: number;
   /** Max wait for `usage()` when computing `_kiro.dev/metadata`. */
   usageTimeoutMs: number;
+  /**
+   * Max wait, in all, of an open of a session id (`session/load`, the restart after a stuck cancel)
+   * for closes of that id still running in this server ({@link AcpServer.untilIdle}, r12h H3).
+   * Not given: four close budgets (20 s by default), above what a session's own close takes (its
+   * SessionEnd hooks, capped at 5 s, then Claude Code's EOF grace, SIGTERM and SIGKILL).
+   */
+  reopenWaitMs: number;
 }
 
-const DEFAULT_TIMINGS: AcpServerTimings = { cancelGraceMs: 10_000, mcpWaitMs: 30_000, mcpPollMs: 250, closeTimeoutMs: 5_000, usageTimeoutMs: 5_000 };
+const DEFAULT_TIMINGS: AcpServerTimings = { cancelGraceMs: 10_000, mcpWaitMs: 30_000, mcpPollMs: 250, closeTimeoutMs: 5_000, usageTimeoutMs: 5_000, reopenWaitMs: 20_000 };
 
 export interface AcpServerOptions {
   ctx: CliContext;
@@ -678,6 +690,13 @@ export class AcpServer {
   /** Session closes still running (awaited by {@link serve} before it returns). */
   private readonly closing = new Set<Promise<void>>();
   /**
+   * By session id: the closes of that id's sessions still running in this server, each until the
+   * session's own close has ended (also past the close budget a `terminate` waits), and the restart
+   * after a stuck cancel while it creates the new session ({@link track}). An open of the id waits
+   * for them before it reads the record or takes the lock ({@link untilIdle}, r12h H3).
+   */
+  private readonly busy = new Map<string, Set<Promise<void>>>();
+  /**
    * Aborted when shutdown begins (stdin EOF, {@link stop}): the start signal of every session this
    * server creates (session/startSignal.ts, K3). A start still running its agentSpawn hooks then is
    * cancelled (the hooks are killed, the fresh record removed, the lock released) instead of
@@ -692,6 +711,7 @@ export class AcpServer {
     this.flags = { trustAllTools: false, trustTools: [], login: false, verbose: 0, help: false, ...opts.flags };
     this.factory = opts.createSession ?? defaultSessionFactory;
     this.timings = { ...DEFAULT_TIMINGS, ...opts.timings };
+    if (opts.timings?.reopenWaitMs === undefined) this.timings.reopenWaitMs = 4 * this.timings.closeTimeoutMs;
     this.env = { ...opts.ctx.ws.env };
     // never forwarded to Claude children (08 KC-ENV-01)
     delete this.env.KIRO_API_KEY;
@@ -773,30 +793,87 @@ export class AcpServer {
     }
   }
 
-  /** Cancel turns and close every session (≤ closeTimeoutMs each, in parallel). */
+  /**
+   * Cancel turns and close every session (≤ closeTimeoutMs each, in parallel); closes still running
+   * from an earlier `terminate` (or a stuck-cancel restart) get the same budget, in parallel too, so
+   * that their SessionEnd hooks and record save are not cut short by the exit (r12h H3).
+   */
   async shutdown(): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
     this.stopAbort.abort();
     const all = [...this.sessions.values()];
     this.sessions.clear();
-    await Promise.allSettled(all.map((st) => this.closeSession(st)));
+    const earlier = [...this.busy.values()].flatMap((s) => [...s]);
+    await Promise.allSettled([...all.map((st) => this.closeSession(st)), withTimeout(Promise.allSettled(earlier), this.timings.closeTimeoutMs)]);
+  }
+
+  /**
+   * Keep session id `id` busy until `p` settles (r12h H3): a close of one of its sessions, to the
+   * end of the session's own close, or a restart creating the new session. Returns `p`.
+   */
+  private track<T>(id: string, p: Promise<T>): Promise<T> {
+    const set = this.busy.get(id) ?? new Set<Promise<void>>();
+    this.busy.set(id, set);
+    const done: Promise<void> = p.then(
+      () => undefined,
+      () => undefined,
+    ).then(() => {
+      set.delete(done);
+      if (set.size === 0 && this.busy.get(id) === set) this.busy.delete(id);
+    });
+    set.add(done);
+    return p;
+  }
+
+  /**
+   * Wait until nothing keeps session id `id` busy in this server ({@link track}): a session of
+   * that id this server still closes (after `terminate`, at a failed or discarded start, in the
+   * restart after a stuck cancel) holds the session's lock and writes its in-memory record at the
+   * end of its close, and its SessionEnd hooks run before that; opened meanwhile, the new session
+   * would replace that lock (a lock of this process is replaced in one step), read the record
+   * before that save, and have it overwritten (r12h H3). So every open of an existing id waits here
+   * first. True once nothing runs; false when something still runs after
+   * {@link AcpServerTimings.reopenWaitMs} in all. Throws `Server is shutting down` when the server
+   * stops meanwhile, and `Request cancelled` (-32800) when `request` is aborted (`$/cancel_request`,
+   * the connection closing), as a cancelled start does ({@link createUnderStop}).
+   */
+  private async untilIdle(id: string, request?: AbortSignal): Promise<boolean> {
+    const end = Date.now() + this.timings.reopenWaitMs;
+    const stop = eitherSignal([this.stopAbort.signal, request]);
+    try {
+      for (let set = this.busy.get(id); set; set = this.busy.get(id)) {
+        const left = end - Date.now();
+        if (left <= 0) return false;
+        if ((await withTimeout(untilAborted(Promise.allSettled([...set]), stop.signal), left)) === undefined) return false;
+      }
+      return true;
+    } catch (e) {
+      if (!(e instanceof OpCancelledError)) throw e;
+      if (this.stopping || this.stopAbort.signal.aborted) throw internalError('Server is shutting down');
+      throw new RpcError(ErrorCodes.REQUEST_CANCELLED, 'Request cancelled');
+    } finally {
+      stop.dispose();
+    }
   }
 
   /**
    * A session finished creating while the server is shutting down (stdin EOF / SIGTERM during
    * `session/new|load`): close it (child, lock) instead of registering it, and fail the request.
    */
-  private async discardLate(session: KiroSession): Promise<never> {
-    await this.closeLate(session);
+  private async discardLate(session: KiroSession, id: string = session.id): Promise<never> {
+    await this.closeLate(session, id);
     throw internalError('Server is shutting down');
   }
 
-  /** Close a session nobody will use (tracked so {@link serve} waits for it). */
-  private async closeLate(session: KiroSession): Promise<void> {
+  /**
+   * Close a session nobody will use (tracked so {@link serve} waits for it, ≤ closeTimeoutMs), its
+   * id `id` busy until its own close has ended ({@link track}).
+   */
+  private async closeLate(session: KiroSession, id: string = session.id): Promise<void> {
     const p = (async () => {
       try {
-        await withTimeout(session.close(), this.timings.closeTimeoutMs);
+        await withTimeout(this.track(id, session.close()), this.timings.closeTimeoutMs);
       } catch (e) {
         this.log.warn('acp: closing a late session failed:', e);
       }
@@ -1201,25 +1278,42 @@ export class AcpServer {
    * `session/load` (05 §4.4, 08 KC-ACP-10): replay, then respond with modes/models. A load of a
    * session that is live in this process re-attaches (no new child, still replays); a load that
    * arrives while another load of the same id is still starting waits for it and re-attaches,
-   * so one ACP session id never gets two `claude` children.
+   * so one ACP session id never gets two `claude` children. A load of a session this server is
+   * still closing (`terminate`, also sent as a notification nobody awaits; a failed start) waits
+   * for that close to end before it reads the record or takes the lock ({@link untilIdle}, r12h
+   * H3), and then loads what the close saved; when it is still running after `reopenWaitMs`, the
+   * load answers the error of a session held elsewhere (`Session is active in another process
+   * (PID <ours>)`, the text KiroCrew retries on) and opens nothing.
    */
   private async sessionLoad(p: Record<string, unknown>, rc: RequestContext): Promise<unknown> {
     const sessionId = str(p.sessionId);
     if (!sessionId) throw invalidParams('sessionId is required');
     const ws = this.sessionWs(p.cwd);
-    const inflight = this.loading.get(sessionId);
-    if (inflight) await inflight.catch(() => undefined);
-    const live = this.sessions.get(sessionId);
-    if (live && !live.closed) {
-      return live.enqueue(async () => {
-        if (live.closed) throw sessionNotFound();
-        await live.whenReady();
-        this.replay(live, live.session.claudeSessionId ?? live.session.record.claudeSessionId);
-        const state = await this.sessionState(live);
-        return respondThen(state, () => this.afterSessionStart(live, undefined));
-      });
+    // looked at again after every wait: what another request started meanwhile counts too, and the
+    // last look and `loading.set` below run in one turn of the event loop
+    for (;;) {
+      const inflight = this.loading.get(sessionId);
+      if (inflight) {
+        await inflight.catch(() => undefined);
+        continue;
+      }
+      const live = this.sessions.get(sessionId);
+      if (live && !live.closed) {
+        return live.enqueue(async () => {
+          if (live.closed) throw sessionNotFound();
+          await live.whenReady();
+          this.replay(live, live.session.claudeSessionId ?? live.session.record.claudeSessionId);
+          const state = await this.sessionState(live);
+          return respondThen(state, () => this.afterSessionStart(live, undefined));
+        });
+      }
+      if (!isSafeSessionId(sessionId)) throw internalError('Session not found');
+      if (!this.busy.has(sessionId)) break;
+      if (!(await this.untilIdle(sessionId, rc.signal))) {
+        this.log.warn(`acp: session/load ${sessionId}: a close of it in this server still runs after ${this.timings.reopenWaitMs} ms; not opened`);
+        throw internalError(`Failed to start session: Session is active in another process (PID ${process.pid})`);
+      }
     }
-    if (!isSafeSessionId(sessionId)) throw internalError('Session not found');
     const job = this.loadFresh(sessionId, ws, p, rc.signal);
     this.loading.set(sessionId, job);
     try {
@@ -1271,7 +1365,7 @@ export class AcpServer {
     if (!opts.additionalDirectories && rec.additionalDirectories.length) opts.additionalDirectories = [...rec.additionalDirectories];
     if (servers.length) opts.extraMcpServers = servers;
     const session = await this.createUnderStop(opts, request);
-    if (this.stopping) return this.discardLate(session);
+    if (this.stopping) return this.discardLate(session, sessionId);
     if (session.id !== sessionId) this.log.warn(`acp: session/load ${sessionId}: the session module answered id ${session.id}; keeping the client's id`);
     const st = new AcpSessionState(sessionId, session, ws, opts);
     holder.st = st;
@@ -1283,7 +1377,8 @@ export class AcpServer {
       // e.g. "Session is active in another process" — KiroCrew retries on that text
       if (st.liveListener) session.off('event', st.liveListener);
       try {
-        await withTimeout(session.close(), this.timings.closeTimeoutMs);
+        // the id stays busy until this close has ended, also past the budget (r12h H3)
+        await withTimeout(this.track(sessionId, session.close()), this.timings.closeTimeoutMs);
       } catch {
         // ignore
       }
@@ -1297,7 +1392,7 @@ export class AcpServer {
     }
     if (this.stopping) {
       if (st.liveListener) session.off('event', st.liveListener);
-      return this.discardLate(session);
+      return this.discardLate(session, sessionId);
     }
     this.sessions.set(st.id, st);
     this.replay(st, session.claudeSessionId ?? rec.claudeSessionId);
@@ -1336,7 +1431,12 @@ export class AcpServer {
     return out;
   }
 
-  /** `_kiro.dev/session/terminate` (05 §4.11, 08 KC-ACP-09): evict, keep files, idempotent. */
+  /**
+   * `_kiro.dev/session/terminate` (05 §4.11, 08 KC-ACP-09): evict, keep files, idempotent. Answers
+   * once the session closed, at most closeTimeoutMs after its close began; a close that takes longer
+   * goes on, and the id stays busy until it has ended, so a `session/load` of it meanwhile waits
+   * for it (r12h H3).
+   */
   private async terminate(sessionId: string | undefined): Promise<Record<string, unknown>> {
     if (!sessionId) return {};
     const st = this.sessions.get(sessionId);
@@ -1347,26 +1447,43 @@ export class AcpServer {
     return {};
   }
 
+  /**
+   * Close an ACP session: its command and turn are cancelled, then the session closed (≤
+   * closeTimeoutMs). From the call on (synchronously, before anything is awaited) until the
+   * session's own close has ended, also past that budget, its id is busy ({@link track}): an open of
+   * the id waits for the close, whose SessionEnd hooks, record save and lock release then all come
+   * before it (r12h H3).
+   */
   private async closeSession(st: AcpSessionState): Promise<void> {
     if (st.closed) return;
     st.closed = true;
-    // a command waiting for Claude Code answers now (C3), not when the child is gone
-    st.op?.abort.abort();
-    const turn = st.turn;
-    if (turn) {
-      turn.cancelled = true;
-      turn.abort.abort();
-      try {
-        await withTimeout(st.session.interrupt(), 1000);
-      } catch {
-        // ignore
-      }
-    }
-    st.steers = [];
+    const ended = deferred<void>();
+    this.track(st.id, ended.promise);
+    let closing: Promise<void> | undefined;
     try {
-      await withTimeout(st.session.close(), this.timings.closeTimeoutMs);
-    } catch (e) {
-      this.log.warn(`acp[${st.id}]: close failed:`, e);
+      // a command waiting for Claude Code answers now (C3), not when the child is gone
+      st.op?.abort.abort();
+      const turn = st.turn;
+      if (turn) {
+        turn.cancelled = true;
+        turn.abort.abort();
+        try {
+          await withTimeout(st.session.interrupt(), 1000);
+        } catch {
+          // ignore
+        }
+      }
+      st.steers = [];
+      try {
+        // (a close() that throws at once fails here, as before: logged, the terminate answers)
+        closing = st.session.close();
+        await withTimeout(closing, this.timings.closeTimeoutMs);
+      } catch (e) {
+        this.log.warn(`acp[${st.id}]: close failed:`, e);
+      }
+    } finally {
+      if (closing) void closing.then(() => ended.resolve(), () => ended.resolve());
+      else ended.resolve();
     }
     if (st.liveListener) st.session.off('event', st.liveListener);
   }
@@ -2441,19 +2558,37 @@ export class AcpServer {
    * (never the launch `--trust-tools` again, F2). The new child starts eagerly; the session
    * queue then continues with it. A failed re-creation is reported by every later operation on
    * the session (`Failed to start the session: …`), like a failed start.
+   *
+   * The re-creation opens the same id, so it waits for the old session's close to END (its
+   * SessionEnd hooks, its record save, its lock release; {@link untilIdle}), not only for the close
+   * budget: that close never writes over the restarted session (r12h H3). A close still running
+   * after `reopenWaitMs` (a session's own close never takes that long; a hung one) is left to run
+   * and the session restarted anyway, as before, so that it never blocks the session for good. The
+   * creation keeps the id busy too: a `terminate` meanwhile closes the late session, and a
+   * `session/load` of the id after that waits for both.
    */
   private async replaceStuckSession(st: AcpSessionState, stuck: Promise<unknown>): Promise<void> {
     const old = st.session;
     if (st.liveListener) old.off('event', st.liveListener);
     st.liveListener = undefined;
+    // (a close() that throws at once is logged and the session restarted, as before)
+    let closingOld: Promise<void>;
     try {
-      await withTimeout(old.close(), this.timings.closeTimeoutMs);
+      closingOld = old.close();
     } catch (e) {
-      this.log.warn(`acp[${st.id}]: closing the stuck session failed:`, e);
+      closingOld = Promise.reject(e);
+    }
+    this.track(st.id, closingOld).catch((e: unknown) => this.log.warn(`acp[${st.id}]: closing the stuck session failed:`, e));
+    let idle = false;
+    try {
+      idle = await this.untilIdle(st.id);
+    } catch {
+      // the server stops: nothing is re-created (below)
     }
     // the stuck generator ends once its child is gone (bounded: never block the queue on it again)
     await withTimeout(stuck.catch(() => undefined), this.timings.closeTimeoutMs);
     if (st.closed || this.stopping) return;
+    if (!idle) this.log.warn(`acp[${st.id}]: the stuck session's close still runs after ${this.timings.reopenWaitMs} ms; restarting Claude Code anyway`);
     const opts: KiroSessionOptions = { ...st.createOpts, resume: { sessionId: st.id }, agentName: old.agent.name, model: old.model };
     delete opts.fork;
     // the resumed record carries every agent's per-tool trust (what `--trust-tools` gave the
@@ -2463,9 +2598,15 @@ export class AcpServer {
     if (old.effort) opts.effort = old.effort;
     else delete opts.effort;
     if (old.trust.trustAll) opts.trustAllTools = true;
-    let fresh: KiroSession;
+    const making = (async (): Promise<KiroSession | undefined> => {
+      const s = await this.createUnderStop(opts, undefined, false);
+      if (!st.closed && !this.stopping) return s;
+      await this.closeLate(s, st.id);
+      return undefined;
+    })();
+    let fresh: KiroSession | undefined;
     try {
-      fresh = await this.createUnderStop(opts, undefined, false);
+      fresh = await this.track(st.id, making);
     } catch (e) {
       this.log.error(`acp[${st.id}]: re-creating the session after a stuck cancel failed:`, e);
       st.startError = e;
@@ -2473,8 +2614,9 @@ export class AcpServer {
       st.ready.catch(() => undefined);
       return;
     }
+    if (!fresh) return;
     if (st.closed || this.stopping) {
-      await this.closeLate(fresh);
+      await this.closeLate(fresh, st.id);
       return;
     }
     if (fresh.id !== st.id) this.log.warn(`acp[${st.id}]: the re-created session answered id ${fresh.id}; keeping the client's id`);

@@ -107,7 +107,8 @@ import { loadPrompts, findPrompt, expandPrompt, parsePromptInvocation } from '..
 import { discoverSkills, expandSkillInvocation, pluginSkillName } from '../config/skills.js';
 import { loadSteering } from '../config/steering.js';
 import { findModelEntry } from '../models/models.js';
-import { currentStartSignal, isSessionStartCancelled, withStartSignal } from '../session/startSignal.js';
+import type { ResumeDefaultsOption } from '../session/kiroSession.js';
+import { SessionStartCancelledError, currentStartSignal, isSessionStartCancelled, withStartSignal } from '../session/startSignal.js';
 import { SessionStore, previewText, sessionsDir } from '../session/store.js';
 import type {
   ApprovalRequest,
@@ -276,6 +277,13 @@ export class Repl implements ReplContext {
    * `tangentParent` / `tangentId`: the stop hit tangent `tangentId` of main `tangentParent`.
    */
   private stoppedSession: { session: KiroSession; closing: Promise<void>; tangentParent?: string; tangentId?: string } | undefined;
+  /**
+   * Closes this REPL started without waiting for their end: a forced stop's ({@link forceStop}),
+   * which the stopped turn waits for {@link FORCE_CLOSE_TIMEOUT_MS} at most. Until one is done its
+   * session still holds its records (their locks are this process's) and saves them at its end, so
+   * a record is reopened by id only after them ({@link awaitUnsettledCloses}, r12h).
+   */
+  private readonly unsettledCloses = new Set<Promise<void>>();
   /** The running slash command's {@link ReplContext.commandSignal}. */
   private cmdSignal: AbortSignal | undefined;
   /** The controllers of every running slash command's signal (nested ones too): a fatal signal aborts them. */
@@ -506,7 +514,9 @@ export class Repl implements ReplContext {
 
   /**
    * The options of a session that follows the chat (`/chat new|resume|load`, and the base of every
-   * {@link createSession}): the launch options with the chat's current agent, model and effort,
+   * {@link createSession}): the launch options with the chat's current agent, model and effort
+   * (for a reopen of a saved record, `/chat resume` and the forced-stop restart, only defaults for
+   * what the record does not name: `resumeDefaults`, r12h),
    * and the chat's trust as it is now, never the launch `--trust-tools` / `--trust-all-tools`
    * again (applied to the next chat they would re-trust a tool the user untrusted, or turn
    * trust-all back on after `/tools reset`). Like the forced-stop restart: all of it as
@@ -529,17 +539,59 @@ export class Repl implements ReplContext {
     return base;
   }
 
-  createSession(opts: Partial<KiroSessionOptions>): Promise<KiroSession> {
-    return this.opening(() =>
-      this.deps.createSession({
+  /**
+   * `resumeDefaults` (KiroSessionInternalOptions, r12h): with `resume`, the agent, model and effort
+   * (the base's: the chat's) apply only to what the record does not name once its lock is taken.
+   * A reopen of a saved record by id first waits for the closes this REPL did not wait for
+   * ({@link awaitUnsettledCloses}): a session still closing would save its copy of that record
+   * over the new session's (r12h); Ctrl+C (the start signal) cancels the wait like a start.
+   */
+  createSession(opts: Partial<KiroSessionOptions> & ResumeDefaultsOption): Promise<KiroSession> {
+    const byId = !!opts.resume && 'sessionId' in opts.resume;
+    return this.opening(async () => {
+      if (byId && !(await this.awaitUnsettledCloses(currentStartSignal()))) throw new SessionStartCancelledError();
+      return this.deps.createSession({
         ...this.baseSessionOptions(),
         ...opts,
         ws: opts.ws ?? this.ws,
         origin: opts.origin ?? 'repl',
         interactive: opts.interactive ?? true,
         ui: opts.ui ?? this.ui,
-      }),
+      });
+    });
+  }
+
+  /** Remember a close this REPL does not wait for until it is done ({@link unsettledCloses}). */
+  private trackClose(close: Promise<unknown>): void {
+    const done: Promise<void> = close.then(
+      () => undefined,
+      () => undefined,
     );
+    this.unsettledCloses.add(done);
+    void done.then(() => this.unsettledCloses.delete(done));
+  }
+
+  /**
+   * Wait until every close in {@link unsettledCloses} is done (at once when there is none); false
+   * when `signal` aborted first (the closes go on).
+   */
+  private async awaitUnsettledCloses(signal: AbortSignal | undefined): Promise<boolean> {
+    while (this.unsettledCloses.size > 0) {
+      if (signal?.aborted) return false;
+      let off = (): void => undefined;
+      const aborted = new Promise<'aborted'>((resolve) => {
+        if (!signal) return;
+        const on = (): void => resolve('aborted');
+        signal.addEventListener('abort', on, { once: true });
+        off = () => signal.removeEventListener('abort', on);
+      });
+      try {
+        if ((await Promise.race([Promise.all([...this.unsettledCloses]), aborted])) === 'aborted') return false;
+      } finally {
+        off();
+      }
+    }
+    return true;
   }
 
   /**
@@ -1186,14 +1238,17 @@ export class Repl implements ReplContext {
   /**
    * Stop Claude Code: close the current session (its child gets stdin EOF, SIGTERM after 2 s,
    * then SIGKILL; the stuck turn ends with it). The REPL keeps the closed session until the
-   * next input re-creates it ({@link restartStopped}).
+   * next input re-creates it ({@link restartStopped}), which waits for the whole close
+   * ({@link unsettledCloses}; the returned promise gives up after FORCE_CLOSE_TIMEOUT_MS).
    */
   private forceStop(): Promise<void> {
     if (this.stoppedSession) return this.stoppedSession.closing;
     const session = this.current;
     this.notice('warn', 'Claude Code did not stop after the interrupt; stopping it.');
     const tangentParent = session.tangent?.parentId;
-    const closing = withTimeout(session.close(), FORCE_CLOSE_TIMEOUT_MS).then(() => undefined);
+    const close = session.close();
+    this.trackClose(close);
+    const closing = withTimeout(close, FORCE_CLOSE_TIMEOUT_MS).then(() => undefined);
     this.stoppedSession = { session, closing, ...(tangentParent ? { tangentParent, tangentId: session.id } : {}) };
     return closing;
   }
@@ -1204,9 +1259,13 @@ export class Repl implements ReplContext {
   }
 
   /**
-   * After a forced stop: re-create the stopped session under its id with `--resume` (agent,
-   * model, effort, trust-all as they were; per-tool trust, context rules and plan mode come back
-   * with the record), or a new one when closing dropped the record (no finished turn yet).
+   * After a forced stop: re-create the stopped session under its id with `--resume` (trust-all
+   * and the trust as they were; per-tool trust, context rules and plan mode come back with the
+   * record; the agent, model and effort the record has by then, which another chat may have
+   * changed while this one was stopped, else the stopped session's: resumeDefaults, r12h), or a
+   * new one when closing dropped the record (no finished turn yet). Only once the stopped
+   * session's close is done, also when it outlasted the forced stop's FORCE_CLOSE_TIMEOUT_MS (it
+   * saves the record at its end; r12h): a notice says so and Ctrl+C cancels that wait.
    * `'failed'` when that failed (the REPL then exits 1). A Ctrl+C while this runs (spawning
    * Claude Code takes a while) cancels the input it runs for (`'cancelled'`; the session is
    * still re-created) instead of waiting as type-ahead, where it would count as an exit press.
@@ -1227,6 +1286,25 @@ export class Repl implements ReplContext {
     this.reader.on('interrupt', onPress);
     try {
       await st.closing;
+      // r12h: `closing` gives up after FORCE_CLOSE_TIMEOUT_MS; a close still running holds the
+      // record and saves its copy at its end (over the restarted session's), or drops it: the
+      // record is looked at and reopened only once that close is done. Ctrl+C cancels the wait;
+      // the session stays stopped and the next input tries again
+      if (this.unsettledCloses.size > 0) {
+        if (!this.exits?.received) this.write(`\n${c.gray('The stopped session is still closing; Claude Code restarts once it has closed (Ctrl+C cancels).')}\n`);
+        const stop = anySignal([press?.signal, this.exits?.startSignal]);
+        let closed: boolean;
+        try {
+          closed = await this.awaitUnsettledCloses(stop.signal);
+        } finally {
+          stop.dispose();
+        }
+        if (!closed) {
+          this.stoppedSession = st;
+          if (!this.exits?.received) this.write(`\n${c.yellow('Restart cancelled (Ctrl+C). Claude Code restarts with your next input.')}\n\n`);
+          return 'cancelled';
+        }
+      }
       // replaced meanwhile (e.g. a spec task session handed back): nothing to re-create
       if (this.current === st.session) {
         const old = st.session;
@@ -1248,7 +1326,11 @@ export class Repl implements ReplContext {
             initialTrust: { trust: old.trust, agent: old.agent.name },
             trustAllTools: old.trust.trustAll,
             trustTools: resumable ? [] : [...old.trust.allowedTools],
-            ...(resumable ? { resume: { sessionId: old.id } } : {}),
+            // the agent, model and effort the record has once its lock is taken (a chat in another
+            // terminal may have reopened it meanwhile and changed them): the stopped session's
+            // only for what it does not name (resumeDefaults, r12h); plan mode when the stopped
+            // session or the record is in it (the more restrictive, as /chat resume)
+            ...(resumable ? { resume: { sessionId: old.id }, resumeDefaults: true, ...(old.planMode ? { planMode: true } : {}) } : {}),
           });
           if (revoked.length) fresh.untrustTools([...revoked]);
           // plan mode lived in the dropped record: the next prompt must not run with edits allowed
